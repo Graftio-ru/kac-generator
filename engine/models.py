@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from enum import IntEnum
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -18,6 +18,10 @@ class SpecPosition(BaseModel):
     name: str                        # наименование строительного ресурса (графа C)
     full_name: str = ""              # полное наименование (графа D); по умолчанию = name
     type_mark: str = ""              # тип, марка, обозначение
+    review_issue: str = ""           # unresolved source recognition details
+    review_fields: dict[str, str] = Field(default_factory=dict)
+    source_evidence: dict = Field(default_factory=dict)  # provenance, not verified cells
+    source_reader: str = ""          # actual parser path, never a verification claim
     unit: str = "шт"                 # ед. изм. (графа E)
     qty: float = 0.0                 # количество (для ТСН)
     is_unique: bool = False          # уникальное оборуд. из письма (цена не ищется в интернете)
@@ -30,12 +34,13 @@ class SpecPosition(BaseModel):
 
 class Requisites(BaseModel):
     """Реквизиты организации-продавца (для граф K, L, M, O)."""
+    seller_source: dict | None = None  # server-owned retained product-bound terms only
     name: str = ""                   # наименование (графа K)
     inn: str = ""                    # ИНН (графа M)
     kpp: str = ""                    # КПП (графа L)
     ogrn: str = ""                   # ОГРН/ОГРНИП (для панели реквизитов в ТКП)
     address: str = ""                # юридический адрес (для панели реквизитов в ТКП)
-    city: str = "Москва"             # населённый пункт склада (графа O)
+    city: str = ""             # населённый пункт склада (графа O)
     status: OrgStatus = OrgStatus.SUPPLIER  # графа P
 
 
@@ -44,10 +49,39 @@ class PriceOffer(BaseModel):
     price_with_vat: float            # графа G — цена С НДС
     url: str = ""                    # графа N — ссылка на карточку
     product_title: str = ""          # как называется товар на сайте
-    in_moscow_region: bool = True    # самовывоз Москва/МО
+    page_title: str = ""             # заголовок карточки, иногда содержит точный артикул
+    identity_evidence: dict = Field(default_factory=dict)
+    page_article: str = ""           # артикул основного товара из характеристик карточки
+    price_unit: str = ""              # единица продажи, подтверждённая на карточке
+    normalized_price_unit: str = ""   # единица price_with_vat после пересчёта
+    source_quote_evidence: dict = Field(default_factory=dict)
+    catalogue_ref: dict = Field(default_factory=dict)
+    catalogue_observed_at: float = 0.0
+    catalogue_source_sha256: str = ""
+    catalogue_image: dict = Field(default_factory=dict)
+    seller_evidence: dict | None = None
+    catalogue_vat_status: Literal["", "included", "excluded", "unknown"] = ""
+    catalogue_vat_notice: str = ""
+    price_capture_evidence: dict = Field(default_factory=dict)
+    price_capture_review_reason: str = ""
+    price_unit_evidence: str = ""    # explicit main-card selling-unit text
+    listed_price_with_vat: Optional[float] = None  # цена в единице продажи
+    match_review_required: bool = False
+    model_review_accepted: bool = False
+    unit_review_required: bool = False
+    unit_review_reason: str = ""
+    refresh_failed: bool = False     # historical quote; latest refresh did not confirm it
+    refresh_failure_reason: str = ""
+    refresh_checked_at: float = 0.0  # refusal observation, never the old capture date
+    in_moscow_region: Optional[bool] = None  # unknown is not confirmed pickup
+    region_status: Literal["", "unknown", "confirmed", "incompatible"] = ""
+    region_evidence: str = ""  # warehouse/pickup/delivery observation, never inferred from city
     requisites: Requisites = Field(default_factory=Requisites)
     # пути к скриншотам (карточка + панель реквизитов) для сборки страницы ТКП
     screenshot_product: Optional[str] = None
+    screenshot_context: str = ""
+    context_capture_evidence: dict = Field(default_factory=dict)
+    context_capture_review_reason: str = ""
     screenshot_requisites: Optional[str] = None
     # для позиций из писем: цена задана напрямую, в ТКП не попадает
     from_letter: bool = False
@@ -69,8 +103,12 @@ class PositionResult(BaseModel):
     excluded_by_tsn: bool = False    # ТСН-2001 > КАЦ → исключить из КАЦ
     # статистика поиска (для индикатора «найдено N из target»)
     sources_checked: int = 0         # сколько карточек обойдено
-    sources_found: int = 0           # сколько валидных офферов (Москва/МО) найдено
+    sources_found: int = 0           # сколько сопоставимых офферов найдено
     sources_target: int = 0          # цель (MIN_SOURCES)
+    catalogue_revision: int = 0
+    catalogue_product_id: str = ""
+    catalogue_coverage: dict = Field(default_factory=dict)
+    catalogue_refresh_attempts: list[dict] = Field(default_factory=list)
 
     @property
     def max_offer(self) -> Optional[PriceOffer]:

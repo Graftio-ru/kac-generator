@@ -1,0 +1,6 @@
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict'),test=require('node:test'),path=require('node:path');
+const source=fs.readFileSync(path.join(__dirname,'../common.js'),'utf8');
+const normalize=source.slice(source.indexOf('function normalizePos(p)'),source.indexOf('function applyCatalogueMetadata'));
+function context(){const c={$:()=>null,unitReviewPending:()=>false,captureReviewReason:()=>''};vm.createContext(c);vm.runInContext(normalize,c);return c;}
+test('normalization and JSON roundtrip never invent locality',()=>{const c=context();for(const city of [undefined,'','Москва','Тверь']){const p=c.normalizePos({offers:[{city,price_with_vat:100}]});const again=c.normalizePos(JSON.parse(JSON.stringify(p)));assert.equal(again.offers[0].city,city||'');}});
+test('actual add-offer handler creates unknown locality',()=>{const begin=source.indexOf('else if (t.classList.contains("addoffer"))');const end=source.indexOf('else if (t.classList.contains("rmoffer"))',begin);const handler=source.slice(begin,end).replace(/^else /,'');const c={positions:[{offers:[]}],t:{classList:{contains:v=>v==='addoffer'},dataset:{p:'0'}},renderPositions:()=>{}};vm.createContext(c);vm.runInContext(handler,c);assert.equal(c.positions[0].offers[0].city,'');});

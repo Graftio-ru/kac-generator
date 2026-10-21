@@ -17,7 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, Side
+from openpyxl.styles import Alignment, Border, Font, Side, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
@@ -77,6 +77,14 @@ def _write_sheet_header(ws: Worksheet, object_name: str) -> None:
     ws["A3"] = "(наименование объекта строительства)"
     ws["A3"].font = Font(name="Arial", size=10, italic=True)
     ws["A3"].alignment = Alignment(horizontal="center")
+
+    # Visible calculation assumption; normative columns and numeric values stay intact.
+    ws.merge_cells(start_row=4, start_column=1, end_row=4, end_column=NCOLS)
+    ws["A4"] = (f"Расчётное допущение: НДС {settings.vat_rate:g}%; делитель {settings.vat_divisor:g}. "
+                "Не подтверждает НДС в цене поставщика.")
+    ws["A4"].font = Font(name="Arial", size=10, italic=True)
+    ws["A4"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    ws.row_dimensions[4].height = 30
 
     # строка 5 (+6) — заголовки, строка 7 — номера граф
     for i, (title, num) in enumerate(zip(HEADERS, GRAPH_NUMBERS), start=1):
@@ -141,8 +149,11 @@ def _write_position(ws: Worksheet, row: int, res: PositionResult) -> int:
         if res.tkp_page is not None and not offer.from_letter:
             ws.cell(row=r, column=17, value=res.tkp_page)
 
-    if not offers:  # позиция без цен (на всякий случай) — пустой блок
-        pass
+    from ..equipment_output_policy import missing_own_price, MISSING_PRICE
+    if missing_own_price(pos, offers):
+        from openpyxl.comments import Comment
+        ws.cell(row=r0, column=4, value=f"{pos.full_name}; {pos.type_mark}\n{MISSING_PRICE}")
+        ws.cell(row=r0, column=7).comment = Comment(MISSING_PRICE, "Автосметчик")
 
     # стиль/границы по всему блоку
     for r in range(r0, r1 + 1):
@@ -178,6 +189,56 @@ def build_kac(
             if res.excluded_by_tsn:
                 continue
             row = _write_position(ws, row, res)
+    from ..region_policy import region_notice
+    warnings = [(res, offer) for results in results_by_discipline.values() for res in results
+                if not res.excluded_by_tsn for offer in res.offers if region_notice(offer)]
+    if warnings:
+        notes = wb.create_sheet("Регион поставки")
+        notes.append(["№ позиции", "Наименование", "Поставщик", "Карточка / источник", "Предупреждение"])
+        notes.freeze_panes = "A2"
+        notes.row_dimensions[1].height = 30
+        for res, offer in warnings:
+            notes.append([res.position.number, res.position.name, offer.requisites.name,
+                          offer.url, region_notice(offer)])
+        for row in notes:
+            for cell in row:
+                # Supplier observations are literal text, not Excel formulas.
+                if isinstance(cell.value, str):
+                    cell.data_type = "s"
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+        for col, width in zip("ABCDE", [12, 45, 30, 65, 85]):
+            notes.column_dimensions[col].width = width
+        for row in notes.iter_rows(min_row=2):
+            import math
+            lines = max(math.ceil(len(str(cell.value or "")) / width) for cell, width in
+                        zip(row, [10, 38, 25, 55, 70]))
+            notes.row_dimensions[row[0].row].height = min(409, max(30, lines * 15))
+            row[4].fill = PatternFill("solid", fgColor="FFF2CC")
+            if str(row[3].value or "").startswith(("https://", "http://")):
+                row[3].hyperlink = row[3].value
+    from ..equipment_output_policy import financial_summary, MISSING_PRICE, INCOMPLETE_TOTAL
+    summary = financial_summary(r for rows in results_by_discipline.values() for r in rows if not r.excluded_by_tsn)
+    if summary["missing_positions"]:
+        notes = wb.create_sheet("Полнота стоимости")
+        notes.append(["Известная часть стоимости, ₽", summary["known_subtotal"]])
+        notes.append(["Полная стоимость, ₽", None])
+        notes.append([INCOMPLETE_TOTAL])
+        notes.append(["Позиции без цены", ", ".join(map(str, summary["missing_positions"]))])
+        notes.column_dimensions["A"].width = 90
+    from ..source_notes import document_notes
+    document_warnings = document_notes(r for rows in results_by_discipline.values() for r in rows)
+    if document_warnings:
+        notes = wb.create_sheet("Предупреждения к документу")
+        notes.append(["Исходник SHA256", "Страница", "Таблица", "Строка", "Текст", "Координаты PDF", "Статус", "Тип наблюдения", "Исходная графа"])
+        for note in document_warnings:
+            notes.append([note["source_hash"], note["page"], note["table"], note["row"], note["text"], str(note["bbox"]), "Предупреждение к документу; известные позиции обрабатываются", note["code"], note.get("original_cell", "name")])
+        for row in notes:
+            for cell in row:
+                if isinstance(cell.value, str): cell.data_type = "s"
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+        notes.column_dimensions["E"].width = 75
+        notes.column_dimensions["F"].width = 55
+        notes.column_dimensions["G"].width = 65
     out_path = Path(out_path)
     wb.save(out_path)
     return out_path

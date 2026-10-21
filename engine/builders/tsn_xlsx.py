@@ -38,6 +38,10 @@ COLUMNS = [
 
 
 def _compute(row: TsnRow) -> TsnRow:
+    from ..equipment_output_policy import MISSING_PRICE
+    if row.decision == MISSING_PRICE and row.kac_max_price is None:
+        row.ratio_percent = None
+        return row
     if row.tsn_base_price is not None and row.coefficient is not None:
         row.tsn_current_price = round(row.tsn_base_price * row.coefficient, 2)
     if row.tsn_current_price and row.kac_max_price:

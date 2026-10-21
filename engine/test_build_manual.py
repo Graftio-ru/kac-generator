@@ -82,6 +82,9 @@ def main() -> None:
     g = [ws.cell(r, 7).value for r in range(9, 12)]
     print("цены поз.1 (по возрастанию):", g)
     assert g == sorted(g) and g[-1] == 24033
+    from datetime import date
+    assert ws.cell(9, 9).value == str(date.today().year), "в КАЦ не заполнен год"
+    assert ws.cell(9, 10).value == str((date.today().month - 1) // 3 + 1), "в КАЦ не заполнен квартал"
     print("\nВСЕ ПРОВЕРКИ ПРОЙДЕНЫ ✓")
 
 

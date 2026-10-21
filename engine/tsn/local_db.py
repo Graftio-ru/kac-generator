@@ -13,7 +13,8 @@ import re
 from functools import lru_cache
 
 from ..config import TSN_INDICES_FILE, TSN_REFERENCE_FILE
-from ..llm import complete_json
+from ..llm import complete_json, ModelOutputInvalid
+from ..search.failure_policy import ResearchControlError
 from ..models import TsnRow
 
 # Сопоставление вида работ → подстрока в наименовании строки таблицы индексов.
@@ -125,8 +126,12 @@ def lookup_tsn_price(name: str) -> dict | None:
             f"Наименование: {name}\n\nФрагмент справочника ТСН-2001:\n\n{fragment}",
             system=_MATCH_SYSTEM, smart=True,
         )
+    except ResearchControlError:
+        raise
     except Exception:
         return None
+    if not isinstance(data,dict):
+        raise ModelOutputInvalid('invalid_schema')
     return data if data.get("found") else None
 
 

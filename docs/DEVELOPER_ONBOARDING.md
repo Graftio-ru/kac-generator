@@ -3,6 +3,8 @@
 > Документ для программиста, который принимает проект и продолжает разработку.
 > Составлен 2026-09-07 по состоянию кода на коммите `92aeadb` (последняя работа — 17 июня 2026).
 > Дополняет — не заменяет — [`HANDOFF.md`](HANDOFF.md) и [`STATUS.md`](STATUS.md).
+> Разделы ниже описывают исходное состояние на 07.09.2026. Актуальные репозиторий,
+> ветка и результат прогона спецификации указаны в [`HANDOFF.md`](HANDOFF.md).
 
 ---
 
@@ -19,8 +21,8 @@
   страница **База-менеджер** (`/base.html`). Общий движок, общий код.
 - **Язык, стек.** Python 3.11+, FastAPI, Playwright (Chromium), Pydantic v2, openpyxl, PyMuPDF.
   Фронт — без сборки и без фреймворка. LLM сейчас — **DeepSeek** (не Claude).
-- **Репозиторий.** <https://github.com/Inslyer/kac-generator> (публичный). Ветка `main`, работа
-  ведётся прямо в `main`.
+- **Репозиторий.** <https://github.com/Graftio-ru/kac-generator>. Текущая работа —
+  в ветке `feat/kac-supplier-search-hardening`.
 - **Что НЕ в репозитории и нужно получить отдельно:** файл секретов `engine/.env`, папка
   `Obrazcy/` с эталонными образцами, накопленная база цен (сейчас пустая).
 
@@ -30,11 +32,11 @@
 
 | Что | Где | Примечание |
 |---|---|---|
-| Исходный код | <https://github.com/Inslyer/kac-generator> | публичный, ветка `main`, ~35 коммитов |
+| Исходный код | <https://github.com/Graftio-ru/kac-generator> | текущая работа в `feat/kac-supplier-search-hardening` |
 | Задеплоенный UI | <https://inslyer.github.io/kac-generator/> | GitHub Pages из папки `web/`; для **локальной** работы использовать `http://127.0.0.1:8765/` (см. §6) |
 | Старый прототип (архив) | <https://github.com/Inslyer/smeta-app> | Streamlit-монолит, предшественник, заброшен 10.06.2026 — только для истории, **не трогать** |
-| GitHub-аккаунт | `Inslyer` | владелец обоих репозиториев |
-| Локальная рабочая копия | `/Users/yuriy/Documents/Claude/KA` на машине владельца | синхронизирована с `origin/main` |
+| GitHub-аккаунт | `Graftio-ru` | организация владеет текущим репозиторием; `Inslyer/smeta-app` остаётся историческим прототипом |
+| Локальная рабочая копия | `/Users/MmM/WebstormProjects/graftio/kac-generator` | ветка `feat/kac-supplier-search-hardening` |
 | Память проекта (заметки) | `~/.claude/projects/-Users-yuriy-Documents-Claude-KA/memory/` | `kac-generator-project.md`, `kac-generator-backlog.md` — история решений и бэклог; продублировано в этом документе |
 
 ### Внешние сервисы (нужны ключи)
@@ -42,7 +44,7 @@
 | Сервис | Зачем | Тариф | Личный кабинет |
 |---|---|---|---|
 | **DeepSeek API** | структуризация спецификаций, разбор писем, извлечение цены/ИНН со страниц, матчинг наименований, матчинг ТСН | платный, дёшево | <https://platform.deepseek.com/api_keys> |
-| **Anthropic (Claude)** | тот же слой, если переключить `LLM_PROVIDER=anthropic`; единственный путь для vision-распознавания сканов без OCR | платный | <https://console.anthropic.com> |
+| **Anthropic (Claude)** | тот же слой, если переключить `LLM_PROVIDER=anthropic`; альтернативный провайдер с vision | платный | <https://console.anthropic.com> |
 | **DaData** | реквизиты (наименование/КПП/адрес) организации-продавца по ИНН | есть бесплатный тариф | <https://dadata.ru> |
 | **XMLRiver** (SERP-API) | выдача Яндекса в XML без капчи (замена официальному Yandex Search API, который новым аккаунтам недоступен) | платный, по запросам | <https://xmlriver.com> (user_id в проекте — `21356`) |
 
@@ -243,7 +245,7 @@ kac-generator/
 `run.cmd`, но проект отлаживался на macOS).
 
 ```bash
-git clone https://github.com/Inslyer/kac-generator.git
+git clone https://github.com/Graftio-ru/kac-generator.git
 cd kac-generator
 
 # 1. окружение движка
@@ -314,12 +316,12 @@ python -m engine.calibrate            # диагностика окружени�
 | `POST /base/fill` | `{positions: PositionIn[]}` | `{results:[{…, in_base, offers}], found, total}` | **Сметчик:** подтянуть готовые блоки из базы (без поиска) |
 | `POST /base/save` | `{positions: PositionIn[]}` | `{saved}` | **База-менеджер:** upsert блоков в базу (без поиска) |
 | `POST /base/import` | multipart: `file` (xlsx), `discipline` | `{job_id, positions}` | импорт списка позиций из Excel → фоновый поиск → база |
-| `POST /search_position` | `{name, type_mark, discipline}` | `{offers, candidates, year, quarter, found, checked, from_base, target}` | найти цены по одной позиции (cache-first) |
+| `POST /search_position` | `{name, type_mark, discipline, unit}` | `{offers, candidates, year, quarter, found, checked, from_base, target}` | найти цены по одной позиции (cache-first) |
 | `POST /capture` | `{url, inn?, extract?}` | `{screenshot_product, screenshot_requisites, extracted, requisites}` | снять скриншот карточки по URL + добрать реквизиты продавца |
 | `POST /build` | `BuildRequest` (`object_name, fix_date, use_tsn, skip_search, tsn_work_kind, positions[]`) | `{job_id}` | запустить сборку документов (фоновый поток) |
 | `GET /base` | — | `{count, last_refresh, disk_bytes, entries[]}` | сводка базы цен |
 | `POST /base/refresh` | — | `{job_id}` | переискать цены по всей базе (фоновая джоба) |
-| `POST /base/add` | `{name, type_mark, discipline}` | `{added, offers_count}` | ручное добавление одной позиции с поиском |
+| `POST /base/add` | `{name, type_mark, discipline, unit}` | `{added, offers_count}` | ручное добавление одной позиции с поиском |
 | `DELETE /base/{key}` | — | `{removed: bool}` | удалить запись базы (ключ — url-энкоденный) |
 | `GET /cache/{name}` | — | `image/png` | отдать скриншот из `engine/data/cache/` (берётся только basename — защита от обхода каталогов) |
 | `GET /jobs/{id}` | — | `{status, step, progress, log[-50:], outputs[], error}` | прогресс фоновой задачи |
@@ -338,17 +340,21 @@ python -m engine.calibrate            # диагностика окружени�
 
 ```dotenv
 # --- Провайдер LLM ---
-LLM_PROVIDER=deepseek                 # deepseek | anthropic
+# deepseek | anthropic
+LLM_PROVIDER=deepseek
 
 # --- DeepSeek (активный провайдер) ---
-DEEPSEEK_API_KEY=                     # обязателен при LLM_PROVIDER=deepseek
+# Обязателен при LLM_PROVIDER=deepseek.
+DEEPSEEK_API_KEY=
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL_SMART=deepseek-chat
 DEEPSEEK_MODEL_FAST=deepseek-chat
+DEEPSEEK_MODEL_VISION=deepseek-flash
 
-# --- Anthropic (фолбэк; нужен для vision-распознавания сканов без OCR) ---
+# --- Anthropic (альтернативный провайдер с vision) ---
 ANTHROPIC_API_KEY=
-MODEL_SMART=claude-opus-4-8           # ⚠ ID устарели, обновить перед переключением (см. §12)
+# ⚠ ID устарели, обновить перед переключением (см. §12).
+MODEL_SMART=claude-opus-4-8
 MODEL_FAST=claude-sonnet-4-6
 
 # --- Реквизиты по ИНН ---
@@ -358,23 +364,35 @@ DADATA_TOKEN=
 XMLRIVER_USER=21356
 XMLRIVER_KEY=
 XMLRIVER_URL=https://xmlriver.com/search_yandex/xml
-XMLRIVER_LR=213                       # код региона Яндекса, 213 = Москва
+# Код региона Яндекса, 213 = Москва.
+XMLRIVER_LR=213
 
 # --- Официальный Yandex Search API (не используется, оставлено на всякий случай) ---
 YANDEX_SEARCH_API_KEY=
 YANDEX_SEARCH_FOLDER_ID=
 
 # --- Параметры поиска цен ---
-MIN_SOURCES=5                         # минимум валидных офферов на позицию
-TOP_PRICES=3                          # сколько максимальных цен берём в КАЦ/ТКП
-VAT_RATE=22                           # НДС, %; графа H КАЦ = G / (1 + VAT_RATE/100)
-REGION=Москва и Московская область
-CUSTOM_MAKERS=                        # заводы уникального оборуд. через «;» → авто-пометка «уник.»
+# Минимум валидных офферов на позицию.
+MIN_SOURCES=5
+# Сколько максимальных цен берём в КАЦ/ТКП.
+TOP_PRICES=3
+# Мягкие лимиты: после основного списка остаётся время для резерва.
+PRIMARY_SEARCH_SECONDS=90
+POSITION_SEARCH_SECONDS=150
+# НДС, %; графа H КАЦ = G / (1 + VAT_RATE/100).
+VAT_RATE=22
+REGION="Москва и Московская область"
+# Заводы уникального оборудования через «;» → авто-пометка «уник.».
+CUSTOM_MAKERS=
 
 # --- Браузер ---
-BROWSER_HEADED=false                  # false = headless (штатно). true — если Яндекс просит капчу:
-                                      # разово запустить с true, решить капчу вручную → cookie
-                                      # сохранятся в data/cache/cookies.json, вернуть false.
+# false = headless (штатно). Если Яндекс просит капчу, разово установить true,
+# решить капчу вручную, дождаться сохранения cookie в data/cache/cookies.json и вернуть false.
+BROWSER_HEADED=false
+# Опциональный локальный mixed-прокси для российского IP.
+BROWSER_PROXY_SERVER=http://127.0.0.1:2080
+# Опциональный установленный Google Chrome вместо bundled Chromium.
+BROWSER_CHANNEL=chrome
 
 # --- Скриншот карточки реквизитов по ИНН (пробуются по порядку) ---
 # REQUISITES_SOURCES=https://www.audit-it.ru/contragent/{inn};https://sbis.ru/contragents/{inn};...
@@ -411,8 +429,10 @@ DTO слоя API (`engine/schemas.py`): `PositionIn`/`OfferIn` (редактир
 Единственная точка входа — `complete_json(prompt, *, system, smart, max_tokens, images)`.
 Диспетчеризация по `settings.llm_provider`:
 - `deepseek` — POST на OpenAI-совместимый `/chat/completions`, `response_format=json_object`
-  (требует слова «json» в промпте — обёртка добавляет сама). **Vision не поддерживается** —
-  вызов с `images` бросает `LLMUnavailable`.
+  (требует слова «json» в промпте — обёртка добавляет сама). Изображения передаются
+  как локальные base64 `image_url` с `detail=original` через отдельную
+  `DEEPSEEK_MODEL_VISION=deepseek-flash`; текстовые модели остаются прежними.
+  Для vision thinking отключён. Пустой, обрезанный или некорректный JSON — явная ошибка.
 - `anthropic` — SDK `anthropic`, поддерживает `images` (base64 PNG).
 
 `smart=True` → «сильная» модель (матчинг, сложные случаи), иначе «быстрая». У DeepSeek обе =
@@ -422,9 +442,20 @@ DTO слоя API (`engine/schemas.py`): `PositionIn`/`OfferIn` (редактир
 
 `parse_spec(path, discipline, unique_names)` — диспетчер по расширению:
 - **PDF с текстом** → PyMuPDF → LLM.
-- **PDF-скан** (эвристика: `len(text) < 40 * page_count`) → локальный OCR
-  (`_ocr_backend()`: Apple Vision `ocrmac` → Tesseract) → LLM по OCR-тексту. Если OCR нет и
-  провайдер `anthropic` — фолбэк на Claude vision (рендер страниц в PNG). Иначе `LLMUnavailable`.
+- **PDF-скан / изображение, DeepSeek** → оригинальные изображения и увеличенные
+  перекрывающиеся фрагменты → vision JSON. Локальный OCR (Apple Vision / Tesseract),
+  когда доступен, отдельно сверяет ячейки: конфликт не заменяет чтение изображения,
+  а создаёт конкретное замечание. Автоматическое чтение не означает проверку человеком.
+- Сверка марок учитывает визуально одинаковые буквы кириллицы и латиницы, пробелы,
+  типографские тире и обозначения размеров. Исходная запись сохраняется; цифры и буквы
+  (`0`/`D`/`O`, `1`/`I` и т. п.) не подменяются. Для буквенно-цифровых марок изображения
+  с `0` или `O` остаётся предупреждение даже при согласии модели и OCR: оба могут
+  повторить одну ошибку. Это консервативный сигнал проверки, а не доказательство ошибки.
+  Пустая колонка «Тип, марка» не отменяет чтение соседней колонки кода изделия.
+  Если vision пропустил код, а OCR его прочитал, замечание показывает кандидат OCR,
+  но не утверждает, что он записан в исходную позицию. Отсутствие чтения количества
+  OCR и положительное расхождение количеств обозначаются разными причинами.
+- **PDF-скан / изображение, Anthropic** → прежний OCR-путь с vision-фолбэком без OCR.
 - **DOCX** → `python-docx` (абзацы + таблицы) → LLM.
 - **XLSX/XLS** → `openpyxl` (строки листов) → LLM.
 
@@ -435,17 +466,42 @@ DTO слоя API (`engine/schemas.py`): `PositionIn`/`OfferIn` (редактир
 ### 10.3. Поиск цен (`engine/search/`)
 
 `agent.research_position(browser, pos, year, quarter)`:
-1. `build_queries` — LLM генерит 3 поисковых запроса (фолбэк — шаблонные).
+1. `build_queries` — при наличии `type_mark` сохраняет точный запрос по марке первым, затем одним
+   LLM-вызовом на позицию добавляет запросы с синонимами, альтернативными торговыми названиями
+   и назначением товара; итоговый набор ограничен тремя вариантами. При сбое LLM остаются
+   шаблонные запросы по имени и марке; запросы нормализуются и дедуплицируются.
+   В автоматическом задании параллельно обрабатываются разные позиции;
+   поисковые задачи одной позиции идут
+   последовательно по очереди обходов.
+   Совместимые артикулы получают дополнительный вариант с латинскими буквами вместо
+   визуально одинаковых кириллических. Он не вытесняет точные и семантические запросы
+   из лимита и не ослабляет проверку найденных предложений.
+   В автоматическом задании варианты готовятся один раз внутри первого поискового
+   обработчика. Первый обход групп основного списка чередует варианты запросов;
+   затем идёт первый обход резервного списка и оставшиеся варианты. Каждая пара
+   «запрос — сайт» сохраняется в плане один раз, но лимит времени может не дать её
+   выполнить. Отмена после подготовки запросов предотвращает новый поисковый вызов.
 2. **Фаза 1 — доверенные поставщики.** `search_engine.search_on_sites` — `site:`-ограниченная
-   выдача XMLRiver батчами по 6 доменов из `Поставщики.md`. Обход карточек (`_collect_offers`).
-3. **Фаза 2 — общий интернет** — только если офферов `< TOP_PRICES`. `search_engine.search_candidates`:
-   XMLRiver → Yandex API → браузерная выдача. Маркетплейсы (`market.yandex`, `ozon`, `wildberries`,
-   `avito`, `youla`) отсекаются.
+   выдача XMLRiver параллельными батчами по 8 доменов из `Поставщики.md`. Обход карточек
+   (`_collect_offers`).
+3. **Фаза 2 — резерв Москвы/МО** — только если офферов `< MIN_SOURCES`. Повторный
+   `search_engine.search_on_sites` ограничивает XMLRiver доменами из
+   `Поставщики_резерв_Москва.md`; произвольная интернет-выдача в этом сценарии не используется.
+   Если марка совпадает с доменом производителя из резервного списка, его точная карточка
+   проверяется первой внутри резервной фазы.
+   По умолчанию основной список получает 90 секунд, вся позиция — 150 секунд. Лимиты мягкие:
+   начатый сетевой запрос или карточка могут завершиться позже. При остановке отчёт сохраняет
+   уже найденные цены, причину недобора и фактическое время фаз в `phase_seconds`.
 4. Для каждой карточки: детектор капчи (`_looks_like_bot_check` — сильные фразы при любой длине,
    слабые — только на коротких страницах; один ретрай с перезагрузкой); LLM извлекает
-   `price_with_vat` / `product_title` / `moscow_pickup` / `city` / `seller_inn` из текста
-   страницы; скриншот карточки 1366×900 → `data/cache/prod_*.png`.
-5. Реквизиты: для доверенного хоста — из `Поставщики.md`; иначе ИНН со страницы → `valid_inn`
+   цену и размер упаковки / `product_title` / `moscow_pickup` / `city` / `seller_inn` и одновременно
+   проверяет соответствие запрошенному товару с учётом синонимов и альтернативных названий.
+   Цена упаковки нормализуется к единице измерения позиции (например, 102 169 ₽ за 20 м →
+   5 108,45 ₽/м); уже указанная цена за единицу повторно не делится.
+   Код до LLM отклоняет явные конфликты модели или типоразмера; отсутствие артикула в заголовке
+   считается неясным случаем и требует положительного семантического решения LLM. Скриншот
+   карточки 1366×900 → `data/cache/prod_*.png`.
+5. Реквизиты: для хоста из основного списка — из `Поставщики.md`; для резервного — ИНН со страницы → `valid_inn`
    (контрольные цифры, отсекает галлюцинации DeepSeek) → DaData → фолбэк на скрейп сайта продавца.
 6. Отбор `offers[-TOP_PRICES:]` по возрастанию цены; всё найденное — в `all_offers`.
 
@@ -543,8 +599,9 @@ UA — фиксированный Chrome 131 Windows, локаль `ru-RU`, вь
 - **Фоновые джобы — в памяти процесса** (`JOBS` в `app.py`); перезапуск движка их теряет.
 - **Пути скриншотов в офферах — абсолютные** → на другой машине не резолвятся (важно для плана
   «база на Google Drive», см. §13).
-- **`vseinstrumenti.ru`** стабильно отдаёт капчу при заходе за скриншотами карточек — ретрай не
-  помогает, нужен резидентный прокси / cookie.
+- **`vseinstrumenti.ru`** открывает карточку с ценой в обычном Chrome, но Playwright и прямой
+  HTTP-запрос через тот же московский прокси получают 403. Надёжный автоматический сбор
+  текущим движком не подтверждён; нужен согласованный B2B-прайс/API либо ручной ввод цены.
 
 ---
 
@@ -561,7 +618,8 @@ UA — фиксированный Chrome 131 Windows, локаль `ru-RU`, вь
 3. **Деплой движка на VPS** (доступ по ссылке с любого компьютера). На Linux — Tesseract вместо
    `ocrmac`, перенести `cookies.json`, cron на `/base/refresh`. Риск: серверный IP → капча/блок
    магазинов и mos.ru (ради чего движок и локальный).
-4. **Капча `vseinstrumenti.ru`** — прокси / иной способ получения карточки.
+4. **`vseinstrumenti.ru`** — согласовать B2B-прайс/API либо ручной ввод цены; текущий
+   автоматический сбор через московский прокси блокируется 403.
 5. **База на Google Drive без серверов** — общий каталог базы (`index.json` + скриншоты) в папке
    Google Drive Desktop, приложение у каждого сотрудника локально. Пишет один человек, остальные
    читают. Доработки: `BASE_DIR` из `.env`; скриншоты хранить В каталоге базы и ссылаться по
@@ -574,8 +632,9 @@ UA — фиксированный Chrome 131 Windows, локаль `ru-RU`, вь
 
 ## 14. Как продолжать разработку
 
-- Ветка `main`, коммиты прямо в неё (проект вёл один человек). При работе вдвоём —
-  завести ветки/PR.
+- Текущая работа ведётся в ветке `feat/kac-supplier-search-hardening` на
+  локальном checkout. Перед commit/push — итоговая проверка изменений и
+  согласование плана публикации; не работать напрямую в `main`.
 - После значимого изменения обновлять `docs/HANDOFF.md` и `docs/STATUS.md` — это точки входа.
 - UI деплоится сам: push с изменениями в `web/**` → GitHub Actions → Pages
   (`.github/workflows/pages.yml`). Движок нигде не деплоится — только локально.

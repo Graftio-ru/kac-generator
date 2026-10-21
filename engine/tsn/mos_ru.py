@@ -11,7 +11,8 @@ from __future__ import annotations
 
 from datetime import date
 
-from ..llm import complete_json
+from ..llm import complete_json, ModelOutputInvalid
+from ..search.failure_policy import ResearchControlError
 from ..models import TsnRow
 
 BASE_URL = ("https://www.mos.ru/mke/function/tcenoobrazovanie/"
@@ -41,7 +42,14 @@ def fetch_current_coefficient(browser, as_of: date | None = None) -> float | Non
                    "указанную дату. Верни JSON {coefficient: число, period: строка}. Только JSON.",
             smart=True,
         )
-        return float(data["coefficient"])
+        if not isinstance(data,dict)or isinstance(data.get('coefficient'),bool)or not isinstance(data.get('coefficient'),(int,float)):
+            raise ModelOutputInvalid('invalid_schema')
+        import math
+        if not math.isfinite(data['coefficient'])or data['coefficient']<=0:
+            raise ModelOutputInvalid('invalid_schema')
+        return float(data['coefficient'])
+    except ResearchControlError:
+        raise
     except Exception:
         return None
 
@@ -56,7 +64,11 @@ def lookup_tsn_price(browser, name: str) -> dict | None:
             f"Наименование: {name}\n\nФрагмент сборника ТСН-2001:\n\n{text[:15000]}",
             system=MATCH_SYSTEM, smart=True,
         )
+        if not isinstance(data,dict):
+            raise ModelOutputInvalid('invalid_schema')
         return data if data.get("found") else None
+    except ResearchControlError:
+        raise
     except Exception:
         return None
 

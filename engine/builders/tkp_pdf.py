@@ -6,7 +6,7 @@
   справа — панель реквизитов продавца (ОГРН/ИНН/КПП).
 
 Шапка справа сверху: «УТВЕРЖДАЮ:», линии для подписи, «М.П.», «Дата фиксации: ДД.ММ.ГГГГ».
-Подвал слева снизу: «Цена указана включая НДС {vat}%».
+Подвал: настроенное расчётное допущение, не подтверждение НДС поставщика.
 Номер страницы проставляется в графу Q соответствующей позиции КАЦ.
 
 Позиции из писем (уникальное оборудование) в Том ТКП НЕ включаются.
@@ -55,10 +55,16 @@ def _draw_header(page: fitz.Page, fix_date: str) -> None:
                      fontname=FONT, fontsize=9)
 
 
+def _draw_assumption(page: fitz.Page, y: float) -> None:
+    lines = [f"Расчётное допущение: НДС {settings.vat_rate:g}%; делитель {settings.vat_divisor:g}.",
+             "Не подтверждает НДС в цене поставщика."]
+    for line in lines:
+        page.insert_text((MARGIN, y), line, fontname=FONT, fontsize=9)
+        y += 11
+
+
 def _draw_footer(page: fitz.Page) -> None:
-    page.insert_text((MARGIN, A4.height - 12),
-                     f"Цена указана включая НДС {settings.vat_rate}%",
-                     fontname=FONT, fontsize=9)
+    _draw_assumption(page, A4.height - 23)
 
 
 def _place_image(page: fitz.Page, rect: fitz.Rect, img_path: str | None, label: str) -> None:
@@ -129,7 +135,15 @@ def _draw_position_page(doc: fitz.Document, res: PositionResult, fix_date: str) 
         offer = offers[k] if k < len(offers) else None
         _place_image(page, left, offer.screenshot_product if offer else None, "карточка товара")
         if offer:
-            _draw_requisites_panel(page, right, offer.requisites)  # реквизиты всегда текстом
+            from ..region_policy import region_notice
+            notice = region_notice(offer)
+            panel = fitz.Rect(right.x0, right.y0, right.x1, right.y1 - 58) if notice else right
+            _draw_requisites_panel(page, panel, offer.requisites)
+            if notice:
+                # Position and supplier are identified by the adjacent card/requisites.
+                page.insert_textbox(fitz.Rect(right.x0 + 6, right.y1 - 54, right.x1 - 6, right.y1 - 4),
+                                    "\n".join(_wrap(notice, 43)[:5]),
+                                    fontname=FONT, fontsize=7, color=(0.55, 0.32, 0.05))
         else:
             _place_image(page, right, None, "реквизиты")
 
@@ -147,8 +161,7 @@ def _draw_cover(doc: fitz.Document, object_name: str, fix_date: str) -> None:
         page.insert_text((MARGIN, y), chunk, fontname=FONT, fontsize=11)
         y += 16
     page.insert_text((MARGIN, y + 30), f"Дата фиксации: {fix_date}", fontname=FONT, fontsize=11)
-    page.insert_text((MARGIN, A4.height - 40),
-                     f"Цена указана включая НДС {settings.vat_rate}%", fontname=FONT, fontsize=10)
+    _draw_assumption(page, A4.height - 40)
 
 
 def _wrap(text: str, width: int) -> list[str]:
@@ -174,6 +187,7 @@ def build_tkp(
     Каждой искомой позиции (есть онлайн-офферы) выделяется одна страница.
     Номер страницы (1-based, без титула) записывается в res.tkp_page и возвращается в маппинге.
     """
+    results = list(results)
     fix_date = fix_date or date.today().strftime("%d.%m.%Y")
     doc = fitz.open()
     _draw_cover(doc, object_name, fix_date)
@@ -190,6 +204,34 @@ def build_tkp(
         page_map[res.position.number] = page_no
         _draw_position_page(doc, res, fix_date)
 
+    from ..equipment_output_policy import missing_own_price, MISSING_PRICE, INCOMPLETE_TOTAL
+    missing = [r for r in results if missing_own_price(r.position, r.offers)]
+    if missing:
+        page = doc.new_page(width=A4.width, height=A4.height)
+        _register_font(page)
+        y = MARGIN + 14
+        page.insert_text((MARGIN, y), INCOMPLETE_TOTAL, fontname=FONT, fontsize=10)
+        y += 28
+        for res in missing:
+            text = f"{res.position.number}. {res.position.full_name}; {res.position.type_mark}; {res.position.qty:g} {res.position.unit}. {MISSING_PRICE}"
+            for line in _wrap(text, 85):
+                if y > A4.height - MARGIN:
+                    page = doc.new_page(width=A4.width, height=A4.height); _register_font(page); y = MARGIN + 14
+                page.insert_text((MARGIN, y), line, fontname=FONT, fontsize=9); y += 14
+            y += 10
+    from ..source_notes import document_notes, note_description
+    notes = document_notes(results)
+    if notes:
+        page = doc.new_page(width=A4.width, height=A4.height); _register_font(page)
+        y = MARGIN + 14
+        page.insert_text((MARGIN, y), "Предупреждения к документу; известные позиции обрабатываются", fontname=FONT, fontsize=10); y += 28
+        for note in notes:
+            text = note_description(note)
+            for line in _wrap(text, 90):
+                if y > A4.height - MARGIN:
+                    page = doc.new_page(width=A4.width, height=A4.height); _register_font(page); y = MARGIN + 14
+                page.insert_text((MARGIN, y), line, fontname=FONT, fontsize=9); y += 14
+            y += 10
     out_path = Path(out_path)
     doc.save(out_path, deflate=True)
     doc.close()
