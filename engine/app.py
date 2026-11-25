@@ -920,7 +920,7 @@ def _save_research_job(job_id: str, *, force: bool = True) -> bool:
 
 
 def _save_research_job_locked(job_id: str, *, force: bool = True) -> bool:
-    """Persist lifecycle only. Row/event producers publish new deltas directly."""
+    """Persist durable lifecycle fields, excluding the process-local provider admission."""
     import copy
     publisher = _research_publisher(job_id)
     # First stop is a canonical immutable receipt, not a diagnostic recomputed
@@ -949,7 +949,7 @@ def _save_research_job_locked(job_id: str, *, force: bool = True) -> bool:
     fields = copy.deepcopy({k: v for k, v in RESEARCH_JOBS[job_id].items()
               if k not in {'job_id','rows','progress_rows','total','completed','revision',
                            'configured_hosts','primary_hosts','fallback_hosts','refresh_first','force_discovery',
-                           '_catalogue_search_route','_catalogue_search_receipt'}})
+                           '_catalogue_search_route','_catalogue_search_receipt','_catalogue_xmlriver'}})
     if fields == _RESEARCH_LIFECYCLES.get(key):
         if force:
             publisher.drain()
@@ -1489,22 +1489,29 @@ def _run_catalogue_unknown_job_with_documents(job_id, store, *, resumed=None):
         if parent_deadline is not None and time.monotonic()>=parent_deadline:raise SearchBudgetExceeded('Общий срок получения завершён')
     lease_keeper=AcquisitionLeaseKeeper(store,lease_control,cancelled=lambda:bool(job.get('cancel_requested')),owner=job_id)
     try:
+        from .search.catalogue_xmlriver import CatalogueXmlRiver, STATE_KEY
         if resumed is None:
-            from .search.search_route import resolve_initial_route
-            from .search.session import research_session
-            with research_session(health,llm_guard=guard,deadline=parent_deadline,cancelled=lambda:bool(job.get('cancel_requested'))):
-                route,receipt=guard.call('search_account_api',lambda:resolve_initial_route(deadline=parent_deadline))
-            job['_catalogue_search_route']=route
-            job['_catalogue_search_receipt']=receipt
-            if (receipt or {}).get('account_admission') is not None:
-                job.setdefault('search_account_admission',receipt['account_admission'])
-                _save_research_job(job_id,force=True)
-            if route is not None:
-                job['search_backend']=route['backend']
-                job['search_backend_reason']=(receipt or {}).get('selection_reason','')
-                job['search_backend_observed_at']=(receipt or {}).get('observed_at')
+            job['_catalogue_search_route']=None
+            job.setdefault(STATE_KEY,{'state':'pending'})
+            _save_research_job(job_id,force=True)
         else:
             job['_catalogue_search_route']=_original_catalogue_search_route([(0,v[1]) for v in resumed.values()]) if resumed else job.get('_catalogue_search_route')
+
+        def persist_xmlriver_admission(state):
+            """Acknowledge the job's external route before admitting a query to it."""
+            with _RESEARCH_LOCK:
+                job[STATE_KEY]=state
+                if state['state']=='ready' and state['profile'] is not None:
+                    job.update(search_backend=state['profile']['backend'],search_backend_reason=state['reason'],
+                               search_backend_observed_at=state['observed_at'])
+                    if 'account_admission' in state:
+                        job.setdefault('search_account_admission',state['account_admission'])
+                elif state['state']=='unavailable':
+                    job.update(partial=True,business_complete=False)
+                _save_research_job(job_id,force=True)
+
+        if STATE_KEY in job:
+            job['_catalogue_xmlriver']=CatalogueXmlRiver(job[STATE_KEY],persist_xmlriver_admission)
         lease_keeper.start()
         if job.get('cancel_requested'):
             job['status']='cancelled'
@@ -1607,6 +1614,7 @@ def _run_catalogue_unknown_job_with_documents(job_id, store, *, resumed=None):
                 elif job.get('status')=='error' or admission.product_id not in job.get('catalogue_awaiting_products',[]):store.finish_acquisition(admission,error=job.get('error',''))
         except CatalogueStoreError:
             job.update(status='error',error='Каталог недоступен; получение остановлено',error_code='catalogue_store_error')
+        job.pop('_catalogue_xmlriver',None)
         try:_save_research_job(job_id)
         finally:
             with _RESEARCH_LOCK:
@@ -1773,6 +1781,7 @@ def _catalogue_discovery_diagnostic_fields(saved,value):
 
 
 def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,health,parent_deadline=None,lease_keeper=None,frontier=None,slice_until=None):
+    """Yield bounded product operations and checkpoint discovery, capture and review outcomes."""
     from collections import deque
     from .search.acquisition_scheduler import Operation,SelectCard,OperationParked,advance_substage
     import httpx
@@ -1783,6 +1792,7 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
     from .search.article_query_plan import build_article_query_plan
     from .search.discovery_plan import StagedDiscoveryPlan,DiscoveryObservationCache,expand_discovery_tasks,own_prefix
     from .search.search_engine import search_on_sites
+    from .search.catalogue_xmlriver import catalogue_xmlriver_scope
     from .search.failure_policy import ResearchControlError,SearchCapacityDeferred,SearchQueryFailed,ResearchInternalFailure,SearchServiceUnavailable
     from .llm import LLMUnavailable
     from .search.session import research_session,bounded_timeout,research_deadline,SearchBudgetExceeded,SupplierDeferred,ResearchProgressError
@@ -2117,7 +2127,9 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
                     if value.get('origin')=='supplier_own_search' and value.get('candidate_count',0)>0:item['own_search_positive']=True
                 try:
                     from .search.search_route import search_route_scope
-                    with search_route_scope(job.get('_catalogue_search_route')),research_session(health,llm_guard=guard,deadline=operation_deadline,cancelled=cancelled):
+                    with (search_route_scope(job.get('_catalogue_search_route')),
+                          catalogue_xmlriver_scope(job.get('_catalogue_xmlriver')),
+                          research_session(health,llm_guard=guard,deadline=operation_deadline,cancelled=cancelled)):
                         if state['response'] is not None:urls,reused=response_value(state),True
                         else:
                             parts=own_prefix(controller.value['queries'],state) if controller.value['version']==5 else []

@@ -21,7 +21,8 @@ PRE_RUNNER_SOURCE_FILES=PRE_SERVER_SOURCE_FILES+('server_auth.py','config.py',)
 PRE_SERVICE_SOURCE_FILES=PRE_RUNNER_SOURCE_FILES+('runner_control.py','runner_executor.py','runner_protocol.py',)
 PRE_METHOD_SOURCE_FILES=PRE_SERVICE_SOURCE_FILES+('runner_service.py','runner_cloud.py','runner_cloud_http.py',)
 PRE_KNOWN_CAPTURE_SOURCE_FILES=PRE_METHOD_SOURCE_FILES+('supplier_methods.py',)
-SOURCE_FILES=PRE_KNOWN_CAPTURE_SOURCE_FILES+('known_card_runner.py','search/known_capture_intent.py','search/document_context.py')
+PRE_XMLRIVER_ADMISSION_SOURCE_FILES=PRE_KNOWN_CAPTURE_SOURCE_FILES+('known_card_runner.py','search/known_capture_intent.py','search/document_context.py')
+SOURCE_FILES=PRE_XMLRIVER_ADMISSION_SOURCE_FILES+('search/catalogue_xmlriver.py',)
 class IntentInvalid(ValueError):pass
 
 def plain(value):return json.loads(json.dumps(value,sort_keys=True,allow_nan=False))
@@ -50,7 +51,7 @@ def validate(value):
     current_names=SOURCE_FILES if value['version']=='acquisition-source-intent-v7' else names
     for key,names in (('components',names),('legacy_components',LEGACY_FILES)):
         allowed=(set(names),set(current_names)) if key=='components' else (set(names),)
-        if key=='components' and value['version']=='acquisition-source-intent-v7':allowed=allowed+(set(PRE_FACTORY_SOURCE_FILES),set(PRE_PURCHASE_SOURCE_FILES),set(PRE_LITERAL_SOURCE_FILES),set(PRE_ESTIMATOR_SOURCE_FILES),set(PRE_SERVER_SOURCE_FILES),set(PRE_RUNNER_SOURCE_FILES),set(PRE_SERVICE_SOURCE_FILES),set(PRE_METHOD_SOURCE_FILES),set(PRE_KNOWN_CAPTURE_SOURCE_FILES))
+        if key=='components' and value['version']=='acquisition-source-intent-v7':allowed=allowed+(set(PRE_FACTORY_SOURCE_FILES),set(PRE_PURCHASE_SOURCE_FILES),set(PRE_LITERAL_SOURCE_FILES),set(PRE_ESTIMATOR_SOURCE_FILES),set(PRE_SERVER_SOURCE_FILES),set(PRE_RUNNER_SOURCE_FILES),set(PRE_SERVICE_SOURCE_FILES),set(PRE_METHOD_SOURCE_FILES),set(PRE_KNOWN_CAPTURE_SOURCE_FILES),set(PRE_XMLRIVER_ADMISSION_SOURCE_FILES))
         if type(value[key]) is not dict or set(value[key]) not in allowed:raise IntentInvalid('source_components_invalid')
         for item in value[key].values():hex64(item)
     receipt=value['receipt']

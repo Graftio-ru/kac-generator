@@ -1,5 +1,5 @@
 """Exact native route, real HTTPX MockTransport, typed DNS cause; no Settings/wires."""
-import sys,types,contextvars,socket,json,time,unittest,ast,tempfile,uuid
+import sys,types,contextvars,socket,json,time,unittest,tempfile
 from pathlib import Path
 from unittest.mock import patch
 sys.dont_write_bytecode=True;sys.path.insert(0,str(Path(__file__).resolve().parent.parent))
@@ -48,12 +48,33 @@ class Checks(unittest.TestCase):
   stop=ResearchControlError('original-global-stop');result,error,calls,guard=self.exercise([('again',16.061)],stop=stop);self.assertIs(error,stop);self.assertEqual(len(calls),1)
   result,error,calls,guard=self.exercise([('again',16.061)],global_end=15);self.assertIsInstance(error,session.SearchBudgetExceeded);self.assertEqual(len(calls),1)
   result,error,calls,guard=self.exercise([('again',31)]);self.assertIsInstance(error,session.SearchBudgetExceeded);self.assertEqual(len(calls),1)
- def test_recovered_receipt_actual_app_save_store_reload(self):
-  from engine.research_publication import IntegrationStore,DeltaPublisher
-  result,error,calls,guard=self.exercise([('again',16.061),('ok',0.5)]);receipt=result[1];tree=ast.parse(Path(__file__).with_name('app.py').read_text());save=next(n for n in tree.body if isinstance(n,ast.FunctionDef)and n.name=='_save_research_job_locked');native=next(n for n in tree.body if isinstance(n,ast.FunctionDef)and n.name=='_run_catalogue_unknown_job_with_documents');block=next(n for n in ast.walk(native)if isinstance(n,ast.If)and 'account_admission' in ast.unparse(n.test))
+ def test_recovered_receipt_survives_durable_catalogue_admission(self):
+  """Retain the safe DNS recovery receipt across a job-store reload."""
+  from engine.research_publication import IntegrationStore
+  from engine.search.catalogue_xmlriver import CatalogueXmlRiver,STATE_KEY
+  result,_,_,_=self.exercise([('again',16.061),('ok',0.5)])
   with tempfile.TemporaryDirectory()as d:
-   store=IntegrationStore(Path(d));key='a'*12;store.create_job(key,[{'number':1,'name':'offline','unit':'шт','qty':1}],['example.test']);publisher=DeltaPublisher(store,key);job={};ns={'__package__':'engine','job':job,'receipt':receipt,'job_id':key,'json':json,'time':time,'uuid':uuid,'RESEARCH_JOBS':{key:job},'RESEARCH_JOB_DIR':Path(d),'_research_publisher':lambda j:publisher,'_RESEARCH_CONTINUATIONS':{},'_RESEARCH_LIFECYCLE_RETRIES':{},'_RESEARCH_LIFECYCLES':{},'_RESEARCH_CHECKPOINT_AT':{}}
-   exec(compile(ast.fix_missing_locations(ast.Module(body=[save],type_ignores=[])),'engine/app.py','exec'),ns);ns['_save_research_job']=ns['_save_research_job_locked'];exec(compile(ast.fix_missing_locations(ast.Module(body=[block],type_ignores=[])),'engine/app.py','exec'),ns);store.close();store=IntegrationStore(Path(d));persisted=store.public(key)['search_account_admission'];self.assertEqual(persisted['search_transport_attempt_count'],2);self.assertEqual(len(persisted['search_transport_attempts']),1);self.assertEqual(persisted['response_status'],200);self.assertNotIn('sensitive',json.dumps(persisted));store.close()
+   key='a'*12
+   store=IntegrationStore(Path(d))
+   store.create_job(key,[{'number':1,'name':'offline','unit':'шт','qty':1}],['example.test'])
+   initial={'state':'pending'}
+   store.commit_update(key,'pending',lifecycle={STATE_KEY:initial})
+   def persist(state):
+    """Write one admitted transition to the real job lifecycle store."""
+    store.commit_update(key,state['state'],lifecycle={STATE_KEY:state})
+   admission=CatalogueXmlRiver(initial,persist)
+   with patch.object(route,'resolve_initial_route',return_value=result):
+    self.assertEqual(admission.resolve(deadline=None,configured=True),result[0])
+   store.close()
+   reopened=IntegrationStore(Path(d))
+   try:
+    saved=reopened.public(key)[STATE_KEY]['account_admission']
+    self.assertEqual(saved['search_transport_attempt_count'],2)
+    self.assertEqual(len(saved['search_transport_attempts']),1)
+    self.assertEqual(saved['response_status'],200)
+    self.assertNotIn('sensitive',json.dumps(saved))
+   finally:
+    reopened.close()
  def test_legacy_one_success_and_second_http_schema_preserve_history(self):
   result,error,calls,guard=self.exercise([('ok',1)]);self.assertEqual(result[1]['account_api_calls'],1);self.assertNotIn('account_transport_failures',result[1])
   for second in ['403','invalid']:

@@ -448,6 +448,13 @@ class ResearchStore:
                     raise Conflict("Cancellation cannot be cleared")
                 if state.get("first_stop") is not None and lifecycle.get("first_stop", state["first_stop"]) != state["first_stop"]:
                     raise Conflict("First stop cannot be overwritten")
+                if 'catalogue_xmlriver_admission' in lifecycle:
+                    from .search.catalogue_xmlriver import STATE_KEY, valid_transition
+                    try:
+                        if not valid_transition(state.get(STATE_KEY), lifecycle[STATE_KEY]):
+                            raise Conflict('XMLRiver admission cannot be reset or rebound')
+                    except ValueError as error:
+                        raise Invalid('Invalid XMLRiver admission') from error
                 state.update(lifecycle)
                 if "first_stop" in state and (not isinstance(state["first_stop"], dict) or not state["first_stop"]):
                     raise Invalid("Invalid first stop")

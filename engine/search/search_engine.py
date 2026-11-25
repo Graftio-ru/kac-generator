@@ -17,7 +17,8 @@ import httpx
 
 from ..config import settings
 from ..telemetry import record_stage, timed_stage
-from .search_route import active_search_route
+from .search_route import active_search_route, search_route_scope
+from .catalogue_xmlriver import XMLRiverDiscoveryUnavailable, active_catalogue_xmlriver
 from .admission import OrderedSlots
 from .discovery_cache import DiscoveryCache
 from .session import SearchBudgetExceeded, ResearchProgressError, research_deadline
@@ -41,24 +42,37 @@ class DiscoveryURLs(list):
         self.host_observations = deepcopy(host_observations or {})
 
 def guarded_search(operation):
+    """Apply the existing provider lane and isolate XMLRiver for catalogue discovery only."""
     from functools import wraps
     @wraps(operation)
     def guarded(*args, **kwargs):
+        """Run one bounded search with the provider policy from the current job context."""
         from ..llm import captured_request_guard
         guard = captured_request_guard()
         from .session import deadline_scope
         # XMLRiver's finite logical operation begins before provider admission.
-        deadline = time.monotonic()+30 if operation.__name__ == 'xmlriver_search' else None
+        is_xmlriver = operation.__name__ == 'xmlriver_search'
+        deadline = time.monotonic()+30 if is_xmlriver else None
+        admission = active_catalogue_xmlriver() if is_xmlriver else None
+
+        def invoke():
+            """Classify isolated provider failures before the job-wide guard sees them."""
+            def request():
+                """Preserve the selected search adapter's arguments and result."""
+                return operation(*args, **kwargs)
+
+            return admission.query(request) if admission is not None else request()
+
         cache_token=_SEARCH_CACHE_ALLOCATION.set(research_deadline() is not None or kwargs.get('deadline') is not None)
         try:
             with deadline_scope(deadline):
-                if guard is None:return operation(*args, **kwargs)
+                if guard is None:return invoke()
                 guard.check_physical_route('search_query',
                     provider='xmlriver-google' if operation.__name__ == 'xmlriver_search' else operation.__name__,
                     endpoint=_effective_search_endpoint() if operation.__name__ == 'xmlriver_search' else None)
                 temporary_xmlriver = operation.__name__ == 'xmlriver_search' and _documented_xmlriver_endpoint(_effective_search_endpoint())
                 with guard.search_capacity_scope(temporary_xmlriver):
-                    return guard.call('search_api', lambda: operation(*args, **kwargs))
+                    return guard.call('search_api', invoke)
         finally:
             _SEARCH_CACHE_ALLOCATION.reset(cache_token)
     return guarded
@@ -199,11 +213,15 @@ def _search_get(url, *, operation_deadline=None, seconds=30, response_validator=
     started=time.monotonic();deadline=min(started+seconds,operation_deadline) if operation_deadline is not None else started+seconds
     operation=uuid.uuid4().hex;attempts=[];response_failures=[];wire_count=0;response_status=None;response_ok=False
     def report():
+        """Build the safe transport receipt from the attempts made so far."""
         return SearchTransportReport(operation,wire_count,tuple(attempts),round(time.monotonic()-started,6),response_status,tuple(response_failures))
     try:
         with deadline_scope(deadline):
             for attempt in (1,2):
                 remaining=bounded_timeout(seconds)
+                admission=active_catalogue_xmlriver() if response_validator is _xmlriver_response_policy else None
+                if admission is not None:
+                    admission.check_query()
                 from ..llm import captured_request_guard
                 wire_guard = captured_request_guard()
                 if wire_guard is not None:
@@ -631,12 +649,28 @@ def search_candidates(browser, query: str, n: int = 20) -> list[str]:
 
 def _serp_on_sites(query: str, hosts: list[str], n: int = 20, batch: int = 8,
                     *, deadline: float | None = None) -> list[str]:
-    """Выдача, ограниченная списком сайтов (оператор site:), батчами по batch доменов.
+    """Query XMLRiver in domain batches and retain a distinct outcome for each host.
 
-    Используется для приоритетного поиска по доверенным поставщикам. Без SERP-API ключа
-    вернёт [] (фолбэка на браузер тут нет — оператор site: с батчами специфичен для выдачи).
+    Catalogue jobs admit the external provider lazily and publish its failures
+    as unconfirmed discovery. Standalone callers retain their previous policy.
     """
-    if not (settings.xmlriver_user and settings.xmlriver_key):
+    if not hosts:
+        return DiscoveryURLs()
+    admission = active_catalogue_xmlriver()
+    configured = bool(settings.xmlriver_user and settings.xmlriver_key)
+
+    def unavailable(group, failure):
+        """Report an unknown search outcome for the affected hosts, with no product-absence claim."""
+        return {host: dict(origin='unknown', window='unknown', observed_at=None, candidate_count=0,
+                           diagnostics=[failure.diagnostic()]) for host in group}
+
+    route = active_search_route()
+    if admission is not None:
+        try:
+            route = admission.resolve(deadline=deadline, configured=configured)
+        except XMLRiverDiscoveryUnavailable as failure:
+            return DiscoveryURLs(host_observations=unavailable(hosts, failure))
+    if not configured:
         record_stage('search_response',0,ok=False,label='configuration_missing')
         if _strict_search():
             from ..llm import _REQUEST_GUARD
@@ -648,12 +682,13 @@ def _serp_on_sites(query: str, hosts: list[str], n: int = 20, batch: int = 8,
     groups = [hosts[i:i + batch] for i in range(0, len(hosts), batch)]
 
     def search_group(group: list[str]) -> list[str]:
-        route = active_search_route()
+        """Keep the job's selected backend and scope every query to this group of suppliers."""
         separator = " OR " if route and route['backend'] == 'xmlriver-google' else " | "
         site_expr = separator.join(f"site:{h}" for h in group)
-        if deadline is not None:
-            return xmlriver_search(f"{query} ({site_expr})", n, deadline=deadline)
-        return xmlriver_search(f"{query} ({site_expr})", n)
+        with search_route_scope(route):
+            if deadline is not None:
+                return xmlriver_search(f"{query} ({site_expr})", n, deadline=deadline)
+            return xmlriver_search(f"{query} ({site_expr})", n)
 
     urls: list[str] = []
     host_observations = {}
@@ -662,6 +697,15 @@ def _serp_on_sites(query: str, hosts: list[str], n: int = 20, batch: int = 8,
         futures = [pool.submit(copy_context().run, search_group, group) for group in groups]
         for group,future in zip(groups,futures):
             try:found=future.result()
+            except XMLRiverDiscoveryUnavailable as failure:
+                host_observations.update(unavailable(group, failure))
+                windows.append('unknown')
+                origins.append('unknown')
+                raw_counts.append(None)
+                empty_codes.append(None)
+                observed_dates.append(None)
+                limits.append(None)
+                continue
             except BaseException as error:
                 error.partial_discovery=DiscoveryURLs(urls,origin='mixed' if urls else 'unknown',host_observations=host_observations)
                 raise

@@ -186,19 +186,24 @@ class SearchRouteTests(unittest.TestCase):
    failure.validation_branch=value;self.assertNotIn('search_validation_branch',failure.diagnostic())
   legacy=SearchServiceUnavailable('invalid_structure').diagnostic()
   self.assertEqual(set(legacy),{'code','url','failure_source','failure_scope','failure_cause','observed_at','reason','search_error_category'})
- def test_validation_branch_native_first_stop_persists_before_discovery(self):
-  from engine import app,test_catalogue_unknown as fixtures
+ def test_invalid_account_response_is_scoped_to_external_discovery(self):
+  """An invalid account payload settles the supplier check as unknown."""
+  from engine import test_catalogue_unknown as fixtures
   from engine.schemas import PositionIn
+  from engine.search.catalogue_xmlriver import STATE_KEY
   fixture=fixtures.CatalogueUnknownTests();fixture.setUp();self.addCleanup(fixture.doCleanups)
+  fixture.hosts=['external.example']
   position=PositionIn(number=1,name='Cable',type_mark='AAA123',unit='м',qty=1)
   failure=SearchServiceUnavailable('invalid_structure',validation_branch='engine_flags')
   with patch.object(routes,'resolve_initial_route',side_effect=failure) as resolve:
-   job,public=fixture.job([position],search=lambda *a,**kw:self.fail('No discovery after account rejection'))
-  self.assertEqual(resolve.call_count,1);self.assertEqual(job['status'],'error');self.assertEqual(job['completed'],0)
-  self.assertEqual(job['first_stop']['search_validation_branch'],'engine_flags');self.assertEqual(fixture.calls,[]);self.assertEqual(fixture.captures,[])
-  stored=json.loads(app._research_store().db.execute('SELECT payload FROM jobs WHERE job=?',(job['job_id'],)).fetchone()[0])
-  self.assertEqual(stored['first_stop']['search_validation_branch'],'engine_flags')
-  self.assertEqual(public['first_stop']['search_validation_branch'],'engine_flags')
+   job,public=fixture.job([position],search=search.search_on_sites)
+  resolve.assert_called_once()
+  self.assertEqual(job['status'],'done',job.get('error'))
+  self.assertFalse(public.get('first_stop'))
+  self.assertEqual(public[STATE_KEY]['cause'],'invalid_structure')
+  check=next(item for item in public['rows'][0]['source_checks'] if item['host']=='external.example')
+  self.assertEqual(check['product_presence'],'unknown')
+  self.assertEqual(check['diagnostics'][0]['failure_scope'],'provider')
  def test_operator_preference_native_settings_schema_and_auto_compatibility(self):
   from engine.config import Settings
   from pydantic import ValidationError
@@ -248,32 +253,34 @@ class SearchRouteTests(unittest.TestCase):
     self.assertIs(caught.exception,failure)
    with patch.object(search.settings,'xmlriver_backend_preference',preference),patch.object(httpx,'Client',side_effect=AssertionError('No expired wire')):
     with self.assertRaises(session.SearchBudgetExceeded):routes.resolve_initial_route(deadline=time.monotonic()-1)
- def test_fresh_native_google_route_reason_and_real_receipt_before_discovery(self):
+ def test_fresh_native_google_selection_precedes_first_external_request(self):
+  """The native job persists the selected backend before the first external wire."""
   from engine import app,test_catalogue_unknown as fixtures
   from engine.schemas import PositionIn
-  from engine.search.search_engine import DiscoveryURLs
+  from engine.search.catalogue_xmlriver import STATE_KEY
   resolver=routes.resolve_initial_route
   fixture=fixtures.CatalogueUnknownTests();fixture.setUp();self.addCleanup(fixture.doCleanups)
-  positions=[PositionIn(number=1,name='Cable',type_mark='AAA123',unit='м',qty=1)];seen=[]
-  def discovery(query,hosts,**kwargs):
+  fixture.hosts=['external.example']
+  positions=[PositionIn(number=1,name='Cable',type_mark='AAA123',unit='м',qty=1)]
+  def wire(endpoint, **kwargs):
+   """Verify the selected route against the immutable lifecycle and scoped adapter."""
    key=next(k for k,v in app._RESEARCH_INPUTS.items() if v is positions)
+   self.assertEqual(endpoint,self.google['endpoint'])
    self.assertEqual(routes.active_search_route(),self.google)
-   frontier=app._research_store().load_acquisition_frontier(key,0)['frontier']
-   self.assertEqual(frontier['search_route'],self.google)
    header=json.loads(app._research_store().db.execute('SELECT payload FROM jobs WHERE job=?',(key,)).fetchone()[0])
-   self.assertEqual(header['search_backend'],'xmlriver-google')
+   self.assertEqual(header[STATE_KEY]['profile'],self.google)
    self.assertEqual(header['search_backend_reason'],'operator_selected_google')
    self.assertGreater(header['search_backend_observed_at'],0)
-   self.assertNotIn('_catalogue_search_receipt',header)
-   receipt=app.RESEARCH_JOBS[key]['_catalogue_search_receipt']
-   self.assertEqual(receipt['engine'],{'yandex':1,'google':1})
-   self.assertEqual(receipt['selection_reason'],'operator_selected_google');seen.append(True)
-   stamp=time.time();return DiscoveryURLs([],origin='response',window='below_limit',host_observations={h:dict(origin='response',window='below_limit',observed_at=stamp,candidate_count=0,diagnostics=[]) for h in hosts})
+   return httpx.Response(200,text='<yandexsearch><response/></yandexsearch>')
   calls,client=self.admin({'balance':100,'engine':{'yandex':1,'google':1}})
-  with patch.object(search.settings,'xmlriver_backend_preference','xmlriver-google'),patch.object(routes,'resolve_initial_route',side_effect=resolver),client:
-   job,public=fixture.job(positions,search=discovery)
-  self.assertEqual(len(calls),1);self.assertTrue(seen);self.assertEqual(job['status'],'done',job.get('error'))
-  self.assertEqual(public['search_backend'],'xmlriver-google');self.assertEqual(public['search_backend_reason'],'operator_selected_google')
+  with (patch.object(search.settings,'xmlriver_backend_preference','xmlriver-google'),
+        patch.object(routes,'resolve_initial_route',side_effect=resolver),client,
+        patch.object(search,'_search_get',side_effect=wire) as request):
+   job,public=fixture.job(positions,search=search.search_on_sites)
+  self.assertEqual(len(calls),1)
+  self.assertGreater(request.call_count,0)
+  self.assertEqual(job['status'],'done',job.get('error'))
+  self.assertEqual(public['search_backend'],'xmlriver-google')
   self.assertIsNone(routes.active_search_route())
  def xml(self,code=None,count=2):
   content='<error code="'+str(code)+'"/>' if code else '<response>'+''.join('<doc><url>https://chipdip.ru/product/c'+str(i)+'</url></doc>' for i in range(count))+'</response>'
