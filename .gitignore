@@ -9,6 +9,13 @@ engine/data/output/
 engine/data/uploads/
 engine/data/base/
 
+# Local workspace state and catalogue databases
+/.dreamteam/
+/catalogue.sqlite3
+/catalogue.sqlite3-wal
+/catalogue.sqlite3-shm
+/catalogue.sqlite3-journal
+
 # Node
 node_modules/
 web/dist/

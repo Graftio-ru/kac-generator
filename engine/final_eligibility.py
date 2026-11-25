@@ -3,9 +3,34 @@ from .offer_selection import independent_offers, offer_is_comparable
 from .equipment_output_policy import is_graftio_equipment, letter_offers
 
 
+class FinalEligibilityRefused(ValueError):
+    """Expected native refusal; receipt diagnostics never include exception text."""
+    code = 'final_document_not_ready'
+
+    def __init__(self, message, positions):
+        super().__init__(message)
+        self._positions = []
+        self._truncated = len(positions) > 64
+        for item in positions[:64]:
+            values = tuple(item.get(k) for k in ('position', 'eligible', 'required'))
+            if (all(type(v) is int for v in values)
+                    and abs(values[0]) < 2**63
+                    and 0 <= values[1] < 2**31 and 1 <= values[2] < 2**31):
+                self._positions.append(values)
+            else:
+                self._truncated = True
+
+    def diagnostic(self):
+        return {'code': 'final_document_not_ready',
+                'positions': [dict(zip(('position', 'eligible', 'required'), values))
+                              for values in self._positions],
+                'truncated': self._truncated}
+
+
 def prepare_final_results(results):
     prepared = []
     missing = []
+    refusals = []
     for result in results:
         pos = result.position
         from .search.base_db import apply_refresh
@@ -36,12 +61,14 @@ def prepare_final_results(results):
                               key=lambda o: o.price_with_vat)
             if not eligible:
                 missing.append(f'{pos.number}: нет допустимой цены из письма')
+                refusals.append(dict(position=pos.number, eligible=0, required=1))
         elif len(eligible) < 3:
             missing.append(f'{pos.number}: {len(eligible)} из 3 независимых допустимых поставщиков')
+            refusals.append(dict(position=pos.number, eligible=len(eligible), required=3))
         prepared.append((result,eligible if unique_letters or own_equipment else eligible[-3:],pool))
     if missing:
-        raise ValueError('Итоговые документы не готовы: '+ '; '.join(missing)+
-                         '. Сохраните предварительный отчёт и дополните предложения.')
+        raise FinalEligibilityRefused('Итоговые документы не готовы: '+ '; '.join(missing)+
+                         '. Сохраните предварительный отчёт и дополните предложения.', refusals)
     # Do not mutate any row until every row is eligible.
     for result,offers,pool in prepared:
         result.all_offers = list(pool)

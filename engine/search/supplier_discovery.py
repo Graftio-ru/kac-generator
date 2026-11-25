@@ -183,20 +183,37 @@ def parse_candidates(text,endpoint,hint,provider=None):
 def _discover_once(provider,step,*,deadline=None):
  """One bounded ordinary supplier HTTP lease; only delivered links are returned."""
  from ..browser import supplier_http_get
+ from ..supplier_methods import MethodUnavailable
  endpoint=provider.endpoint+'?'+urlencode({provider.parameter:step.identity_hint});started=time.time()
  observation={'origin':'supplier_own_search','window':'unknown','observed_at':None,'raw_count':None,'limit':None,'own_http_calls':0,'serp_wire_calls':0,'diagnostics':[],'provider_profile':provider.parser,'provider_version':VERSION,'discovery_complete':False}
  try:
   with deadline_scope(deadline),supplier_transport(endpoint):
    bounded_timeout(1);observation['own_http_calls']=1
-   response=supplier_http_get(endpoint,max_bytes=2*1024*1024)
+   from ..supplier_methods import selected,response as method_response,failure
+   grant=selected(endpoint)
+   if grant is not None and grant['method']=='browser':
+    from ..browser import Browser
+    import httpx
+    observation['own_http_calls']=0;observation['own_browser_calls']=1
+    with Browser()as browser:
+     with browser.page(endpoint)as page:
+      raw=page.content()
+      if len(raw.encode())>2*1024*1024:
+       failure(grant,'representation');raise ValueError('supplier_discovery_body_limit')
+      method_response(grant,getattr(page,'_kac_response_status',None),raw)
+      response=httpx.Response(getattr(page,'_kac_response_status',200)or 200,content=raw.encode(),headers={'content-type':'text/html'},request=httpx.Request('GET',getattr(page,'_kac_document_url',endpoint)or endpoint))
+   else:response=supplier_http_get(endpoint,max_bytes=2*1024*1024)
    bounded_timeout(1)
-   if card_host(str(response.url))!=provider.host:raise ValueError('redirect_unbound')
+   if card_host(str(response.url))!=provider.host:
+    failure(grant,'representation');raise ValueError('redirect_unbound')
    transport_observed(http_outcome(response.status_code));response.raise_for_status()
-   if 'html' not in response.headers.get('content-type','').lower():raise ValueError('unsupported_content_type')
+   if 'html' not in response.headers.get('content-type','').lower():
+    failure(grant,'representation');raise ValueError('unsupported_content_type')
    try:
     hints=parse_candidate_hints(response.text,str(response.url),step.identity_hint,provider);urls=list(hints)
    except ValueError as error:
     if error.args==('observed_protection',):
+     failure(grant,'protection',response.status_code)
      from .supplier_health_store import Outcome
      transport_observed(Outcome.BOT_PROTECTION)
     raise
@@ -204,6 +221,9 @@ def _discover_once(provider,step,*,deadline=None):
    observation.update(observed_at=time.time(),raw_count=len(urls),http_status=response.status_code)
    if not urls:observation['diagnostics']=[{'code':'supplier_discovery_unresolved','reason':'Собственный поиск не предоставил подтверждённые ссылки; наличие неизвестно','url':provider.endpoint,'observed_at':observation['observed_at']}]
    return urls,observation
+ except MethodUnavailable as error:
+  observation['diagnostics']=[dict(error.diagnostic(),url=provider.endpoint)]
+  return [],observation
  except SupplierDeferred as error:
   from .catalogue import safe_deferred_check,supplier_defer_reason
   check=safe_deferred_check(error.check,provider.host)

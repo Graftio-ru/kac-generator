@@ -282,6 +282,13 @@ def research_deadline():
     return _DEADLINE.get()
 
 
+def _budget_failure(message, cause, remaining, minimum):
+    error = SearchBudgetExceeded(message)
+    error._budget_observation = dict(cause=cause, effective_remaining_seconds=remaining,
+                                     minimum_seconds=minimum)
+    return error
+
+
 def bounded_timeout(seconds, *, minimum=0):
     from ..llm import _REQUEST_GUARD
     guard = _REQUEST_GUARD.get()
@@ -289,13 +296,14 @@ def bounded_timeout(seconds, *, minimum=0):
         guard.check()
     cancelled = _CANCELLED.get()
     if cancelled is not None and cancelled():
-        raise SearchBudgetExceeded('Задание отменено; следующая операция не начата')
+        raise _budget_failure('Задание отменено; следующая операция не начата', 'cancelled', None, minimum)
     deadline = research_deadline()
     if deadline is None:
         return seconds
     remaining = deadline - time.monotonic()
     if remaining <= 0 or remaining < minimum:
-        raise SearchBudgetExceeded("Недостаточно времени для следующей операции; работа отложена")
+        raise _budget_failure("Недостаточно времени для следующей операции; работа отложена",
+                              "deadline_expired" if remaining <= 0 else "below_minimum", remaining, minimum)
     return min(seconds, remaining)
 
 

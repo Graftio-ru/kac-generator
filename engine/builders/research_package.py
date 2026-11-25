@@ -32,7 +32,15 @@ def _screenshot(reference):
         return None
 
 
-def build_research_package(request):
+def can_reuse_standalone_workbook(request):
+    # Packaged and standalone notices/links differ whenever an attachment
+    # locator is present, even if its local file is currently unavailable.
+    return not any(offer.screenshot_product or offer.screenshot_context
+                   for position in request.positions for offer in _evidence(position))
+
+
+def build_research_package(request, *, standalone_workbook=None, interruption_reason=None):
+    """Package the workbook and locally available evidence, including any stop reason."""
     files = {}
     links = {}
     context_links = {}
@@ -68,7 +76,15 @@ def build_research_package(request):
                 total+=len(data)
                 if total>128*1024*1024:raise ValueError('Скриншоты превышают лимит пакета 128 МБ')
                 files[name]=data
-    workbook = build_research_report(request, screenshot_links=links,context_links=context_links)
+    if standalone_workbook is not None:
+        if type(standalone_workbook) is not bytes or not can_reuse_standalone_workbook(request) or links or context_links:
+            raise ValueError('standalone_workbook_links_differ')
+        workbook = standalone_workbook
+    else:
+        workbook = build_research_report(
+            request, screenshot_links=links, context_links=context_links,
+            interruption_reason=interruption_reason,
+        )
     output = BytesIO()
     with ZipFile(output, 'w', compression=ZIP_DEFLATED) as archive:
         archive.writestr('supplier-research-summary.xlsx', workbook)

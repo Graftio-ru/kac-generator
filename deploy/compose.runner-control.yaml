@@ -1,0 +1,25 @@
+# CONTROL-host override ONLY: combine with deploy/compose.yaml.
+# API and power supervisor share the SAME same-host KAC_DATA_DIR; never runner SQLite.
+services:
+  estimator:
+    environment:
+      EXECUTION_MODE: remote
+      RUNNER_ROLE: control
+  runner-power:
+    image: ${KAC_APP_IMAGE:?set identical reviewed immutable image}
+    command: [python, -m, engine.runner_service, control]
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    env_file:
+      # IAM and exact VM IDs only, no native provider credentials.
+      - ${KAC_POWER_ENV_FILE:?set CONTROL-only operator-provisioned file}
+    environment:
+      RUNNER_SERVICE_ENABLED: ${KAC_RUNNER_POWER_ENABLED:-false}
+    volumes:
+      - type: bind
+        source: ${KAC_DATA_DIR:?set SAME durable CONTROL directory as estimator}
+        target: /app/engine/data
+    networks: [service]

@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .config import CACHE_DIR
 from .offer_selection import unit_review_pending
@@ -37,6 +37,9 @@ class OfferIn(BaseModel):
     price_unit: str = ""
     normalized_price_unit: str = ""
     source_quote_evidence: dict = Field(default_factory=dict)
+    article_match_evidence: dict = Field(default_factory=dict)  # display input is never trusted
+    estimator_approval_ref: dict = Field(default_factory=dict)
+    estimator_approval: dict = Field(default_factory=dict)
     catalogue_ref: dict = Field(default_factory=dict)
     catalogue_observed_at: float = 0.0
     catalogue_source_sha256: str = ""
@@ -72,6 +75,15 @@ class PositionIn(BaseModel):
     name: str
     full_name: str = ""
     type_mark: str = ""
+    alternative_articles: list[str] = Field(default_factory=list)
+    alternative_names: list[str] = Field(default_factory=list)
+
+    @field_validator('alternative_articles','alternative_names',mode='before')
+    @classmethod
+    def validate_alternatives(cls,value,info):
+        from .models import normalize_alternatives
+        return normalize_alternatives(value,article=info.field_name=='alternative_articles')
+
     unit: str = "шт"
     qty: float = 0.0
     is_unique: bool = False
@@ -92,10 +104,12 @@ class PositionIn(BaseModel):
         pos = SpecPosition(
             number=self.number, name=self.name, full_name=self.full_name,
             type_mark=self.type_mark, unit=self.unit, qty=self.qty,
+            alternative_articles=self.alternative_articles,alternative_names=self.alternative_names,
             is_unique=self.is_unique, discipline=self.discipline,
             review_fields=self.review_fields, review_issue=self.review_issue,
             source_evidence=self.source_evidence,
         )
+        from .search.product_identity import current_offer_article_evidence
         offers = [
             PriceOffer(
                 price_with_vat=o.price_with_vat, url=o.url, from_letter=o.from_letter,
@@ -107,6 +121,8 @@ class PositionIn(BaseModel):
                 normalized_price_unit="" if unit_review_pending(o) else o.normalized_price_unit or self.unit,
                 price_unit_evidence=o.price_unit_evidence,
                 source_quote_evidence=o.source_quote_evidence,
+                article_match_evidence=current_offer_article_evidence(o,pos),
+                estimator_approval_ref=o.estimator_approval_ref, estimator_approval=o.estimator_approval,
                 catalogue_ref=o.catalogue_ref,
                 catalogue_observed_at=o.catalogue_observed_at,
                 catalogue_source_sha256=o.catalogue_source_sha256,

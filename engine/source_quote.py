@@ -138,10 +138,69 @@ def owned_purchase_facts(text):
          'purchase_unit_unconfirmed' if not sale else firm_price_role_reason(price_text,unit_text,text))
  return dict(raw_amount=raw,currency='RUB' if matches else 'unknown',sale_unit=sale,price_text=price_text,unit_text=unit_text,reason=reason)
 
+def explicit_selected_price_lot(text, listed, unit):
+ """A current currency amount and its immediately printed denominator only.
+
+ Input is already primary-owner text with its immutable hash checked by caller.
+ No title length, stock, package contents or order quantity is a price divisor.
+ """
+ from .price_capture import _sale_unit_token
+ if type(text)is not str or len(text)>20000:return None,''  # Decline new derivation; retain legacy strict checks.
+ token=_sale_unit_token(unit)
+ if not token:return None,''
+ money=re.compile(r'(?<![\d.,])((?:\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+)(?:[.,]\d{1,2})?)\s*(?:₽|руб(?:\.|лей|ля|ль)?|RUB)(?![^\W\d_])',re.I)
+ matches=list(money.finditer(text));values=[]
+ # Inspect every selected-amount explicit unit before choosing the target unit.
+ # Otherwise equally priced metre/piece (or unknown-unit) quotes could be hidden.
+ from .price_capture import _unit
+ pairs=set()
+ for i,m in enumerate(matches):
+  amount=float(re.sub(r'\s','',m[1]).replace(',','.'))
+  if not math.isclose(amount,listed,rel_tol=1e-8,abs_tol=.005):continue
+  tail=text[m.end():matches[i+1].start() if i+1<len(matches) else len(text)]
+  printed=re.match(r'\s*(?:/|за\s+)\s*(?:(\d+(?:[.,]\d+)?)\s*)?([^\s/;,]+)',tail,re.I)
+  if not printed:continue
+  canonical=_unit(printed[2])
+  if not canonical or canonical != _unit(unit):return None,'Единица выбранной цены противоречива'
+  count=float((printed[1]or'1').replace(',','.'))
+  pairs.add((count,canonical))
+ if len(pairs)>1:return None,'Количество единиц в цене противоречиво'
+ for i,m in enumerate(matches):
+  amount=float(re.sub(r'\s','',m[1]).replace(',','.'))
+  if not math.isclose(amount,listed,rel_tol=1e-8,abs_tol=.005):continue
+  tail=text[m.end():matches[i+1].start() if i+1<len(matches) else len(text)]
+  denominator=re.match(r'\s*(?:/|за\s+)\s*(?:(\d+(?:[.,]\d+)?)\s*)?'+token+r'(?!\w)',tail,re.I)
+  if not denominator:continue
+  count=float((denominator[1]or'1').replace(',','.'))
+  if count == 1:
+   values.append(count);continue  # No new conversion: preserve existing same-unit policy.
+  before=text[:m.start()].rstrip().splitlines();nonempty=[v.strip()for v in before if v.strip()]
+  label=nonempty[-1]if nonempty else ''
+  same_line=text[text.rfind('\n',0,m.start())+1:m.start()].strip()
+  if same_line:label=same_line
+  if not re.fullmatch(r'(?:текущая\s+)?цена\s*[:：]?',label,re.I):return None,'Роль цены с количеством не подтверждена'
+  nearby=' '.join(nonempty[-3:])
+  if (_nonproduct_money_role(text,matches,i) or re.search(r'стар\w*\s+цен|прошл\w*\s+цен|рассроч|плат[её]ж|(?:сумма|стоимость)\s+заказ|subtotal|итого|минимальн|в\s+наличии|остаток|другой\s+товар|похож\w*\s+товар|рекоменд',nearby,re.I)):
+   return None,'Роль цены с количеством не подтверждена'
+  count=float((denominator[1]or'1').replace(',','.'))
+  if not math.isfinite(count)or count<=0:return None,'Количество единиц в цене не подтверждено'
+  # Extra denominator text on the same branch cannot be silently ignored.
+  rest=tail[denominator.end():].split('\n',1)[0]
+  if re.search(r'(?:/|\bза\b)\s*\d',rest):return None,'Количество единиц в цене противоречиво'
+  values.append(count)
+ if not values:return None,''
+ if len(set(values))!=1:return None,'Количество единиц в цене противоречиво'
+ return values[0],''
+
 def literal_same_unit_confirmed(unit_text,wanted):
  """Literal denomination in an already selected cash context, never a counter."""
  from .price_capture import _sale_unit_token
  token=_sale_unit_token(wanted)
+ if wanted=='шт':token=r'(?:шт\.?|штук[аи]?)'
+ # A labelled base unit cannot erase an explicit multi-unit price denominator.
+ lots={float(n.replace(',','.')) for n in re.findall(
+  r'(?:/|\bза(?=\s|\d|$)\s*)\s*(\d+(?:[.,]\d+)?)\s*'+token+r'\b',unit_text,re.I)}
+ if lots and lots!={1}:return False
  return bool(token and re.search(r'(?:/[ \t\u00a0\u202f]*|\bза(?=\s|\d|$)\s*(?:1\s*)?|единица[^\n:]*:\s*)'+token+r'\b',unit_text,re.I))
 
 
@@ -275,12 +334,20 @@ def observe_captured_quote(text,*,actual_url,observed_at,url,title,article,liste
    length=_product_length_metres(title);quantity=length if sale=='шт' else 1/length if length else None
   if type(quantity) not in (int,float) or not math.isfinite(quantity) or quantity<=0:return {}
   price_text,unit_text=selected_price_context(text,listed)
+  row=None
   if owned_source is not None:
-   from .search.owned_purchase_row import derive
-   row=derive(owned_source,url=actual_url,observed_at=observed_at,title=title,article=article,text=text)
+   from .search.owned_purchase_row import derive,_derive_v1
+   reader=derive if 'purchase_row_v2' in data else _derive_v1
+   row=reader(owned_source,url=actual_url,observed_at=observed_at,title=title,article=article,text=text)
+   if 'purchase_row_v2' in data and (not row or row.get('version')!=2 or data['purchase_row_v2']!=row):return {}
    if row:
     if row['raw_amount']!=listed or _unit(row['sale_unit'])!=sale:return {}
     price_text,unit_text=row['price_text'],row['unit_text']
+    if row.get('version')==2:
+     from .search.owned_purchase_row import decision as purchase_decision
+     selected,reason=purchase_decision(row,dict(name=expected_name,type_mark=expected_mark,unit=requested_unit),factory_proof=data.get('factory_unit_proof'))
+     if reason or not selected or not math.isclose(normalized,selected['price'],rel_tol=1e-8,abs_tol=.005):return {}
+     quantity=selected['quantity']
   witness=None
   factory_proof=data.get('factory_unit_proof')
   if sale=='уп' and wanted=='компл' and factory_proof is not None:
@@ -294,6 +361,9 @@ def observe_captured_quote(text,*,actual_url,observed_at,url,title,article,liste
    if reason or not math.isclose(normalized,decision['price'],rel_tol=1e-8,abs_tol=.005):return {}
    witness=decision['witness']
   result= {'version':1,'source':'product_card_text','url':actual_url,'observed_at':observed_at,'title':title,'article':article,'listed_price':listed,'normalized_price':normalized,'sale_unit':sale_unit,'requested_unit':requested_unit,'quantity':quantity,'unit_text':unit_text,'price_text':price_text,'terms_text':_pricing_terms(text,listed)}
+  if row and row.get('version')==2:
+   result['purchase_row_v2']=row
+   result['terms_text']=row['terms_text']
   if factory_proof is not None:result['factory_unit_proof']=factory_proof
   if witness:result['unit_witness']=witness
   return result
@@ -315,7 +385,7 @@ def quote_review_reason(offer,position=None):
  evidence=field('source_quote_evidence',{}) or {}
  if evidence and (type(evidence) is not dict or type(evidence.get('version')) is not int or evidence.get('version')!=1 or evidence.get('source')!='product_card_text'):return 'Сведения об источнике цены не подтверждены'
  if pos('type_mark') and (evidence or field('listed_price_with_vat') is not None) and not field('from_letter'):
-  if not valid_identity(field('identity_evidence',{}) or {},expected_mark=pos('type_mark'),expected_name=pos('name')):return 'Товар/артикул не подтверждены'
+  if not valid_identity(field('identity_evidence',{}) or {},expected_mark=pos('type_mark'),expected_name=pos('name'),request_position=position):return 'Товар/артикул не подтверждены'
  if not evidence:
   # Historical metadata contributes only stored business facts, not image approval.
   old=field('price_capture_evidence',{}) or {}
@@ -338,15 +408,15 @@ def quote_review_reason(offer,position=None):
   if _unit(evidence.get('requested_unit'))!=_unit(requested) or evidence.get('sale_unit')!=field('price_unit'):return 'Единица цены не соответствует спецификации'
   identity=field('identity_evidence',{}) or {}
   if identity and (evidence.get('title')!=identity.get('main_title') or evidence.get('article')!=identity.get('main_article')):return 'Сведения о цене относятся к другому товару/артикулу'
-  if pos('type_mark') and not valid_identity(identity,expected_mark=pos('type_mark'),expected_name=pos('name')):return 'Товар/артикул не подтверждены'
+  if pos('type_mark') and not valid_identity(identity,expected_mark=pos('type_mark'),expected_name=pos('name'),request_position=position):return 'Товар/артикул не подтверждены'
   if identity.get('provenance')=='http_main_product' or identity.get('rendered_source'):
    from .search.http_card import read_source
-   source=read_source(identity.get('http_source') or identity.get('rendered_source') or {},allow_rendered=identity.get('provenance')=='rendered_main_card' and bool(identity.get('rendered_source')))
+   source=read_source(identity.get('http_source') or identity.get('rendered_source') or {},allow_rendered=(identity.get('provenance')=='rendered_main_card' and bool(identity.get('rendered_source')))or (identity.get('http_source')or{}).get('role')=='http_primary_dom')
    if not source or not source[1]:return 'Источник основной карточки не подтверждён' if identity.get('rendered_source') else 'HTTP-источник цены не подтверждён'
    record,observed=source
    if listed!=observed['listed_price']:return 'Цена отличается от текущего предложения основной карточки' if identity.get('rendered_source') else 'Цена отличается от текущего предложения HTTP-карточки'
-   bound=observe_captured_quote(observed['text'],actual_url=record['url'],observed_at=record['observed_at'],url=record['requested_url'],title=observed['title'],article=observed['article'],listed=listed,normalized=normalized,sale_unit=evidence.get('sale_unit'),requested_unit=requested,data={'package_quantity':quantity,**({'factory_unit_proof':evidence['factory_unit_proof']} if 'factory_unit_proof' in evidence else {})},expected_name=pos('name'),expected_mark=pos('type_mark'),owned_source=identity.get('http_source') or identity.get('rendered_source'))
-   if not bound or any(evidence.get(key)!=bound.get(key) for key in ('url','observed_at','title','article','price_text','unit_text','quantity','unit_witness','factory_unit_proof')) or _pricing_disclosures(evidence.get('terms_text',''))!=_pricing_disclosures(bound.get('terms_text','')):return 'Сведения о цене/единице не принадлежат сохранённой основной карточке' if identity.get('rendered_source') else 'Сведения о цене/единице не принадлежат сохранённой HTTP-карточке'
+   bound=observe_captured_quote(observed['text'],actual_url=record['url'],observed_at=record['observed_at'],url=record['requested_url'],title=observed['title'],article=observed['article'],listed=listed,normalized=normalized,sale_unit=evidence.get('sale_unit'),requested_unit=requested,data={'package_quantity':quantity,**({'purchase_row_v2':evidence['purchase_row_v2']} if 'purchase_row_v2' in evidence else {}),**({'factory_unit_proof':evidence['factory_unit_proof']} if 'factory_unit_proof' in evidence else {})},expected_name=pos('name'),expected_mark=pos('type_mark'),owned_source=identity.get('http_source') or identity.get('rendered_source'))
+   if not bound or any(evidence.get(key)!=bound.get(key) for key in ('url','observed_at','title','article','price_text','unit_text','quantity','unit_witness','factory_unit_proof','purchase_row_v2')) or _pricing_disclosures(evidence.get('terms_text',''))!=_pricing_disclosures(bound.get('terms_text','')):return 'Сведения о цене/единице не принадлежат сохранённой основной карточке' if identity.get('rendered_source') else 'Сведения о цене/единице не принадлежат сохранённой HTTP-карточке'
   unit_text=evidence.get('unit_text','');price_text=evidence.get('price_text','')
   from .price_capture import visible_prices
   if not any(math.isclose(v,listed,rel_tol=1e-8,abs_tol=.005) for v in visible_prices(price_text)):return 'Исходная цена не подтверждена текстом карточки'
@@ -355,6 +425,15 @@ def quote_review_reason(offer,position=None):
   role_reason=firm_price_role_reason(price_text,unit_text,evidence.get('terms_text',''))
   if role_reason:return role_reason
   if re.search(r'клуб|по\s+карт[еы]|при\s+(?:покупк|заказ)|оптов|от\s+\d+\s*(?:шт|м)',unit_text+' '+price_text+' '+evidence.get('terms_text',''),re.I):return 'Цена зависит от условий покупки'
+  if 'purchase_row_v2' in evidence:
+   from .search.owned_purchase_row import decision as purchase_decision
+   selected,reason=purchase_decision(evidence['purchase_row_v2'],position or dict(unit=requested),factory_proof=evidence.get('factory_unit_proof'))
+   if reason or not selected:return reason or 'Текущая строка покупки не подтверждена'
+   expected_source=identity.get('rendered_source')or identity.get('http_source')or{}
+   if expected_source.get('role')=='http_primary_dom':expected_source={k:expected_source[k]for k in ('role','ref','record_sha256','body_sha256','observed_at')}
+   if evidence['purchase_row_v2'].get('source')!=expected_source:return 'Источник покупной строки не подтверждён'
+   if not math.isclose(selected['price'],normalized,rel_tol=1e-8,abs_tol=.005) or selected['quantity']!=quantity:return 'Пересчёт покупной строки не подтверждён'
+   return ''
   decision, reason = strict_unit_decision(listed=listed, sale_unit=field('price_unit',''),
       requested_unit=requested, title=evidence.get('title',''), unit_text=unit_text,
       quantity=quantity, package_quantity=quantity,
@@ -465,7 +544,7 @@ def _piece_is_complete_set(title: str) -> bool:
                           normalized))
 
 def _price_per_requested_unit(data: dict, requested_unit: str = "",
-                              product_title: str = "", *, owned_unit_context: str = "", identity_metadata: tuple = (), factory_proof=None, request_position=None) -> float | None:
+                              product_title: str = "", *, owned_unit_context: str = "", identity_metadata: tuple = (), factory_proof=None, request_position=None, owned_length=None) -> float | None:
     """Verify the LLM's unit conversion; reject unsupported metre/piece changes."""
     sale_unit = _sale_unit(data.get("price_unit"))
     requested = _sale_unit(requested_unit)
@@ -545,6 +624,7 @@ def _price_per_requested_unit(data: dict, requested_unit: str = "",
 
     if sale_unit in {"м", "шт"} and requested in {"м", "шт"} and sale_unit != requested:
         length = _product_length_metres(product_title)
+        if owned_length is not None:length = _validated_owned_length(owned_length,product_title)
         try:
             listed = float(data.get("listed_price_with_vat"))
         except (TypeError, ValueError):
@@ -579,7 +659,7 @@ def _price_per_requested_unit(data: dict, requested_unit: str = "",
 
 
 def strict_unit_decision(*, listed, sale_unit, requested_unit, title, unit_text,
-                         quantity=None, package_quantity=None, lot_quantity=None, identity_metadata=(),factory_proof=None,request_position=None):
+                         quantity=None, package_quantity=None, lot_quantity=None, identity_metadata=(),factory_proof=None,request_position=None,owned_length=None):
     """Derive one source-bound denominator; no source or financial admission.
 
     The caller first establishes ownership of title/unit_text and checks price
@@ -594,6 +674,12 @@ def strict_unit_decision(*, listed, sale_unit, requested_unit, title, unit_text,
     sale, wanted = _sale_unit(sale_unit), _sale_unit(requested_unit)
     lot = _sale_lot(sale_unit)
     token = _sale_unit_token(wanted)
+    # A declared/model unit cannot override an explicit owned sale-unit label.
+    # Package contents and dimensions are not sale-unit labels.
+    printed_units = {_sale_lot(value)[1] if _sale_lot(value) else _sale_unit(value)
+                     for value in labelled_sale_units(unit_text)}
+    if printed_units and printed_units != {lot[1] if lot else sale}:
+        return None, 'Единица продажи противоречит напечатанной единице карточки'
     if lot:
         if lot[1] != wanted or (lot_quantity is not None and lot_quantity != lot[0]):
             return None, 'Количество единиц в цене не подтверждено'
@@ -628,6 +714,7 @@ def strict_unit_decision(*, listed, sale_unit, requested_unit, title, unit_text,
             return None, 'Состав упаковки не подтверждён'
     elif {sale, wanted} == {'шт', 'м'}:
         length = _product_length_metres(title)
+        if owned_length is not None:length = _validated_owned_length(owned_length,title)
         if length is None:
             return None, 'Пересчёт длины не подтверждён'
         divisor, basis = (length if sale == 'шт' else 1 / length), 'product_length'
@@ -644,3 +731,52 @@ def strict_unit_decision(*, listed, sale_unit, requested_unit, title, unit_text,
     decision = dict(price=price, quantity=divisor, basis=basis, basis_text=unit_text)
     if basis == 'explicit_complete_kit_pack':decision['witness'] = witness
     return decision, ''
+
+
+def _validated_owned_length(witness,title):
+ """Reopen the exact typed owner on every use; a numeric caller hint is no proof."""
+ from .search.http_card import read_primary_characteristics_source
+ try:
+  if type(witness)is not dict or set(witness)!={'version','source','url','observed_at','title','article','source_sha256','length'} or witness['version']!=1 or witness['title']!=title:return None
+  retained=read_primary_characteristics_source(witness['source'],expected_code=witness['article'])
+  if not retained:return None
+  record,owned=retained
+  if (record['url']!=witness['url'] or record['observed_at']!=witness['observed_at'] or owned['title']!=title
+      or hashlib.sha256(owned['text'].encode()).hexdigest()!=witness['source_sha256']
+      or owned['characteristics']['length']!=witness['length']):return None
+  length=witness['length']['metres']
+  native=_product_length_metres(title)
+  if native is not None and not math.isclose(native,length,rel_tol=1e-9,abs_tol=0):return None
+  # A separately owned field does not erase a contradictory/qualified title length.
+  markers=list(re.finditer(r'(?<!\w)(?:l(?=\s*=?\s*[\d-])|длина(?=\s*[:=]?\s*[\d-]))',title,re.I))
+  for marker in markers:
+   tail=title[marker.start():]
+   field=re.match(r'(l|длина)\s*[:=]?\s*(\d+(?:[.,]\d+)?)\s*(мм|см|м)?(?![\w.,])',tail,re.I)
+   if not field or field[1].casefold()=='длина' and not field[3]:return None
+   if re.match(r'\s*[-–—+*/~±…]',tail[field.end():]) or re.search(r'(?:\bне|около|\bдо|\bот|более|менее|~)\s*$',title[:marker.start()],re.I):return None
+   declared=float(field[2].replace(',','.'))*{'мм':.001,'см':.01,'м':1}[(field[3]or'мм').casefold()]
+   if not math.isclose(declared,length,rel_tol=1e-9,abs_tol=0):return None
+  return length
+ except (OSError,ValueError,TypeError,KeyError,RecursionError):return None
+
+def owned_product_length(observation):
+ """Resolve a native observation to one separately owned length characteristic."""
+ from .search.http_card import locate_primary_characteristics,read_primary_characteristics_source
+ from .search.purchase_preview import valid_unit_basis
+ try:
+  if not valid_unit_basis(observation,observation.get('unit_basis')):return None,'Единица предпросмотра товара не подтверждена'
+  if 'primary_source'in observation:
+   from .search.catalogue import validate_primary_source
+   source=validate_primary_source(observation['primary_source'])
+  else:
+   source,reason=locate_primary_characteristics(url=observation['url'],observed_at=observation['observed_at'],title=observation['title'],article=observation['manufacturer_code'],source_sha256=observation['source_sha256'])
+   if reason:return None,'Длина основного товара не подтверждена: '+reason
+  retained=read_primary_characteristics_source(source,expected_code=observation['manufacturer_code'])
+  if not retained:return None,'Владелец характеристики длины не подтверждён'
+  record,owned=retained
+  if (record['url']!=observation['url'] or record['observed_at']!=observation['observed_at']
+      or owned['title']!=observation['title'] or owned['text']!=observation['source_text']):return None,'Характеристика длины относится к другому наблюдению'
+  witness=dict(version=1,source=source,url=record['url'],observed_at=record['observed_at'],title=owned['title'],article=observation['manufacturer_code'],source_sha256=observation['source_sha256'],length=owned['characteristics']['length'])
+  if _validated_owned_length(witness,observation['title'])is None:return None,'Характеристика длины противоречит названию товара'
+  return witness,''
+ except (OSError,ValueError,TypeError,KeyError,RecursionError):return None,'Владелец характеристики длины не подтверждён'

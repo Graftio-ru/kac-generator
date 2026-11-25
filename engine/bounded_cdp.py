@@ -6,6 +6,7 @@ failed creation/detach leaves normal owned page/context cleanup authoritative.
 """
 import asyncio,time
 from .search.session import bounded_timeout
+from .browser_transport_trace import record_owned_browser_failure
 
 async def guarded_task(factory,deadline,*,controls=True):
     def check():
@@ -45,7 +46,7 @@ class PageCDP:
         if getattr(page,'_kac_context_cleanup_required',False):
             raise ValueError('context_channel_cleanup_unacknowledged')
         self.page=page;self.deadline=deadline;self.command_deadline=deadline-self.CLEANUP_RESERVE;self.session=None
-    def _run(self,factory,deadline,*,controls=True):
+    def _run(self,factory,deadline,*,controls=True,phase='send'):
         # Retain our own runner before entering SyncBase._sync: its implementation
         # does not cancel a still-running coroutine after external interruption.
         owned=self.page._loop.create_task(guarded_task(factory,deadline,controls=controls))
@@ -56,30 +57,37 @@ class PageCDP:
             await asyncio.sleep(0)
         try:return self.page._sync(receive())
         except BaseException as error:
+            record_owned_browser_failure(self.page,phase,error,deadline,pending=not owned.done())
             if not owned.done():
                 owned.cancel()
                 try:self.page._sync(drain())
                 except BaseException as cleanup:
                     self.page._kac_context_cleanup_required=True
+                    record_owned_browser_failure(self.page,'owned_await',cleanup,deadline,secondary=True)
                     error.add_note('Owned SDK await cleanup failed: '+type(cleanup).__name__)
             raise
     def __enter__(self):
-        try:self.session=self._run(lambda:self.page.context._impl_obj.new_cdp_session(self.page._impl_obj),self.command_deadline)
-        except BaseException:
+        try:self.session=self._run(lambda:self.page.context._impl_obj.new_cdp_session(self.page._impl_obj),self.command_deadline,phase='attach')
+        except BaseException as error:
             self.page._kac_context_cleanup_required=True
+            record_owned_browser_failure(self.page,'attach',error,self.command_deadline)
             raise
         return self
     def send(self,method,params):
-        return self._run(lambda:self.session.send(method,params),self.command_deadline)
+        try:return self._run(lambda:self.session.send(method,params),self.command_deadline)
+        except BaseException as error:
+            record_owned_browser_failure(self.page,'send',error,self.command_deadline)
+            raise
     def screenshot(self,clip):
         timeout=max(1,int(bounded_timeout(max(0,self.command_deadline-time.monotonic()))*1000))
         return self._run(lambda:self.page._impl_obj.screenshot(type='png',clip=clip,fullPage=True,timeout=timeout,animations='disabled'),self.command_deadline)
     def __exit__(self,kind,error,tb):
         if self.session is None:return False
         try:
-            self._run(lambda:self.session.detach(),self.deadline,controls=False)
+            self._run(lambda:self.session.detach(),self.deadline,controls=False,phase='detach')
         except BaseException as cleanup:
             self.page._kac_context_cleanup_required=True
+            record_owned_browser_failure(self.page,'detach',cleanup,self.deadline,secondary=True)
             if error is not None:
                 error.add_note('Owned CDP detach unacknowledged: '+type(cleanup).__name__)
             else:raise ValueError('context_channel_cleanup_unacknowledged') from cleanup

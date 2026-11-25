@@ -1,0 +1,29 @@
+# INERT operator checklist/placeholders. No existing credentials or data are bundled.
+KAC_PUBLIC_HOST=<approved-HTTPS-hostname-standard-port443>
+KAC_APP_IMAGE=<release-specific-image-name>
+KAC_GATEWAY_IMAGE=<reviewed-caddy-image@sha256:digest>
+KAC_BUILD_CONTEXT=<absolute-new-staged-context>
+KAC_SERVER_ENV_FILE=<absolute-new-host-managed-secret-file-not-in-build-context>
+KAC_DATA_DIR=<absolute-durable-host-directory-owned-by-uid10001>
+KAC_GATEWAY_IP=172.30.77.2
+KAC_NETWORK_CIDR=172.30.77.0/24
+# Host-managed secret file must supply SERVER_USERNAME, SERVER_PASSWORD_HASH and
+# configured provider/storage credentials. Do not copy a developer engine/.env.
+# Username: approved ASCII account. Password hash: backend-supported PBKDF2 format.
+# Actual values must be provisioned separately, outside source and build context.
+# Validate host ports, network collision, TLS hostname, uid10001 storage permissions,
+# exact base-image digest/version, provider egress/proxy settings, persistence and backups.
+# This recipe has NOT been built, pulled, installed or deployed.
+# Linux local OCR is not qualified; existing configured Cloud vision is independent.
+
+# FIRST SERVER RELEASE rollback: disable/remove only the new gateway route and stop
+# only this new workload; PRESERVE the durable data directory and gateway volumes.
+# Never publish the older local-only375 image as a rollback: it has no server auth.
+# A later rollback requires a previously accepted SERVER-AUTH image and compatible
+# data/source-policy. Never delete volumes, downgrade SQLite, reset history or
+# reinterpret newer acquisition proofs as current under an older source policy.
+
+# Compose env_file interpolates unquoted $ characters. Keep the full host-generated
+# PBKDF2 hash SINGLE-QUOTED as a literal in that separate secret file:
+SERVER_PASSWORD_HASH='<REPLACE_WITH_HOST_GENERATED_HASH>'
+# This invalid placeholder is not a credential; replace it outside source/context.

@@ -26,7 +26,7 @@ from .config import CACHE_DIR, settings
 from .telemetry import record_stage, timed_call
 from .search.session import bounded_timeout
 from .search.failure_policy import ResearchControlError
-from .browser_transport_trace import ArrivalTrace
+from .browser_transport_trace import ArrivalTrace, record_owned_browser_failure
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -64,8 +64,12 @@ def _recover_native_document(page,trace,requested_url):
             recovered=bound
         bounded_timeout(0)
         return recovered
-    except ResearchControlError:raise
-    except Exception:return None
+    except ResearchControlError as error:
+        record_owned_browser_failure(page,'recovery',error,deadline)
+        raise
+    except Exception as error:
+        record_owned_browser_failure(page,'recovery',error,deadline)
+        return None
 
 
 class SupplierProfileBusy(RuntimeError):
@@ -165,6 +169,19 @@ def supplier_http_configuration_hash():
         'adapter':'html_v1'},sort_keys=True).encode()).hexdigest()
 
 def supplier_http_get(url: str, *, max_bytes=None, max_redirects=3) -> httpx.Response:
+    from . import supplier_methods as methods
+    grant=methods.selected(url,'http')
+    try:
+        result=_supplier_http_get_unchecked(url,max_bytes=max_bytes,max_redirects=max_redirects)
+    except (httpx.RequestError,SupplierHttpLimit,SupplierHttpRepresentation)as error:
+        methods.failed(grant,error,'representation'if isinstance(error,(SupplierHttpLimit,SupplierHttpRepresentation))else'network_error')
+        raise
+    methods.response(grant,result.status_code,result.text)
+    methods.current(grant,url)
+    return result
+
+
+def _supplier_http_get_unchecked(url: str, *, max_bytes=None, max_redirects=3) -> httpx.Response:
     """Supplier HTML transport; a configured proxy failure never retries direct."""
     if max_bytes is not None:
         return _bounded_supplier_http_get(url,max_bytes,max_redirects)
@@ -434,6 +451,8 @@ class Browser:
     def page(self, url: str) -> Iterator:
         from playwright.sync_api import Error as PlaywrightError
 
+        from . import supplier_methods as methods
+        grant=methods.selected(url)
         started = time.monotonic()
         ready = False
         host = (urlparse(url).hostname or "").removeprefix("www.")
@@ -453,12 +472,13 @@ class Browser:
             # Chromium can stall a waiting close during a navigation commit.
             page.on("dialog", lambda dialog: dialog.accept())
             from .search.session import primary_http_failed
-            if (urlparse(url).hostname or "").removeprefix("www.").lower() == "elektromehanika.ru" and not primary_http_failed(url):
+            if grant is not None and grant["method"] == "http":
                 # This static site serves its product HTML reliably over HTTP, while
                 # Chrome navigation can finish on a blank document through the proxy.
                 trace.begin_attempt('http_set_content')
                 response = supplier_http_get(url)
                 response.raise_for_status()
+                page._kac_selected_http_response=response
                 content = response.text
                 # The product and prices are server-rendered; third-party scripts can
                 # otherwise keep DOMContentLoaded pending indefinitely in set_content.
@@ -476,8 +496,11 @@ class Browser:
                 page._kac_response_status = response.status_code
                 trace.commit(str(response.url), response.status_code)
                 record_stage("navigation", time.monotonic() - started, label=host)
+                methods.response(grant,response.status_code,content)
+                methods.current(grant,url)
                 ready = True
                 yield page
+                methods.current(grant,url)
                 return
             # Некоторые магазины быстро отдают HTML, но их сторонние скрипты никогда не
             # завершают DOMContentLoaded. Для извлечения текста достаточно получить первый
@@ -487,81 +510,37 @@ class Browser:
             recovered_native = None
             document_url = ''
             last_navigation_error = None
-            for attempt in range(2):
-                if attempt:
-                    recovered_native=_recover_native_document(page,trace,url)
-                    if getattr(page,'_kac_context_cleanup_required',False) is True:raise last_navigation_error
-                    if recovered_native:
-                        response_status=recovered_native['status'];document_url=recovered_native['url']
-                        trace.point('native_document_recovered');break
-                try:
-                    from .search.session import transport_started
-                    bounded_timeout(10, minimum=3)
-                    trace.begin_attempt()
-                    transport_started('supplier_navigation', url)
-                    trace.point('transport_admitted')
-                    response = page.goto(url, wait_until="commit", timeout=max(1, int(bounded_timeout(10, minimum=3) * 1000)))
-                    response_status = response.status if response else None
-                    document_url = str(response.url) if response else ''
-                    trace.commit(getattr(response, 'url', None), response_status)
-                    break
-                except PlaywrightError as navigation_error:
-                    last_navigation_error = navigation_error
-                    trace.attempt_error(navigation_error)
-                    _supplier_failure(navigation_error, url, 'supplier_navigation')
-                    if attempt:
-                        recovered_native=_recover_native_document(page,trace,url)
-                        if getattr(page,'_kac_context_cleanup_required',False) is True:raise navigation_error
-                        if recovered_native:
-                            response_status=recovered_native['status'];document_url=recovered_native['url']
-                            trace.point('native_document_recovered');break
-                        from .search.session import primary_http_failed,http_fallback_advised
-                        if primary_http_failed(url) or not http_fallback_advised(url,supplier_http_configuration_hash()):
-                            raise navigation_error
-                        # Chromium иногда не получает даже первый байт от сайта, который при
-                        # обычном HTTP-запросе отвечает сразу. Берём исходный HTML, добавляем
-                        # base URL для ресурсов и всё равно получаем проверяемый текст/скриншот.
-                        try:
-                            trace.begin_attempt('http_set_content_fallback')
-                            fallback = supplier_http_get(url)
-                            response_status = fallback.status_code
-                            content = fallback.text
-                            if response_status < 400 and content.strip():
-                                base = f'<base href="{escape(str(fallback.url))}">'
-                                if "<head" in content.lower():
-                                    head_end = content.lower().find(">", content.lower().find("<head"))
-                                    content = content[:head_end + 1] + base + content[head_end + 1:]
-                                else:
-                                    content = base + content
-                                page.set_content(
-                                    content, wait_until="domcontentloaded", timeout=_budget_ms(10000)
-                                )
-                                document_url = str(fallback.url)
-                                page._kac_document_url = document_url
-                                trace.commit(str(fallback.url), response_status)
-                                break
-                        except Exception as fallback_error:
-                            from .search.failure_policy import SearchServiceUnavailable
-                            from .llm import LLMUnavailable
-                            from .search.session import SearchBudgetExceeded
-                            if isinstance(fallback_error, ResearchControlError):
-                                raise
-                            if getattr(fallback_error, '_kac_supplier_failure', None):
-                                navigation_error._kac_supplier_failure = fallback_error._kac_supplier_failure
-                        if response_status is not None:
-                            navigation_error._kac_http_status = response_status
-                            navigation_error._kac_retry_after = (getattr(fallback,'headers',{}).get('retry-after')
-                                if 'fallback' in locals() else None)
-                            navigation_error.add_note(f"HTTP fallback did not load a document (status {response_status})")
-                        raise navigation_error
-                    page.wait_for_timeout(_budget_ms(750))
+            try:
+                from .search.session import transport_started
+                bounded_timeout(10, minimum=3)
+                trace.begin_attempt()
+                transport_started('supplier_navigation',url)
+                trace.point('transport_admitted')
+                response=page.goto(url,wait_until="commit",timeout=max(1,int(bounded_timeout(10,minimum=3)*1000)))
+                response_status=response.status if response else None
+                document_url=str(response.url)if response else ''
+                trace.commit(getattr(response,'url',None),response_status)
+                methods.response(grant,response_status)
+            except PlaywrightError as error:
+                trace.attempt_error(error)
+                _supplier_failure(error,url,'supplier_navigation')
+                recovered_native=_recover_native_document(page,trace,url)
+                if getattr(page,'_kac_context_cleanup_required',False) is True:raise
+                if not recovered_native:
+                    methods.failed(grant,error,'navigation')
+                    raise
+                response_status=recovered_native['status'];document_url=recovered_native['url']
+                trace.point('native_document_recovered')
+                methods.response(grant,response_status)
             page._kac_response_status = response_status
             page._kac_document_url = document_url
             page._kac_retry_after = (getattr(response,'headers',{}).get('retry-after') if response else
                                     getattr(fallback,'headers',{}).get('retry-after') if 'fallback' in locals() else None)
             record_stage("navigation", time.monotonic() - started, label=host)
+            methods.current(grant,url)
             ready = True
             yield page
+            methods.current(grant,url)
         except BaseException as error:
             primary = error
             raise

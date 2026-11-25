@@ -63,6 +63,10 @@ class ArticleQueryPlan:
     identity_source: str
     warnings: tuple[str, ...]
     steps: tuple[QueryStep, ...]
+    unplanned_hints: tuple[dict, ...] = ()
+
+    def diagnostic(self):
+        return dict(query_budget=3,planned_queries=list(self.queries),unplanned_hints=list(self.unplanned_hints),unplanned_hints_optional=True)
 
     @property
     def queries(self) -> tuple[str, ...]:
@@ -72,7 +76,7 @@ class ArticleQueryPlan:
 def build_article_query_plan(
     name: str, type_mark: str = "", *, article: str = "",
     manufacturer: str = "", unit: str = "", characteristics: str = "",
-    max_queries: int = 3,
+    max_queries: int = 3, alternative_articles=None, alternative_names=None,
 ) -> ArticleQueryPlan:
     """Exact article, full identity context, then one spelling/descriptive hint.
 
@@ -109,8 +113,20 @@ def build_article_query_plan(
             seen.add(key)
             steps.append(QueryStep(query, kind, hint))
 
+    from ..models import normalize_alternatives
+    alternatives=normalize_alternatives([]if alternative_articles is None else alternative_articles,article=True)
+    names=normalize_alternatives([]if alternative_names is None else alternative_names)
+    unplanned=[]
+    def hints():
+        for value in alternatives:
+            before=len(steps);add((_quoted(value),maker,"цена"),'exact_article',value)
+            if len(steps)==before and _clean(' '.join(p for p in (_quoted(value),maker,"цена")if p)).casefold()not in seen:unplanned.append(dict(kind='alternative_article',value=value))
+        for value in names:
+            before=len(steps);add((value,maker,"цена"),'description','')
+            if len(steps)==before and _clean(' '.join(p for p in (value,maker,"цена")if p)).casefold()not in seen:unplanned.append(dict(kind='alternative_name',value=value))
     if identity:
         add((_quoted(identity), maker, "цена"), "exact_article" if article else "exact_model", identity)
+        hints()
         # Keep both independent source columns, never replace article with model.
         context = model if article and model.casefold() != article.casefold() else ""
         add((_quoted(identity), _quoted(context), maker, name, characteristics, "цена"), "identity_context", identity)
@@ -122,8 +138,9 @@ def build_article_query_plan(
     elif name or characteristics:
         base = _clean(f"{name} {characteristics}")
         add((base, maker, "цена"), "description", "")
+        hints()
         for variant in _spelling(base):
             add((variant, maker, "цена"), "spelling_description", "")
         add((base, maker, "купить"), "description", "")
     return ArticleQueryPlan(name, article, model, manufacturer, unit, characteristics,
-                            source, tuple(warnings), tuple(steps))
+                            source, tuple(warnings), tuple(steps),tuple(unplanned))

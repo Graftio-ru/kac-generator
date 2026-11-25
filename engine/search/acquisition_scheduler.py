@@ -6,7 +6,9 @@ No timed external retry, background continuation, speculative executor backlog o
 source/price cache is owned by this module.
 """
 from concurrent.futures import ThreadPoolExecutor,wait,FIRST_COMPLETED
-from contextvars import copy_context
+from collections import deque
+from contextvars import copy_context,ContextVar
+from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
@@ -15,6 +17,31 @@ import threading
 import time
 import uuid
 
+SUBSTAGES=frozenset(('publish','current_hosts','checkpoint','reuse','selected_proofs_prepare','candidate_selection','frontier_load'))
+_ADVANCE_OBSERVER=ContextVar('acquisition_advance_observer',default=None)
+
+@contextmanager
+def advance_substage(stage):
+    """Closed passive timing, active only during this generator send/throw.
+
+    A scope accidentally surviving a yield has no end duration: unknown rather
+    than attributing worker/scheduler wait to a synchronous coordinator call.
+    """
+    observer=_ADVANCE_OBSERVER.get()
+    if observer is None or type(stage)is not str or stage not in SUBSTAGES:
+        yield;return
+    observer['sequence']+=1;number=observer['sequence'];parent=observer['stack'][-1]if observer['stack']else 0
+    started=observer['stamp']();observer['stack'].append(number);outcome='error'
+    observer['emit']('advance_substage_start',substage=stage,substage_span=number,parent_substage=parent,at=started)
+    try:
+        yield;outcome='ok'
+    finally:
+        observer['stack'].pop()
+        if observer['active']:
+            try:
+                ended=observer['stamp']();seconds=max(0,ended-started)if started is not None and ended is not None else None
+                observer['emit']('advance_substage_end',substage=stage,substage_span=number,parent_substage=parent,at=ended,seconds=seconds,outcome=outcome)
+            except BaseException:pass
 
 class TimingLedger:
     """Best-effort bounded local JSONL; an absent end event means unknown.
@@ -29,7 +56,8 @@ class TimingLedger:
     HOSTS = frozenset(('chipdip.ru', 'elektro.ru', 'ie-moscow.ru',
                        'favorit-el.ru', 'electro-mpo.ru'))
     EVENTS = frozenset(('run_start', 'run_end', 'ready', 'submit',
-                        'worker_start', 'worker_end', 'advance_start', 'advance_end'))
+                        'worker_start', 'worker_end', 'advance_start', 'advance_end',
+                        'advance_substage_start','advance_substage_end'))
     KINDS = frozenset(('discovery', 'own_discovery', 'card', 'proof', 'select'))
     OUTCOMES = frozenset(('ok', 'error', 'yielded', 'returned', 'parked'))
 
@@ -71,13 +99,16 @@ class TimingLedger:
         return value.ljust(self.HEADER_BYTES - 1, b' ') + b'\n'
 
     def emit(self, event, *, run, span=0, key=None, kind=None, hosts=(),
-             at=None, seconds=None, outcome=None):
+             at=None, seconds=None, outcome=None,substage=None,substage_span=None,parent_substage=None):
         if self.disabled:
             return
         try:
             if event not in self.EVENTS:
                 return
             row = dict(event=event, run=run, span=span, at=at)
+            if event in {'advance_substage_start','advance_substage_end'}:
+                if substage not in SUBSTAGES or type(substage_span)is not int or substage_span<=0 or type(parent_substage)is not int or parent_substage<0:return
+                row.update(substage=substage,substage_span=substage_span,parent_substage=parent_substage)
             if key is not None:
                 row['product'] = hashlib.sha256(key.encode()).hexdigest()
             if kind is not None:
@@ -135,9 +166,9 @@ def run_inline(product):
 def run_products(products,*,control,workers=3,diagnostics=None,clock=time.monotonic):
     if type(workers) is not int or not 1<=workers<=3:raise ValueError('Invalid acquisition worker count')
     contexts={key:copy_context() for key in products}
-    order=tuple(products);requests={};pending={};results={};busy=set();stop=None
+    order=tuple(products);unstarted=deque(order);requests={};pending={};results={};busy=set();stop=None
     run=uuid.uuid4().hex if diagnostics is not None else None
-    sequence=0;ready={}
+    sequence=0;ready={};first_ready=set()
     def stamp():
         try:return clock() if diagnostics is not None else None
         except BaseException:return None
@@ -153,16 +184,24 @@ def run_products(products,*,control,workers=3,diagnostics=None,clock=time.monoto
         age=ready[key][2] if failure is None and isinstance(requests.get(key),SelectCard) else None
         sequence+=1;span=sequence;started=stamp();outcome='error'
         emit('advance_start',key=key,span=span,at=started)
+        def resume():
+            observer=dict(sequence=0,stack=[],active=True,stamp=stamp,emit=lambda event,**fields:emit(event,key=key,span=span,**fields))if diagnostics is not None else None
+            token=_ADVANCE_OBSERVER.set(observer)
+            try:return products[key].throw(failure)if failure is not None else products[key].send(value)
+            finally:
+                if observer is not None:observer['active']=False
+                _ADVANCE_OBSERVER.reset(token)
         try:
-            requests[key]=contexts[key].run(products[key].throw,failure) if failure is not None else contexts[key].run(products[key].send,value)
+            requests[key]=contexts[key].run(resume)
             outcome='yielded'
         except StopIteration as done:
-            requests.pop(key,None);results[key]=done.value;outcome='returned'
+            requests.pop(key,None);first_ready.discard(key);results[key]=done.value;outcome='returned'
         finally:
             ended=stamp()
             emit('advance_end',key=key,span=span,at=ended,seconds=elapsed(started,ended),outcome=outcome)
         if key in requests:
             request=requests[key]
+            if isinstance(request,SelectCard) and not request.choices:first_ready.discard(key)
             ready[key]=(span,ended,span if age is None else age)
             emit('ready',key=key,span=span,at=ended,kind=request.kind if isinstance(request,Operation) else 'select' if isinstance(request,SelectCard) else 'unknown',
                  hosts=request.hosts if isinstance(request,Operation) else ())
@@ -175,60 +214,84 @@ def run_products(products,*,control,workers=3,diagnostics=None,clock=time.monoto
             ended=stamp()
             emit('worker_end',key=key,span=span,kind=request.kind,hosts=request.hosts,at=ended,
                  seconds=elapsed(started,ended),outcome=outcome)
+    def poll_control():
+        nonlocal stop
+        if stop is None:
+            try:control()
+            except BaseException as error:stop=error
+        return stop is None
+    def stop_advance(key):
+        # Cleanup may fail, but cannot replace the already authoritative stop.
+        try:advance(key,failure=stop)
+        except BaseException as error:
+            requests.pop(key,None)
+            if error is not stop:stop.add_note('Additionally failed stopped product cleanup: '+type(error).__name__)
     emit('run_start',at=stamp())
     try:
-        for key in order:advance(key)
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            while requests or pending:
-                if stop is None:
-                    try:control()
-                    except BaseException as error:stop=error
+            while requests or pending or unstarted:
+                poll_control()
                 progressed=False
                 active={v[0] for v in pending.values()}
                 if stop is not None:
                     for key in list(requests):
-                        if key not in active:advance(key,failure=stop)
+                        if key not in active:stop_advance(key)
+                    if not pending:raise stop
                 else:
-                    # Oldest ready candidate wins each eligible grant. A pending
-                    # SelectCard competes at its pre-selection age, not its
-                    # freshly yielded operation span. Diagnostics are optional.
-                    for key in sorted((k for k in order if k in requests and k not in active),
-                                      key=lambda k:ready[k][2]):
-                        if len(pending)>=workers:break
-                        if key in active or key not in requests:continue
-                        request=requests[key]
-                        if isinstance(request,SelectCard):
-                            choice=next((i for i,host in request.choices if host not in busy),None)
-                            if choice is None:continue
-                            advance(key,choice);progressed=True
-                            if key not in requests:continue
+                    # Settle ready outcomes before preparation. A bounded initial
+                    # request gets its first eligible grant ahead of continuations.
+                    while len(pending)<workers and poll_control():
+                        if any(f.done() for f in pending):break
+                        if unstarted and len(first_ready)<workers:
+                            key=unstarted.popleft();first_ready.add(key)
+                            advance(key);progressed=True
+                            if any(f.done() for f in pending):break
+                        for key in sorted((k for k in order if k in requests and k not in active),
+                                          key=lambda k:(k not in first_ready,ready[k][2])):
+                            if len(pending)>=workers or stop is not None:break
+                            if key in active or key not in requests:continue
                             request=requests[key]
-                        if isinstance(request,SelectCard):continue
-                        if not isinstance(request,Operation):raise TypeError('Invalid acquisition operation')
-                        hosts=set(request.hosts)
-                        if busy&hosts:continue
-                        if request.kind not in ('discovery','own_discovery','card','proof'):raise TypeError('Invalid acquisition operation kind')
-                        if request.kind=='discovery' and any(v[2]=='discovery' for v in pending.values()):continue
-                        control()
-                        if not contexts[key].run(request.before):
-                            advance(key,failure=OperationParked());progressed=True;continue
-                        busy.update(hosts)
-                        ctx=contexts[key].copy()
-                        span,started,_=ready[key];submitted=stamp()
-                        emit('submit',key=key,span=span,kind=request.kind,hosts=request.hosts,at=submitted,
-                             seconds=elapsed(started,submitted))
-                        pending[pool.submit(execute,ctx,request,key,span)]=(key,hosts,request.kind)
-                        active.add(key)
+                            if isinstance(request,SelectCard):
+                                choice=next((i for i,host in request.choices if host not in busy),None)
+                                if choice is None:continue
+                                advance(key,choice);progressed=True
+                                if key not in requests:continue
+                                request=requests[key]
+                            if isinstance(request,SelectCard):continue
+                            if not isinstance(request,Operation):raise TypeError('Invalid acquisition operation')
+                            hosts=set(request.hosts)
+                            if busy&hosts:continue
+                            if request.kind not in ('discovery','own_discovery','card','proof'):raise TypeError('Invalid acquisition operation kind')
+                            if request.kind=='discovery' and sum(v[2]=='discovery' for v in pending.values())>=2:continue
+                            if not poll_control():break
+                            first_ready.discard(key)
+                            if not contexts[key].run(request.before):
+                                advance(key,failure=OperationParked());progressed=True;continue
+                            busy.update(hosts)
+                            ctx=contexts[key].copy()
+                            span,started,_=ready[key];submitted=stamp()
+                            emit('submit',key=key,span=span,kind=request.kind,hosts=request.hosts,at=submitted,
+                                 seconds=elapsed(started,submitted))
+                            pending[pool.submit(execute,ctx,request,key,span)]=(key,hosts,request.kind)
+                            active.add(key)
+                        # Deliver completed work before doing more synchronous
+                        # preparation. Existing ready cards keep their older age.
+                        if stop is not None or len(pending)>=workers or any(f.done()for f in pending)or not unstarted:break
+                        if len(first_ready)>=workers:break
                 if not pending:
-                    if requests and stop is None and not progressed:raise RuntimeError('Acquisition queue has no eligible owner')
+                    if stop is not None:raise stop
+                    if requests and not progressed and not unstarted:raise RuntimeError('Acquisition queue has no eligible owner')
                     continue
                 done,_=wait(pending,timeout=.05,return_when=FIRST_COMPLETED)
+                poll_control()
                 # Stable product order breaks simultaneous completion ties.
                 for future in sorted(done,key=lambda f:list(products).index(pending[f][0])):
                     key,hosts,_=pending.pop(future);busy.difference_update(hosts)
                     try:value=future.result();failure=None
                     except BaseException as error:value=None;failure=error
-                    advance(key,value,failure=stop or failure)
+                    if stop is not None:stop_advance(key)
+                    else:advance(key,value,failure=failure)
+            if stop is not None:raise stop
         # Scheduler return says nothing about business acquisition completeness.
         emit('run_end',at=stamp(),outcome='returned')
         return results

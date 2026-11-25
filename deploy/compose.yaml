@@ -1,0 +1,47 @@
+services:
+  estimator:
+    build:
+      context: ${KAC_BUILD_CONTEXT:?set explicit staged context path}
+    image: ${KAC_APP_IMAGE:?set reviewed release image name}
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    shm_size: "1gb"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    env_file:
+      - ${KAC_SERVER_ENV_FILE:?set absolute host-managed secret file path}
+    environment:
+      DEPLOYMENT_MODE: server
+      SERVER_PUBLIC_ORIGIN: https://${KAC_PUBLIC_HOST:?set reviewed HTTPS hostname}
+      BROWSER_HEADED: "false"
+      BROWSER_CHANNEL: ""
+    command: [python, -m, uvicorn, "engine.app:app", --host, "0.0.0.0", --port, "8765", --workers, "1", --proxy-headers, --forwarded-allow-ips, "${KAC_GATEWAY_IP:-172.30.77.2}"]
+    volumes:
+      - type: bind
+        source: ${KAC_DATA_DIR:?set absolute durable host directory owned by uid10001}
+        target: /app/engine/data
+    networks: [service]
+    # Deliberately NO ports entry: only the gateway can reach this listener.
+  gateway:
+    image: ${KAC_GATEWAY_IMAGE:?set reviewed caddy image by immutable digest}
+    restart: unless-stopped
+    environment:
+      KAC_PUBLIC_HOST: ${KAC_PUBLIC_HOST:?set reviewed HTTPS hostname}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - gateway_data:/data
+      - gateway_config:/config
+    networks:
+      service:
+        ipv4_address: ${KAC_GATEWAY_IP:-172.30.77.2}
+networks:
+  service:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${KAC_NETWORK_CIDR:-172.30.77.0/24}
+volumes:
+  gateway_data:
+  gateway_config:

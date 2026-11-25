@@ -13,8 +13,11 @@ from __future__ import annotations
 
 from .offer_selection import select_top_offers, unit_review_pending
 from .research_store import StoreError
+from .runner_protocol import KnownCardTarget
+from .supplier_methods import MethodUnavailable
 
 import json
+import hashlib
 import math
 import os
 import re
@@ -27,7 +30,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
-from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -35,7 +38,7 @@ from fastapi.staticfiles import StaticFiles
 import threading
 from datetime import date
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .browser import Browser
 from .config import CACHE_DIR, ENGINE_DIR, OUTPUT_DIR, UPLOAD_DIR, settings
@@ -48,12 +51,57 @@ from .schemas import (BuildRequest, OfferIn, ParseResponse, PositionIn,
                       ResearchReportRequest)
 
 app = FastAPI(title="КАЦ-генератор (локальный движок)")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # локально; UI с GitHub Pages
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+from .server_auth import ServerAuthMiddleware,policy_from_settings
+_SERVER_POLICY=policy_from_settings(settings)
+if _SERVER_POLICY.mode=='local':
+    app.add_middleware(CORSMiddleware,allow_origins=['*'],allow_methods=['*'],allow_headers=['*'])
+
+def _remote_control():
+    return getattr(settings,'execution_mode','local')=='remote' and getattr(settings,'runner_role','control')=='control'
+
+def _runner_store():
+    from .runner_control import RunnerControl
+    from .runner_protocol import digest
+    from .search.acquisition_source_intent import components
+    return RunnerControl(OUTPUT_DIR/'runner_control',digest(components(Path(__file__).parent)))
+
+@app.middleware('http')
+async def remote_authority_boundary(request,call_next):
+    # Auth middleware still protects every denied endpoint. This boundary never
+    # falls back to a second native catalogue on the control host.
+    if getattr(settings,'execution_mode','local')=='remote'and getattr(settings,'runner_role','control')=='executor'and request.url.path!='/healthz':
+        from fastapi.responses import JSONResponse
+        return JSONResponse({'detail':'runner_executor_http_disabled'},status_code=409)
+    if _remote_control():
+        path=request.url.path
+        allowed=(path in {'/','/index.html','/base.html','/runtime-config.js','/healthz','/health','/research','/parse','/build','/common.js','/app.js','/base.js','/styles.css','/candidate-approvals/review','/candidate-approvals/confirm','/candidate-approvals/revoke','/supplier-methods','/supplier-methods/config'} or path.startswith(('/static/','/runner/v1/','/runner-results/','/runner-inputs/','/jobs/')) or path.startswith('/research/') and not path.endswith(('/continue','/report','/package')))
+        if path=='/parse' and request.method=='POST':
+            # Bound multipart bytes BEFORE Starlette spools/parses any upload.
+            from .runner_protocol import MAX_TOTAL
+            from fastapi.responses import JSONResponse
+            body=bytearray()
+            async for chunk in request.stream():
+                if len(body)+len(chunk)>MAX_TOTAL+1024*1024:return JSONResponse({'detail':'runner_upload_too_large'},status_code=413)
+                body.extend(chunk)
+            request._body=bytes(body)
+        if not allowed:
+            from fastapi.responses import JSONResponse
+            return JSONResponse({'detail':'runner_command_unsupported','supported':'parsed-position research; immutable published results'},status_code=409)
+    return await call_next(request)
+
+app.add_middleware(ServerAuthMiddleware,policy=_SERVER_POLICY)
+
+
+@app.get('/healthz',include_in_schema=False)
+def minimal_health():
+    return {'ok':True}
+
+@app.get('/runtime-config.js',include_in_schema=False)
+def runtime_client_configuration():
+    from fastapi.responses import Response
+    value={'mode':_SERVER_POLICY.mode,'apiBase':''if _SERVER_POLICY.mode=='server'else'http://127.0.0.1:8765','executionMode':getattr(settings,'execution_mode','local')}
+    return Response('window.KAC_RUNTIME='+json.dumps(value,separators=(',',':'))+';',media_type='application/javascript',headers={'Cache-Control':'no-store'})
+
 
 JOBS: dict[str, JobState] = {}
 RESEARCH_JOBS: dict[str, dict] = {}
@@ -168,6 +216,9 @@ _CATALOGUE_STORES = {}
 
 def _catalogue_store():
     """Separate durable authority; a broken store is never a cache miss."""
+    from .search.document_context import active_document_operation
+    operation=active_document_operation()
+    if operation is not None:return operation.store
     from .config import BASE_DIR
     from .search.catalogue import CatalogueStore
     from .search.catalogue_projection import configure_store
@@ -229,6 +280,35 @@ def _catalogue_supplier_deferred_reason(saved, deferred):
     return prior + '; ' + reason if prior else reason
 
 
+def _catalogue_source_checks(product,hosts=None,*,ambiguous=False,reason=''):
+    checks = []
+    for host in (list(product['coverage']) if hosts is None else list(dict.fromkeys(hosts))):
+        missing=host not in product['coverage']
+        saved=product['coverage'].get(host,dict(status='unknown',observed_at=None,product_presence='unknown',reason='Для этого ресурса в снимке каталога нет наблюдения; проверка не выполнялась'))
+        check = dict(host=host, **saved, catalogue_snapshot=True)
+        if missing:check['not_attempted']=True
+        if saved.get('deferred_check'):
+            from .search.catalogue import safe_deferred_check
+            health_check=safe_deferred_check(saved['deferred_check'],host)
+            check.update({k:health_check[k] for k in ('deferred_at','retry_at','failure_code','reason_code','health_state')})
+            check['health_checked_at']=health_check['checked_at']
+        if saved.get('diagnostics'):
+            diagnostic = _catalogue_card_review_diagnostic(saved['diagnostics'])
+            check.update({k:v for k,v in diagnostic.items() if k in {'code','failure_source','failure_scope','failure_cause','http_status','transport_error_code','failure_host'}})
+        if check['status'] == 'unknown':
+            check.update(status='incomplete', code='catalogue_unchecked',
+                         reason=saved['reason'] if missing else 'В каталоге нет сохранённой проверки этого ресурса')
+        elif check['status']=='deferred':
+            check.update(status='incomplete',code='catalogue_deferred',catalogue_coverage_status='deferred')
+        if ambiguous:
+            check.update(status='incomplete',code='catalogue_identity_ambiguous',reason=reason,observed_at=None,product_presence='unknown',observation_id=None)
+            check.pop('checked_at',None)
+        elif check.get('observed_at') is not None:
+            check['checked_at'] = check['observed_at']
+        checks.append(check)
+    return checks
+
+
 def _catalogue_known_row(p, *, store=None, product=None, hosts=None):
     """Local projection, including known zero-price products and failed refreshes."""
     from .search.catalogue import identity_for_position
@@ -260,33 +340,12 @@ def _catalogue_known_row(p, *, store=None, product=None, hosts=None):
         image_proofs = sum(proof_ready(offer, position) for offer in selected)
         offers = [_offer_to_dict(o, p.type_mark, position=position) for o in selected]
     found = len(selected)
-    checks = []
-    for host in (list(product['coverage']) if hosts is None else list(dict.fromkeys(hosts))):
-        missing=host not in product['coverage']
-        saved=product['coverage'].get(host,dict(status='unknown',observed_at=None,product_presence='unknown',reason='Для этого ресурса в снимке каталога нет наблюдения; проверка не выполнялась'))
-        check = dict(host=host, **saved, catalogue_snapshot=True)
-        if missing:check['not_attempted']=True
-        if saved.get('deferred_check'):
-            from .search.catalogue import safe_deferred_check
-            health_check=safe_deferred_check(saved['deferred_check'],host)
-            check.update({k:health_check[k] for k in ('deferred_at','retry_at','failure_code','reason_code','health_state')})
-            check['health_checked_at']=health_check['checked_at']
-        if saved.get('diagnostics'):
-            diagnostic = _catalogue_card_review_diagnostic(saved['diagnostics'])
-            check.update({k:v for k,v in diagnostic.items() if k in {'code','failure_source','failure_scope','failure_cause','http_status','transport_error_code','failure_host'}})
-        if check['status'] == 'unknown':
-            check.update(status='incomplete', code='catalogue_unchecked',
-                         reason=saved['reason'] if missing else 'В каталоге нет сохранённой проверки этого ресурса')
-        elif check['status']=='deferred':
-            check.update(status='incomplete',code='catalogue_deferred',catalogue_coverage_status='deferred')
-        if ambiguous:
-            check.update(status='incomplete',code='catalogue_identity_ambiguous',reason=reason,observed_at=None,product_presence='unknown',observation_id=None)
-            check.pop('checked_at',None)
-        elif check.get('observed_at') is not None:
-            check['checked_at'] = check['observed_at']
-        checks.append(check)
+    checks = _catalogue_source_checks(product,hosts,ambiguous=ambiguous,reason=reason if ambiguous else '')
     from .research_publication import public_source_evidence
-    row=dict(number=p.number, name=p.name, full_name=p.full_name,source_evidence=public_source_evidence(p.source_evidence),type_mark=p.type_mark,
+    from .search.article_query_plan import build_article_query_plan
+    row=dict(alternative_articles=p.alternative_articles,alternative_names=p.alternative_names,
+                alternative_search_diagnostic=build_article_query_plan(position.name,position.type_mark,article=identity.code if identity.kind=='article'else'',manufacturer=identity.manufacturer,unit=position.unit,alternative_articles=p.alternative_articles,alternative_names=p.alternative_names).diagnostic(),
+                number=p.number, name=p.name, full_name=p.full_name,source_evidence=public_source_evidence(p.source_evidence),type_mark=p.type_mark,
                 unit=p.unit, qty=p.qty, discipline=p.discipline,
                 is_unique=p.is_unique, provisional=p.needs_review,
                 status='complete' if found >= 3 else 'partial' if found else 'failed',
@@ -368,6 +427,33 @@ def _catalogue_completion_diagnostics(row,previous,*,job_id,store,identity,produ
     return row
 
 
+def _catalogue_legacy_check_patch(publisher,index,checks,*,replace=False):
+    """Update only an existing imported metadata overlay, never mint one."""
+    with publisher.store.lock:
+        row=publisher.store.db.execute('SELECT payload FROM rows WHERE job=? AND idx=?',(publisher.job,index)).fetchone()
+        payload=json.loads(row['payload'])
+        if 'legacy_source_checks' not in payload:return {}
+        legacy=payload['legacy_source_checks']
+        if (type(legacy)is not list or any(type(v)is not dict or type(v.get('host'))is not str or not v['host'] for v in legacy)
+                or len({v['host'] for v in legacy})!=len(legacy)):
+            from .search.catalogue import CatalogueStoreError
+            raise CatalogueStoreError('Invalid legacy source checks')
+        if replace:return {'legacy_source_checks':checks}
+        merged={value['host']:value for value in legacy}
+        merged.update({value['host']:value for value in checks})
+        return {'legacy_source_checks':list(merged.values())}
+
+
+def _publish_catalogue_diagnostics(job_id, indices, coverage):
+    """Immediate current pair metadata, retaining the last derived price snapshot."""
+    checks=_catalogue_source_checks({'coverage':coverage})
+    publisher=_research_publisher(job_id)
+    with publisher.lock:
+        for index in indices:
+            publisher.publish(index,pairs={value['host']:value for value in checks},
+                row_patch=_catalogue_legacy_check_patch(publisher,index,checks),terminal=False,force=True)
+
+
 def _publish_catalogue_row(job_id, index, row, *, terminal=True):
     """Publish terminal local projection to canonical storage, not lifecycle only."""
     publisher = _research_publisher(job_id)
@@ -378,12 +464,14 @@ def _publish_catalogue_row(job_id, index, row, *, terminal=True):
     if row.get('catalogue_identity_ambiguous') is True:
         previous=_research_store().public(job_id,include_events=False)['rows'][index] or {}
         removals=list(dict.fromkeys(offer['url'] for offer in previous.get('candidates',[]) if offer.get('url')))
-    publisher.publish(index,
-        row_patch={key: value for key, value in row.items() if key not in excluded},
-        pairs={check['host']: check for check in row.get('source_checks', [])},
-        candidates={offer['url']: offer for offer in row.get('candidates', [])},removals=removals,
-        selected_keys=[offer['url'] for offer in row.get('offers', [])],
-        terminal=terminal, force=True)
+    with publisher.lock:
+        publisher.publish(index,
+            row_patch={**{key: value for key, value in row.items() if key not in excluded},
+                **_catalogue_legacy_check_patch(publisher,index,row.get('source_checks',[]),replace=True)},
+            pairs={check['host']: check for check in row.get('source_checks', [])},
+            candidates={offer['url']: offer for offer in row.get('candidates', [])},removals=removals,
+            selected_keys=[offer['url'] for offer in row.get('offers', [])],
+            terminal=terminal, force=True)
 
 
 def _research_row(p: PositionIn, *, use_cache: bool = True) -> dict:
@@ -444,7 +532,10 @@ def _research_row_impl(p: PositionIn, *, use_cache: bool = True) -> dict:
     from .search.agent import (_needs_model_review, capture_card_diagnostics,
                                research_position)
 
-    row = {"number": p.number, "name": p.name, "type_mark": p.type_mark,
+    from .search.article_query_plan import build_article_query_plan
+    row = {"alternative_articles":p.alternative_articles,"alternative_names":p.alternative_names,
+           "alternative_search_diagnostic":build_article_query_plan(p.name,p.type_mark,alternative_articles=p.alternative_articles,alternative_names=p.alternative_names).diagnostic(),
+           "number": p.number, "name": p.name, "type_mark": p.type_mark,
            "qty": p.qty,
            "unit": p.unit, "discipline": p.discipline,
            "is_unique": p.is_unique,
@@ -588,8 +679,8 @@ def _research_row_impl(p: PositionIn, *, use_cache: bool = True) -> dict:
                     diagnostics.append(exc.diagnostic())
                 elif isinstance(exc, SearchBudgetExceeded):
                     diagnostics.append({'code':'search_budget','url':'','reason':str(exc)})
-        row["offers"] = [_offer_to_dict(o, p.type_mark) for o in result.offers]
-        row["candidates"] = [_offer_to_dict(o, p.type_mark) for o in (result.all_offers or result.offers)]
+        row["offers"] = [_offer_to_dict(o, p.type_mark,position=p.to_result().position) for o in result.offers]
+        row["candidates"] = [_offer_to_dict(o, p.type_mark,position=p.to_result().position) for o in (result.all_offers or result.offers)]
         row["found"] = result.sources_found
         row["target"] = result.sources_target or settings.min_sources
         row["match_review_count"] = sum(
@@ -843,6 +934,8 @@ def _save_research_job_locked(job_id: str, *, force: bool = True) -> bool:
         job['cancel_requested']=True
     if canonical.get('cancel_requested'):
         job.update(cancel_requested=True,status='cancelled')
+    if canonical.get('control_failure_diagnostic') is not None:
+        job['control_failure_diagnostic']=copy.deepcopy(canonical['control_failure_diagnostic'])
     if canonical.get('first_stop') is not None:
         stop=copy.deepcopy(canonical['first_stop'])
         job.update(first_stop=stop,error_code=stop['code'])
@@ -1365,7 +1458,7 @@ def _run_catalogue_unknown_job_with_documents(job_id, store, *, resumed=None):
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from .search.catalogue import identity_for_position, CatalogueStoreError
     from .search.whitelist import whitelist_hosts
-    from .llm import LLMRequestGuard
+    from .llm import LLMRequestGuard,_JOB_REQUEST_LIMITS
     from .search.session import PersistentSupplierHealth
     from .search.session import research_deadline
     parent_deadline=research_deadline()
@@ -1385,7 +1478,7 @@ def _run_catalogue_unknown_job_with_documents(job_id, store, *, resumed=None):
     job.update(configured_hosts=hosts,primary_hosts=hosts,fallback_hosts=[])
     indexed=resumed is None or bool(resumed) and all(v[1]['version'] in (4,5) for v in resumed.values())
     job['_indexed_acquisition']=indexed
-    groups={};admissions={};initial_frontiers={};guard=LLMRequestGuard();health=PersistentSupplierHealth(hosts=hosts)
+    groups={};admissions={};initial_frontiers={};guard=LLMRequestGuard(run_limits=(_JOB_REQUEST_LIMITS.get()or{}).get('limits'));health=PersistentSupplierHealth(hosts=hosts)
     job.update(awaiting_provider=False,awaiting_provider_reason='',awaiting_provider_code='',catalogue_awaiting_products=[],awaiting_supplier=False,awaiting_supplier_reason='',awaiting_supplier_retry_at=None,awaiting_slice=False,awaiting_slice_reason='')
     from .search.acquisition_lease import AcquisitionLeaseKeeper
     from .search.failure_policy import ResearchControlError
@@ -1403,6 +1496,9 @@ def _run_catalogue_unknown_job_with_documents(job_id, store, *, resumed=None):
                 route,receipt=guard.call('search_account_api',lambda:resolve_initial_route(deadline=parent_deadline))
             job['_catalogue_search_route']=route
             job['_catalogue_search_receipt']=receipt
+            if (receipt or {}).get('account_admission') is not None:
+                job.setdefault('search_account_admission',receipt['account_admission'])
+                _save_research_job(job_id,force=True)
             if route is not None:
                 job['search_backend']=route['backend']
                 job['search_backend_reason']=(receipt or {}).get('selection_reason','')
@@ -1440,7 +1536,7 @@ def _run_catalogue_unknown_job_with_documents(job_id, store, *, resumed=None):
                     from .search.article_query_plan import build_article_query_plan
                     from .search.discovery_plan import StagedDiscoveryPlan
                     position=positions[indices[0]].model_copy(update={'offers':[]}).to_result().position
-                    query_plan=build_article_query_plan(position.name,position.type_mark,article=identity.code if identity.kind=='article' else '',manufacturer=identity.manufacturer,unit=position.unit)
+                    query_plan=build_article_query_plan(position.name,position.type_mark,article=identity.code if identity.kind=='article' else '',manufacturer=identity.manufacturer,unit=position.unit,alternative_articles=position.alternative_articles,alternative_names=position.alternative_names)
                     planner=StagedDiscoveryPlan(query_plan.queries,job['primary_hosts'],job['fallback_hosts'],strong_article=identity.kind=='article')
                     from .search.discovery_plan import expand_discovery_tasks
                     initial=expand_discovery_tasks(planner.initial(),{step.query:step for step in query_plan.steps})
@@ -1491,6 +1587,8 @@ def _run_catalogue_unknown_job_with_documents(job_id, store, *, resumed=None):
         elif stop:job.update(status='error',error=stop['reason'],error_code=stop['code'],first_stop=stop)
         else:job.update(status='error',error='Каталог недоступен; сохранённые результаты не заменены',error_code='catalogue_store_error')
     except ResearchControlError as error:
+        from .search.failure_policy import record_control_failure
+        record_control_failure(job,error,global_remaining=None if parent_deadline is None else parent_deadline-time.monotonic())
         stop=guard.diagnostic()
         job.update(status='cancelled' if job.get('cancel_requested') else 'error',error=stop['reason'] if stop else str(error),error_code=stop['code'] if stop else 'catalogue_acquisition_failed')
         if stop:job['first_stop']=stop
@@ -1564,6 +1662,9 @@ def _catalogue_completion_preflight(positions,snapshot,known,store=None):
 
 def _catalogue_final_preflight(positions,snapshot,known,store):
     """Final financial readiness is distinct from exhaustive coverage certification."""
+    from .search.document_context import active_document_operation
+    operation=active_document_operation()
+    if operation is not None:return operation.preflight(positions,snapshot,known,store)
     from .final_eligibility import require_terminal_research,coverage_notice
     from .search.catalogue import identity_for_position,CatalogueConflict,CatalogueStoreError
     from .search.acquisition_frontier import validate_frontier
@@ -1644,7 +1745,7 @@ def _catalogue_operation_metrics(job_id,index,control):
         with stream_metrics(receive,policy),capture_metrics() as operation_metrics:
             # The stream batch is the sole retained event list for this scope.
             operation_metrics.retain=False
-            yield
+            yield batch
     finally:
         primary=sys.exc_info()[1]
         if batch.events:
@@ -1673,11 +1774,12 @@ def _catalogue_discovery_diagnostic_fields(saved,value):
 
 def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,health,parent_deadline=None,lease_keeper=None,frontier=None,slice_until=None):
     from collections import deque
-    from .search.acquisition_scheduler import Operation,SelectCard,OperationParked
+    from .search.acquisition_scheduler import Operation,SelectCard,OperationParked,advance_substage
     import httpx
     from playwright.sync_api import Error as SupplierNavigationError
     from .search.catalogue import CatalogueStoreError,CatalogueConflict,ProductIdentity
     from .search.catalogue_producer import capture_and_publish,CataloguePublicationError
+    from .search.catalogue import RetainedCardUncertain
     from .search.article_query_plan import build_article_query_plan
     from .search.discovery_plan import StagedDiscoveryPlan,DiscoveryObservationCache,expand_discovery_tasks,own_prefix
     from .search.search_engine import search_on_sites
@@ -1690,13 +1792,28 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
         from .search.supplier_discovery import PROVIDERS,valid_step
         step=steps.get(task.query) if task.route!='serp_only' else None
         return [h for h in selected if h in PROVIDERS] if valid_step(step,task.query) else []
-    def scheduled_operation(kind,hosts,function):
+    def scheduled_operation(kind,hosts,function,*,card_operation=None,diagnostic_binding=None):
         def run():
             check()
-            with _catalogue_operation_metrics(job_id,indices[0],check):
-                if kind in ('discovery','own_discovery'):return function(None)
-                with _browser_factory() as owned_browser:
-                    return function(owned_browser)
+            with _catalogue_operation_metrics(job_id,indices[0],check) as metrics:
+                if kind in ('discovery','own_discovery','proof'):return function(None)
+                if card_operation is not None:
+                    from .search.catalogue import RetainedCardUncertain,definitely_presend
+                    admitted=store.card_operation(**card_operation,acquisition=admission,evidence=dict(job_id=job_id,generation=admission.generation))
+                    if not admitted['allowed']:raise RetainedCardUncertain()
+                try:
+                    from .browser_transport_trace import owned_trace_scope
+                    with owned_trace_scope(diagnostic_binding):
+                        with _browser_factory() as owned_browser:
+                            result=function(owned_browser)
+                except BaseException:
+                    if card_operation is not None and definitely_presend(metrics.events):
+                        check();store.card_operation(**card_operation,acquisition=admission,resolve=True,evidence=dict(basis='proven_presend',events=[v for v in metrics.events if v.get('stage')=='provider_transport']))
+                    raise
+                if card_operation is not None and store.resolve_observation(product_id,card_operation['operation_id']) is not None:
+                    check();store.card_operation(**card_operation,acquisition=admission,resolve=True,evidence=dict(basis='observation'))
+                return result
+        if urgent_progress:publish()  # Durable errors precede the next external operation.
         return Operation(kind,tuple(hosts),run,before=lambda:not park_slice())
     product_id=admission.product_id;completion_refusal=None
     failure_binding=dict(job_id=job_id,product_id=product_id,generation=admission.generation,position_index=indices[0])
@@ -1713,16 +1830,23 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
             raise
     job=RESEARCH_JOBS[job_id];p=_RESEARCH_INPUTS[job_id][indices[0]].model_copy(update={'offers':[]})
     position=p.to_result().position;hosts=job['configured_hosts'];observations={};identities=set();settled=set();seen=set();cache=DiscoveryObservationCache()
-    plan=build_article_query_plan(position.name,position.type_mark,article=identity.code if identity.kind=='article' else '',manufacturer=identity.manufacturer,unit=position.unit)
+    plan=build_article_query_plan(position.name,position.type_mark,article=identity.code if identity.kind=='article' else '',manufacturer=identity.manufacturer,unit=position.unit,alternative_articles=position.alternative_articles,alternative_names=position.alternative_names)
     steps={step.query:step for step in plan.steps};planner=StagedDiscoveryPlan(plan.queries,job['primary_hosts'],job['fallback_hosts'],strong_article=identity.kind=='article');tasks=deque(expand_discovery_tasks(planner.initial(),steps))
     from .search.acquisition_lease import AcquisitionOwnershipLost
     def check():
         if lease_keeper is None:raise AcquisitionOwnershipLost()
         lease_keeper.check(admission)
+    urgent_progress=False
+    diagnostic_hosts=set()
     def coverage(host,**fields):
+        nonlocal urgent_progress
         check()
         written=store.publish_coverage(product_id,host,acquisition=admission,**fields)
         if not written:check()  # Older coverage can be refused without losing ownership.
+        if written and (fields.get('diagnostics') or fields.get('deferred_check') or fields.get('status') in {'review','error'}):
+            if host not in hosts:raise CatalogueConflict('Diagnostic host is not configured')
+            diagnostic_hosts.add(host)
+            urgent_progress=True  # Metadata flush at the existing post-checkpoint boundary.
         return written
     def discovery_diagnostic(host,value):
         check()
@@ -1740,7 +1864,20 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
         coverage(host,status=status,observed_at=saved.get('observed_at'),reason=_catalogue_supplier_deferred_reason(saved,value),
             product_presence=saved.get('product_presence','unknown'),observation_id=saved.get('observation_id'),diagnostics=[item for item in saved.get('diagnostics',[]) if item.get('code')!='supplier_deferred']+[diagnostic],deferred_check=value)
         return value,reason
-    def publish():
+    from .research_publication import DerivedProgressGate
+    derived_progress=DerivedProgressGate()
+    def publish(*,force=False):
+        nonlocal urgent_progress
+        check()
+        if diagnostic_hosts:
+            current={host:store.read_coverage(product_id,host,acquisition=admission,owner=job_id) for host in sorted(diagnostic_hosts)}
+            _publish_catalogue_diagnostics(job_id,indices,current)
+            diagnostic_hosts.clear()  # Only after every duplicate row acknowledges.
+            urgent_progress=False
+        emitted=derived_progress.publish(build_progress,force=force)
+        return emitted
+    @advance_substage('publish')
+    def build_progress():
         check()
         product=store.lookup(identity)
         for index in indices:
@@ -1748,12 +1885,16 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
             _catalogue_completion_diagnostics(row,job['rows'][index],job_id=job_id,store=store,identity=identity,product=product,refusal=completion_refusal)
             row['catalogue_acquisition_running']=True
             job['rows'][index]=row;_publish_catalogue_row(job_id,index,row,terminal=False)
+    @advance_substage('current_hosts')
     def current_hosts():
         from .offer_selection import offer_is_comparable
         product=store.lookup(identity)
         with catalogue_scope(store,snapshot=product):
             result=project_product(store,identity,position,snapshot=product)
             return {host_for(o.url,hosts) for o in result.all_offers if offer_is_comparable(o,position)}
+    @advance_substage('reuse')
+    def reusable_source(url,host):
+        return _catalogue_reusable_source(store,identity,position,url,host)
     def cancelled():
         if job.get('cancel_requested'):
             lease_keeper.revoke_all(reason='Задание отменено',cancelled=True)
@@ -1776,7 +1917,19 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
         if producer_identity.key!=product_id:raise CatalogueConflict('Acquisition canonical identity changed')
         from .search.discovery_plan import DiscoveryTask
         from .search.search_engine import DiscoveryURLs
-        controller,records,checkpoint=_catalogue_checkpoint_controller(job_id,indices[0],admission,store,planner,list(tasks),frontier)
+        with advance_substage('frontier_load'):
+            controller,records,checkpoint=_catalogue_checkpoint_controller(job_id,indices[0],admission,store,planner,list(tasks),frontier)
+        native_checkpoint=checkpoint
+        @advance_substage('checkpoint')
+        def checkpoint(value):
+            from .research_store import Conflict
+            check();bounded_timeout(0);guard.check()
+            try:return native_checkpoint(value)
+            except Conflict:
+                # A stop may become authoritative after the revision read.
+                # Recheck it without retrying or weakening the original CAS.
+                check();bounded_timeout(0);guard.check()
+                raise
         def park_slice():
             nonlocal paused,slice_pending
             if slice_until is None:return False
@@ -1789,6 +1942,42 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
                 job.update(awaiting_slice=True,acquisition_resume_only=True,awaiting_slice_reason='Временной отрезок получения завершён; сохранённые результаты доступны, оставшиеся операции ожидают явного продолжения')
             _save_research_job(job_id,force=True)
             return True
+        def selected_proofs(*,early=False):
+            nonlocal paused,supplier_pending,supplier_hold
+            from .search.selected_proofs import capture_selected_proofs,price_candidates,proof_ready
+            with advance_substage('selected_proofs_prepare'):
+                check();bounded_timeout(0);guard.check()
+                product=store.lookup(identity)
+                with catalogue_scope(store,snapshot=product):
+                    selected=price_candidates(project_product(store,identity,position,snapshot=product))
+                    attempted=set(job.get('catalogue_proof_attempts',{}).get(product_id,[]))
+                    pending=[o for o in selected if not proof_ready(o,position) and o.url not in attempted]
+            if early and len(selected)<3:return False
+            if not pending or len(attempted)>=6:return False
+            def save_attempts(urls):
+                check();bounded_timeout(0);guard.check()
+                with _RESEARCH_LOCK:
+                    job.setdefault('catalogue_proof_attempts',{})[product_id]=sorted(urls)
+                _save_research_job(job_id,force=True)
+            offer=next(iter(reversed(pending)))
+            proof_host=host_for(offer.url,hosts)
+            if not proof_host:raise CatalogueConflict('Selected proof supplier is not configured')
+            proofs=yield scheduled_operation('proof',[proof_host],lambda browser:capture_selected_proofs(store,[position],browser=None,browser_factory=_browser_factory,image_store=image_store,acquisition=admission,control=check,paused=park_slice,attempted=attempted,on_attempt=save_attempts,selected_url=offer.url))
+            if proofs['paused']:
+                paused=True
+                if proofs.get('deferred_check'):
+                    supplier_pending=True;supplier_hold=proofs['deferred_check']
+                    defer_supplier(supplier_hold['host'],supplier_hold)
+                    with _RESEARCH_LOCK:
+                        waiting=job.setdefault('catalogue_awaiting_products',[])
+                        if product_id not in waiting:waiting.append(product_id)
+                        job.update(awaiting_supplier=True,acquisition_resume_only=True,awaiting_supplier_reason=proofs['reason'])
+                    _save_research_job(job_id,force=True)
+                return True
+            check();bounded_timeout(0);guard.check()
+            job.setdefault('catalogue_selected_proofs',{})[product_id]=proofs
+            publish(force=True)
+            return (yield from selected_proofs(early=early))
         def task_state(task):
             return next(v for v in controller.value['queries'] if (v['phase'],v['query'],tuple(v['hosts']),v['strategy'])==(task.phase,task.query,task.hosts,task.route))
         def response_value(state):
@@ -1852,7 +2041,9 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
         with research_session(health,llm_guard=guard,deadline=parent_deadline,cancelled=cancelled):
             image_store=_catalogue_image_store()
             while tasks:
-                check();task=tasks.popleft()
+                check()
+                if (yield from selected_proofs(early=True)):break
+                task=tasks.popleft()
                 if not (task.query is None and task.phase=='complete' and all(v['state']=='done' for v in controller.value['queries'])) and park_slice():break
                 if task.query is None:
                     if guard.search_deferred() or any(v['state']!='done' for v in controller.value['queries']):break
@@ -1861,21 +2052,7 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
                         # obligations; neither plan completion nor a certificate
                         # follows from their zero-card response alone.
                         if any(saved.get('deferred_check') for saved in store.lookup(identity)['coverage'].values()):break
-                        from .search.selected_proofs import capture_selected_proofs
-                        proofs=yield scheduled_operation('proof',hosts,lambda browser:capture_selected_proofs(store,[position],browser=browser,image_store=image_store,acquisition=admission,control=check,paused=park_slice))
-                        if proofs['paused']:
-                            paused=True
-                            if proofs.get('deferred_check'):
-                                supplier_pending=True;supplier_hold=proofs['deferred_check']
-                                host=supplier_hold['host'];defer_supplier(host,supplier_hold)
-                                with _RESEARCH_LOCK:
-                                    waiting=job.setdefault('catalogue_awaiting_products',[])
-                                    if product_id not in waiting:waiting.append(product_id)
-                                    job.update(awaiting_supplier=True,acquisition_resume_only=True,awaiting_supplier_reason=proofs['reason'])
-                                _save_research_job(job_id,force=True)
-                            break
-                        job.setdefault('catalogue_selected_proofs',{})[product_id]=proofs
-                        publish()
+                        if (yield from selected_proofs()):break
                     expansion=planner.fallback(observations,identities,settled) if task.phase=='fallback' else planner.literal(observations,identities,settled) if task.phase=='literal' else []
                     if controller.value['version']==5:expansion=expand_discovery_tasks(expansion,steps)
                     actual=[v for v in expansion if v.query is not None]
@@ -1904,13 +2081,13 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
                                 return (_research_acquisition_mode(job_id)=='missing_data'
                                     and native is not None and (native.get('acquisition') or {}).get('generation')==admission.generation
                                     and store.acquisition_owner_matches(product_id,owner=job_id,expected_identity=identity,statuses=('running','done'))
-                                    and evidence==_catalogue_reusable_source(store,identity,position,url,host))
+                                    and evidence==reusable_source(url,host))
                             completion=certify_completion(controller.value,context,records,controller.value['source_intent'],resolve_hosts=resolved_hosts,verify_identity=_catalogue_verify_identity_completion,verify_reuse=verify_reuse,allow_catalogue_reuse=_research_acquisition_mode(job_id)=='missing_data')
                         except CompletionUnknown as failure:
                             check()  # Cancellation, global/deadline and ownership retain priority.
                             completion=None # Preserve partial research; never fabricate authority.
                             completion_refusal=_catalogue_completion_reason(failure)
-                            publish()
+                            publish(force=True)
                     tasks.extend(actual)
                     if task.phase!='complete':tasks.append(DiscoveryTask('literal' if task.phase=='fallback' else 'complete'))
                     continue
@@ -1980,7 +2157,8 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
                     if not urls and not getattr(urls,'host_observations',{}):
                         if isinstance(failure,SearchCapacityDeferred):
                             urls=DiscoveryURLs([],host_observations={h:dict(origin='unknown',window='unknown',observed_at=None,candidate_count=0,diagnostics=[failure.diagnostic()]) for h in selected})
-                        else:continue
+                        else:
+                            publish();continue
                 except ResearchControlError as failure:
                     stop=guard.diagnostic()
                     if stop:
@@ -2027,15 +2205,20 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
                 # from already priced hosts; settlement only skips NEW discovery.
                 parked=set()
                 while task_state(task)['state']=='received':
-                    check();state=task_state(task)
+                    check()
+                    if (yield from selected_proofs(early=True)):break
+                    state=task_state(task)
                     if state['current_card'] is None and park_slice():break
                     if state['current_card'] is None:
                         selected_index=None
                         if controller.value['version'] in (4,5):
-                            candidates=controller.candidate_indices(state['id'],parked)
-                            if not candidates:break
-                            choices=[(i,controller.candidate(state['id'],i)['host']) for i in candidates]
+                            with advance_substage('candidate_selection'):
+                                candidates=controller.candidate_indices(state['id'],parked)
+                                if not candidates:break
+                                choices=[(i,controller.candidate(state['id'],i)['host']) for i in candidates]
+                            if urgent_progress:publish()
                             selected_index=yield SelectCard(choices)
+                            check();bounded_timeout(0);guard.check()
                         checkpoint(controller.start_card(state['id'],selected_index));state=task_state(task)
                     card=state['current_card'];url=card['url'];host=card['host'];operation=card['operation_id']
                     def settle_card(state_name,observation_id=None,reason='',typed=None):
@@ -2064,7 +2247,7 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
                         seen.add(url);continue
                     if park_slice():break
                     if _research_acquisition_mode(job_id)=='missing_data':
-                        reused=_catalogue_reusable_source(store,identity,position,url,host)
+                        reused=reusable_source(url,host)
                         if reused is not None:
                             settle_card('observed',reused['observation_id'],typed=dict(version=1,disposition='catalogue_reuse',evidence=reused))
                             seen.add(url);settled=current_hosts();publish();continue
@@ -2079,9 +2262,10 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
                         saved=store.read_coverage(product_id,host,acquisition=admission,owner=job_id)
                         if saved['status']!='found':coverage(host,status='review',observed_at=decision.observed_at,reason=diagnostic['reason'],diagnostics=[diagnostic])
                         settle_card('review' if decision.reason=='candidate_known_listing' else 'identity_conflict',reason=decision.reason,typed=dict(version=1,disposition='deterministic_rejection',evidence=dict(role='candidate_admission',code=decision.reason,response_sha256=state['response']['sha256'])))
+                        publish()
                         continue
                     from .search.agent import capture_card_diagnostics
-                    card_reason='';card_failure=None;card_error=None;card_error_code='';card_deferred=False;contention_deadline=time.monotonic()+120
+                    card_reason='';card_failure=None;card_error=None;card_error_code='';card_deferred=False;card_prior_unknown=False;contention_deadline=time.monotonic()+120
                     with capture_card_diagnostics() as diagnostics:
                         while True:
                             check();bounded_timeout(1)
@@ -2104,7 +2288,7 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
                                     with receive_sources(received):
                                         return capture_and_publish(store,producer_identity,position,url,browser=browser,image_store=image_store,capture=partial(collect_current,http_preflight=True),acquisition=admission,supplier_host=host,observation_id=operation)
                                 with failure_operation(state['id'],operation):
-                                    observation=yield scheduled_operation('card',[host],capture_independent)
+                                    observation=yield scheduled_operation('card',[host],capture_independent,card_operation=dict(product_id=product_id,host=host,url=url,operation_id=operation),diagnostic_binding=dict(failure_binding,task_id=state['id'],operation_id=operation))
                             except SupplierDeferred as failure:
                                 value,card_reason=defer_supplier(host,failure.check)
                                 if controller.value['version'] not in (4,5) and value['reason_code']=='supplier_probe_in_progress' and time.monotonic()<contention_deadline:
@@ -2124,6 +2308,11 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
                                 store.record_refresh_attempt(product_id,host,url,attempted_at=time.time(),outcome='parse_error',reason='card_review_'+type(failure).__name__)
                             except (SearchServiceUnavailable,LLMUnavailable) as failure:
                                 guard.reject(failure);raise
+                            except RetainedCardUncertain as failure:
+                                check();bounded_timeout(0);guard.check()
+                                discovery_diagnostic(host,dict(observed_at=None,diagnostics=[dict(code='prior_card_operation_unknown',reason=str(failure))]))
+                                settle_card('review',reason='card_control_review',typed=_catalogue_uncertain_card_completion([],failure,'card_control_review'))
+                                card_prior_unknown=True;break
                             except ResearchControlError as failure:
                                 if isinstance(failure,ResearchInternalFailure):guard.reject(failure);raise
                                 if isinstance(failure,AcquisitionOwnershipLost) or (isinstance(failure,ResearchProgressError) and isinstance(failure.__cause__,CatalogueStoreError)):raise
@@ -2140,11 +2329,18 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
                                 if diagnostic is None:raise
                                 diagnostic['url']=url;diagnostics.append(diagnostic);card_reason=diagnostic['reason']
                                 observation=None
+                            except MethodUnavailable as failure:
+                                check();bounded_timeout(0)
+                                card_error=failure;card_error_code='card_control_review';observation=None
+                                diagnostic=dict(failure.diagnostic(),url=url)
+                                diagnostics.append(diagnostic);card_reason=diagnostic['reason']
                             except ValueError as failure:
                                 card_error=failure;card_error_code='catalogue_card_validation_failed'
                                 observation=None;diagnostics.append(dict(code='catalogue_card_validation_failed',reason='Исходные данные карточки не прошли проверку публикации',url=url,observed_at=time.time(),failure_source='catalogue_producer',failure_scope='card',failure_cause='source_binding'))
                             break
                     check()
+                    if card_prior_unknown:
+                        publish();continue
                     if card_deferred:
                         seen.discard(url)
                         if controller.value['version'] in (4,5):
@@ -2228,6 +2424,8 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
     except OperationParked:
         pass  # Queued slice boundary persisted by park_slice; no physical attempt.
     except ResearchControlError as failure:
+        from .search.failure_policy import record_control_failure
+        record_control_failure(job,failure,global_remaining=None if parent_deadline is None else parent_deadline-time.monotonic())
         if job.get('cancel_requested'):
             error='Acquisition cancelled';lease_keeper.revoke_all(reason='Задание отменено',cancelled=True)
         elif guard.diagnostic():
@@ -2249,13 +2447,17 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
         job.update(status='cancelled' if job.get('cancel_requested') else 'error',error=error,error_code=stop['code'],first_stop=stop)
         _save_research_job(job_id,force=True)
     finally:
-        if (error or guard.search_deferred() or guard.diagnostic() or job.get('cancel_requested')) and lease_keeper is not None and lease_keeper.may_record_stop(admission):
-            reason=('Задание отменено; ресурс не проверен' if job.get('cancel_requested') else 'Внешний API остановил получение; ресурс не проверен' if guard.diagnostic() else error or 'Поисковый API временно занят; ресурс не проверен')
-            for host,saved in store.lookup(identity)['coverage'].items():
-                if saved['status']=='unknown':store.publish_coverage(product_id,host,status='deferred',reason=reason,acquisition=admission)
-        if lease_keeper is not None:
-            if paused and not (error or job.get('cancel_requested') or guard.diagnostic()):lease_keeper.release(admission)
-            else:lease_keeper.finish(admission,error=error if not job.get('cancel_requested') else 'Acquisition cancelled',completion=completion if not error and not job.get('cancel_requested') else None)
+        try:
+            if __import__('sys').exc_info()[0] is None and (derived_progress.dirty or urgent_progress) and not (error or guard.diagnostic() or job.get('cancel_requested')):
+                publish(force=True)  # Normal/suspended tail, while ownership is still valid.
+        finally:
+            if (error or guard.search_deferred() or guard.diagnostic() or job.get('cancel_requested')) and lease_keeper is not None and lease_keeper.may_record_stop(admission):
+                reason=('Задание отменено; ресурс не проверен' if job.get('cancel_requested') else 'Внешний API остановил получение; ресурс не проверен' if guard.diagnostic() else error or 'Поисковый API временно занят; ресурс не проверен')
+                for host,saved in store.lookup(identity)['coverage'].items():
+                    if saved['status']=='unknown':store.publish_coverage(product_id,host,status='deferred',reason=reason,acquisition=admission)
+            if lease_keeper is not None:
+                if paused and not (error or job.get('cancel_requested') or guard.diagnostic()):lease_keeper.release(admission)
+                else:lease_keeper.finish(admission,error=error if not job.get('cancel_requested') else 'Acquisition cancelled',completion=completion if not error and not job.get('cancel_requested') else None)
     return error
 
 
@@ -2519,8 +2721,8 @@ def _run_research_job(job_id: str) -> None:
             projected.all_offers=list(projected.offers)
             projected=base_db.apply_refresh(position,projected)
             final=projected.all_offers or projected.offers
-            row['candidates']=[_offer_to_dict(o,position.type_mark) for o in final]
-            row['offers']=[_offer_to_dict(o,position.type_mark) for o in projected.offers]
+            row['candidates']=[_offer_to_dict(o,position.type_mark,position=position) for o in final]
+            row['offers']=[_offer_to_dict(o,position.type_mark,position=position) for o in projected.offers]
             row['found']=projected.sources_found
             if row.get('status')!='skipped':row['status']='complete' if row['found']>=settings.min_sources else 'partial' if row['found'] else 'failed'
             allowed=not job.get('cancel_requested') and not llm_guard.diagnostic() and (deadline is None or time.monotonic()<deadline)
@@ -2589,7 +2791,7 @@ def _run_research_job(job_id: str) -> None:
                     from .search import base_db
                     projected = position.model_copy(update={'offers':[
                         OfferIn.model_validate(item) for item in row['candidates']]}).to_result()
-                    row['candidates'] = [_offer_to_dict(offer, position.type_mark)
+                    row['candidates'] = [_offer_to_dict(offer, position.type_mark,position=position)
                         for offer in base_db.project_refresh_offers(projected.position, projected.offers)]
                 row['offers'] = select_top_offers(row['candidates'], settings.top_prices, position)
                 row['found'] = source_count(row['candidates'], position)
@@ -2706,7 +2908,7 @@ def _run_research_job(job_id: str) -> None:
             def on_offer(offer):
                 if offer.identity_evidence:
                     on_identity(offer.identity_evidence)
-                data = _offer_to_dict(offer, position.type_mark)
+                data = _offer_to_dict(offer, position.type_mark,position=position)
                 fresh_observed.add(data.get('url'))
                 progress_by_row[index][data.get('url')] = data
                 publish(index, previous or {}, terminal=False, candidate_delta={data['url']: data})
@@ -2863,8 +3065,8 @@ def _run_research_job(job_id: str) -> None:
                     started_at=refresh_started_at, diagnostics=row.get('diagnostics', []))
                 if reconciled is not None:
                     reviewed = base_db.apply_refresh(observed.position, observed)
-                    row['candidates'] = [_offer_to_dict(o, position.type_mark) for o in reviewed.all_offers]
-                    row['offers'] = [_offer_to_dict(o, position.type_mark) for o in reviewed.offers]
+                    row['candidates'] = [_offer_to_dict(o, position.type_mark,position=position) for o in reviewed.all_offers]
+                    row['offers'] = [_offer_to_dict(o, position.type_mark,position=position) for o in reviewed.offers]
                     row['found'] = reviewed.sources_found
                     for candidate in row['candidates']:
                         if candidate.get('url') in progress_by_row[index]:
@@ -3272,11 +3474,15 @@ def _launch_research_job(job_id: str) -> None:
     threading.Thread(target=_run_research_job, args=(job_id,), daemon=True).start()
 
 
-def _start_research_job(positions: list[PositionIn], *, acquisition_slice_seconds=None, acquisition_mode='catalogue_read') -> str:
+def _start_research_job(positions: list[PositionIn], *, acquisition_slice_seconds=None, acquisition_mode='catalogue_read', _runner_job_id=None) -> str:
     if type(acquisition_mode) is not str or acquisition_mode not in {'catalogue_read','missing_data'}:
         raise ValueError('Invalid research acquisition mode')
     acquisition_slice_seconds=_acquisition_slice_seconds(acquisition_slice_seconds)
-    job_id = uuid.uuid4().hex[:12]
+    job_id = _runner_job_id or uuid.uuid4().hex[:12]
+    if _runner_job_id is not None:
+        from .runner_protocol import identifier
+        identifier(job_id)
+        if job_id in RESEARCH_JOBS or _load_research_job(job_id):raise ValueError('runner_native_job_already_exists')
     snapshot = [p.model_copy(deep=True) for p in positions]
     job = {"job_id": job_id, "status": "pending", "total": len(snapshot),
            "completed": 0, "rows": [None] * len(snapshot), "refresh_first": True,
@@ -3296,21 +3502,244 @@ def _start_research_job(positions: list[PositionIn], *, acquisition_slice_second
         RESEARCH_JOBS[job_id] = job
         _RESEARCH_INPUTS[job_id] = snapshot
         _save_research_job(job_id)
-        _launch_research_job(job_id)
+        if _runner_job_id is None:_launch_research_job(job_id)
     return job_id
+
+
+def _run_known_cards_job(job_id: str, targets: list[KnownCardTarget], *, extract: bool) -> None:
+    """Bind native app adapters to one bounded card job, preserving runner control.
+
+    The service validates targets and parent authority before opening storage.
+    It persists native rows or explicit refusal/UNKNOWN/error states; it never
+    searches, retries unknown sends, or grants full business/report readiness.
+    """
+    from .known_card_runner import KnownCardDependencies, KnownCardRun
+
+    dependencies = KnownCardDependencies(
+        store_factory=_catalogue_store,
+        cache_dir=CACHE_DIR,
+        browser_factory=_browser_factory,
+        save_job=_save_research_job,
+        build_row=_catalogue_known_row,
+        publish_row=_publish_catalogue_row,
+        uncertain_completion=_catalogue_uncertain_card_completion,
+    )
+    KnownCardRun(
+        job_id, _RESEARCH_INPUTS[job_id], RESEARCH_JOBS[job_id], targets,
+        extract=extract, dependencies=dependencies,
+    ).run()
 
 
 class ResearchCreateRequest(BaseModel):
     model_config = {'extra':'forbid'}
-    positions: list[PositionIn] = Field(min_length=1)
+    positions: list[PositionIn] = Field(min_length=1,max_length=5000)
     acquisition_mode: str = Field(default='catalogue_read',pattern=r'^(catalogue_read|missing_data)$',strict=True)
 
 
+class KnownCardTargetRequest(BaseModel):
+    """Strict API target; protocol validation also checks URL and index coverage."""
+
+    model_config = {"extra": "forbid"}
+    index: int = Field(ge=0, le=1, strict=True)
+    url: str = Field(min_length=1, max_length=4096, strict=True)
+
+
+class KnownCardsCreateRequest(BaseModel):
+    """One or two complete native positions with explicitly chosen target URLs."""
+
+    model_config = {"extra": "forbid"}
+    positions: list[PositionIn] = Field(min_length=1, max_length=2)
+    targets: list[KnownCardTargetRequest] = Field(min_length=1, max_length=2)
+    extract: bool = Field(strict=True)
+
+
+class KnownPendingRequest(BaseModel):
+    """Exact historical parent identifiers acknowledged for one indexed target."""
+
+    model_config = {"extra": "forbid"}
+    index: int = Field(ge=0, le=1, strict=True)
+    operation_ids: list[str] = Field(max_length=4096)
+
+
+class KnownNewCaptureRequest(KnownCardsCreateRequest):
+    """An explicit authenticated action, not a client-supplied authority object."""
+
+    pending: list[KnownPendingRequest] = Field(min_length=1, max_length=2)
+    reason: str = Field(min_length=1, max_length=512, strict=True)
+
+
+@app.post('/research/cards/new')
+def create_new_known_capture(req: KnownNewCaptureRequest, request: Request) -> dict[str, str]:
+    """Queue a distinct user action with server-selected identity, source and expiry.
+
+    Authentication supplies the actor. Client authority fields/booleans are not
+    accepted; exact historical parent sets are checked again on the owned runner.
+    The same idempotency key cannot enqueue two distinct commands.
+    """
+    if not _remote_control():
+        raise HTTPException(409, 'remote_execution_required')
+    from .server_auth import approval_actor
+    from .search.known_capture_intent import issue_authority
+    from .runner_protocol import command, ProtocolError
+    from .runner_control import DispatchError
+    store = _runner_store()
+    actor = approval_actor()
+    targets = [target.model_dump(mode='json') for target in req.targets]
+    try:
+        authorization = issue_authority(
+            req.positions, targets,
+            [parent.model_dump(mode='json') for parent in req.pending],
+            actor=actor, source_seal=store.seal, reason=req.reason,
+        )
+        payload = {
+            'positions': [position.model_dump(mode='json') for position in req.positions],
+            'targets': targets, 'extract': req.extract, 'authorization': authorization,
+        }
+        envelope = command({'version': 1, 'kind': 'known_cards_new_capture', 'payload': payload})
+        job_id = store.enqueue(envelope, request.headers.get('Idempotency-Key'), actor)
+        return {'job_id': job_id}
+    except DispatchError as error:
+        raise HTTPException(409, str(error)) from None
+    except (ProtocolError, ValueError):
+        raise HTTPException(422, 'known_capture_request_invalid') from None
+
+
+@app.post('/research/cards')
+def create_known_cards(req: KnownCardsCreateRequest, request: Request) -> dict[str, str]:
+    """Queue an authenticated, idempotent known-card command on CONTROL only.
+
+    Native business data and browser work stay on RUNNER. A closed-payload
+    refusal is HTTP422; unavailable dispatch or a local-only server is HTTP409.
+    The existing middleware supplies the authenticated human actor.
+    """
+    if not _remote_control():
+        raise HTTPException(409, 'remote_execution_required')
+    from .server_auth import approval_actor
+    from .runner_protocol import command, ProtocolError
+    from .runner_control import DispatchError
+
+    try:
+        envelope = command({
+            'version': 1,
+            'kind': 'known_cards',
+            'payload': req.model_dump(mode='json'),
+        })
+        job_id = _runner_store().enqueue(
+            envelope, request.headers.get('Idempotency-Key'), approval_actor(),
+        )
+        return {'job_id': job_id}
+    except ProtocolError as error:
+        raise HTTPException(422, str(error)) from None
+    except DispatchError as error:
+        raise HTTPException(409, str(error)) from None
+
+
 @app.post('/research')
-def create_research(req: ResearchCreateRequest) -> dict:
+def create_research(req: ResearchCreateRequest, request: Request) -> dict:
     """Explicit active collection requires missing_data; existing reads default unchanged."""
+    if _remote_control():
+        from .server_auth import approval_actor
+        from .runner_control import DispatchError
+        try:return {'job_id':_runner_store().enqueue(req.model_dump(mode='json'),request.headers.get('Idempotency-Key'),approval_actor())}
+        except DispatchError as error:raise HTTPException(409,str(error))from None
     return {'job_id':_start_research_job(req.positions,acquisition_mode=req.acquisition_mode)}
 
+
+async def _runner_body(request):
+    from .server_auth import _MACHINE
+    from .runner_protocol import MAX_JSON,ProtocolError
+    if not _remote_control()or not _MACHINE.get():raise HTTPException(403,'runner_machine_required')
+    raw=b''
+    async for part in request.stream():
+        if len(raw)+len(part)>MAX_JSON:raise HTTPException(413,'runner_json_too_large')
+        raw+=part
+    try:
+        value=json.loads(raw)
+        if type(value)is not dict:raise ValueError()
+        return value
+    except(ValueError,UnicodeError):raise HTTPException(422,'runner_json_invalid')from None
+
+def _runner_call(method,*args):
+    from .runner_control import DispatchError
+    from .runner_protocol import ProtocolError
+    try:return method() if callable(method) else getattr(_runner_store(),method)(*args)
+    except(DispatchError,ProtocolError)as error:raise HTTPException(409,str(error))from None
+
+@app.get('/runner/v1/jobs/{job_id}/inputs/{sha}')
+def runner_input_download(job_id:str,sha:str,request:Request):
+    from .server_auth import _MACHINE
+    if not _remote_control()or not _MACHINE.get():raise HTTPException(403,'runner_machine_required')
+    try:fence=int(request.headers.get('X-Runner-Fence',''))
+    except ValueError:raise HTTPException(409,'runner_fence_invalid')from None
+    path,entry=_runner_call(lambda:_runner_store().input_file(job_id,sha,request.headers.get('X-Runner-Lease'),fence))
+    return FileResponse(path,filename=entry['filename'],media_type='application/octet-stream')
+
+@app.get('/runner-inputs/{job_id}/{sha}')
+def runner_original_download(job_id:str,sha:str):
+    from .server_auth import approval_actor
+    path,entry=_runner_call(lambda:_runner_store().input_file(job_id,sha,actor=approval_actor()))
+    return FileResponse(path,filename=entry['filename'],media_type='application/octet-stream')
+
+@app.get('/runner/v1/supplier-methods')
+def runner_supplier_methods_read():
+    from .server_auth import _MACHINE
+    from .supplier_methods import store
+    if not _remote_control()or not _MACHINE.get():raise HTTPException(403,'runner_machine_required')
+    return store().snapshot()
+
+@app.post('/runner/v1/claim')
+async def runner_claim(request:Request):
+    body=await _runner_body(request)
+    return _runner_call('claim',body.get('runner_id'),body.get('source_seal'))
+
+@app.post('/runner/v1/approval-recovery')
+async def runner_approval_recovery(request:Request):
+    body=await _runner_body(request)
+    return _runner_call('approval_recovery_claim',body.get('source_seal'))
+
+@app.post('/runner/v1/jobs/{job_id}/{action}')
+async def runner_job_action(job_id:str,action:str,request:Request):
+    """Route authenticated runner operations, including power-only drain proof."""
+    body=await _runner_body(request);base=(job_id,body.get('lease_token'),body.get('fence'))
+    if action=='supplier-methods':return _runner_call('supplier_methods',*base,body.get('report'))
+    if action=='begin':return _runner_call('begin',*base)
+    if action=='approval-authority':return _runner_call('approval_authority',*base)
+    if action=='receipt-authority':return _runner_call('approval_recovery_authority',job_id,body.get('recovery_token'))
+    if action=='receipt-complete':return _runner_call('approval_recovery_complete',job_id,body.get('recovery_token'),body.get('public_snapshot'),body.get('receipt_sha256'))
+    if action=='receipt-missing':return _runner_call('approval_recovery_missing',job_id,body.get('recovery_token'))
+    if action=='heartbeat':return _runner_call('heartbeat',*base,body.get('sequence'))
+    if action=='work-drained':return _runner_call('record_drained_work',*base)
+    if action=='checkpoint':return _runner_call('checkpoint',*base,body.get('sequence'),body.get('public_snapshot'))
+    if action=='complete':return _runner_call('complete',*base,body.get('manifest'),body.get('public_snapshot'),body.get('outcome'))
+    raise HTTPException(404,'runner_action_unknown')
+
+@app.put('/runner/v1/jobs/{job_id}/artifacts/{sha}')
+async def runner_artifact_upload(job_id:str,sha:str,request:Request):
+    from .server_auth import _MACHINE
+    from .runner_protocol import MAX_ARTIFACT
+    if not _remote_control()or not _MACHINE.get():raise HTTPException(403,'runner_machine_required')
+    try:entry=json.loads(request.headers.get('X-Artifact',''))
+    except ValueError:raise HTTPException(422,'runner_manifest_invalid')from None
+    if type(entry)is not dict or entry.get('sha256')!=sha:raise HTTPException(422,'runner_manifest_invalid')
+    chunks=[];size=0
+    async for part in request.stream():
+        size+=len(part)
+        if size>MAX_ARTIFACT:raise HTTPException(413,'runner_artifact_too_large')
+        chunks.append(part)
+    try:fence=int(request.headers.get('X-Runner-Fence',''))
+    except ValueError:raise HTTPException(422,'runner_fence_invalid')from None
+    _runner_call('put_artifact',job_id,request.headers.get('X-Runner-Lease'),fence,entry,b''.join(chunks))
+    return {'persisted':True}
+
+@app.get('/runner-results/{job_id}/{sha}')
+def runner_result(job_id:str,sha:str):
+    path,entry=_runner_call('artifact',job_id,sha)
+    return FileResponse(path,media_type=entry['content_type'],filename=entry['name'])
+
+@app.post('/research/{job_id}/cancel')
+def cancel_remote_research(job_id:str):
+    if not _remote_control():raise HTTPException(409,'remote_execution_required')
+    return _runner_call('cancel',job_id)
 
 @app.post("/research/{job_id}/continue")
 def continue_research(job_id: str, body: dict | None = Body(default=None)) -> dict:
@@ -3382,6 +3811,11 @@ def continue_research(job_id: str, body: dict | None = Body(default=None)) -> di
 
 @app.get("/research/{job_id}")
 def research_status(job_id: str) -> dict:
+    if _remote_control():
+        from .runner_control import DispatchError
+        from .runner_protocol import ProtocolError
+        try:return _runner_store().public(job_id)
+        except(DispatchError,ProtocolError) as error:raise HTTPException(404,str(error))from None
     loaded = _load_research_job(job_id) if job_id not in RESEARCH_JOBS else None
     with _RESEARCH_LOCK:
         job = RESEARCH_JOBS.get(job_id)
@@ -3407,8 +3841,8 @@ def research_status(job_id: str) -> dict:
 
 
 
-def _catalogue_export_images(snapshot):
-    """Warm only immutable server current-head images, never client S3 refs."""
+def _catalogue_export_images(snapshot, *, local_only=False):
+    """Check saved images and fetch missing current-head images only for online exports."""
     from .search.failure_policy import ResearchControlError
     from concurrent.futures import CancelledError
     errors={};seen=set();images=None;unavailable=False
@@ -3420,6 +3854,9 @@ def _catalogue_export_images(snapshot):
             seen.add(key)
             if image.get('local_path') and (CACHE_DIR/image['local_path']).is_file():continue
             if not image.get('bucket') or not image.get('key'):continue
+            if local_only:
+                errors[key]='Снимок недоступен локально после остановки сбора'
+                continue
             if unavailable:
                 errors[key]='s3_image_export_unavailable';continue
             try:
@@ -3433,15 +3870,15 @@ def _catalogue_export_images(snapshot):
     return errors
 
 
-def _catalogue_export_snapshot(request):
-    """Reproject known rows from one server snapshot; client refs are never authority."""
+def _catalogue_export_snapshot(request, *, local_only=False):
+    """Reproject server-owned rows and optionally limit image evidence to local files."""
     from .search.catalogue import identity_for_position, CatalogueStoreError
     from .search.catalogue_projection import catalogue_scope
     store=_catalogue_store()
     try:
         identities={index:identity_for_position(p) for index,p in enumerate(request.positions) if not p.is_unique}
         snapshot=store.read_snapshot(list(identities.values()))
-        image_errors=_catalogue_export_images(snapshot)
+        image_errors=_catalogue_export_images(snapshot, local_only=local_only)
         positions=[];known=set()
         with catalogue_scope(store,snapshot=snapshot):
             for index,p in enumerate(request.positions):
@@ -3497,14 +3934,37 @@ def research_package(request: ResearchReportRequest) -> StreamingResponse:
 
 @app.post("/parse", response_model=ParseResponse)
 async def parse(
+    request: Request = None,
     object_name: str = Form(""),
     discipline: str = Form("ЭМ"),
     unique_names: str = Form(""),
     specs: list[UploadFile] = (),
     letters: list[UploadFile] = (),
 ) -> ParseResponse:
-    """Парсит спецификации и письма → список позиций для правки в UI."""
-    job_dir = UPLOAD_DIR / f"parse_{uuid.uuid4().hex[:8]}"
+    if _remote_control():
+        from .runner_protocol import command,MAX_ARTIFACT,MAX_TOTAL
+        from .server_auth import approval_actor
+        from fastapi.responses import JSONResponse
+        sources=[];total=0;store=_runner_store()
+        if not 1<=len(specs)+len(letters)<=20:raise HTTPException(413,'runner_input_count_invalid')
+        for kind,files in (('spec',specs),('letter',letters)):
+            for index,f in enumerate(files):
+                raw=bytearray()
+                while chunk:=await f.read(1024*1024):
+                    if len(raw)+len(chunk)>MAX_ARTIFACT or total+len(chunk)>MAX_TOTAL:raise HTTPException(413,'runner_upload_too_large')
+                    raw.extend(chunk);total+=len(chunk)
+                entry=dict(kind=kind,index=index,filename=f.filename or 'source',suffix=Path(f.filename or '').suffix.lower(),sha256=hashlib.sha256(raw).hexdigest(),bytes=len(raw))
+                sources.append(entry)
+                value=_runner_call(lambda:command(dict(version=1,kind='parse',payload=dict(object_name=object_name,discipline=discipline,unique_names=unique_names,sources=sources))))
+                store.store_input(entry,bytes(raw))
+        job=_runner_call(lambda:store.enqueue(value,request.headers.get('Idempotency-Key'),approval_actor()))
+        return JSONResponse({'job_id':job,'dispatch_command':'parse'},status_code=202)
+    return await _parse_native(object_name,discipline,unique_names,specs,letters)
+
+
+async def _parse_native(object_name,discipline,unique_names,specs,letters,*,_start_research=True,_job_dir=None):
+    """Runner-private native parse; stable registered source paths, no auto-paid followup."""
+    job_dir = _job_dir or UPLOAD_DIR / f"parse_{uuid.uuid4().hex[:8]}"
     job_dir.mkdir(parents=True, exist_ok=True)
     uniq = {s.strip() for s in unique_names.split(";") if s.strip()}
 
@@ -3595,18 +4055,30 @@ async def parse(
             record.update(status='failed', code='recognition_letter_failed')
         outcomes.append(record)
     return ParseResponse(positions=positions, source_outcomes=outcomes,
-        research_job_id=_start_research_job(positions) if positions and not account_stopped else None)
+        research_job_id=_start_research_job(positions) if _start_research and positions and not account_stopped else None)
 
 
 @app.post("/build")
-def build(req: BuildRequest) -> dict:
+def build(req: BuildRequest, request: Request = None) -> dict:
+    if _remote_control():
+        from .server_auth import approval_actor
+        return {'job_id':_runner_call(lambda:_runner_store().enqueue(dict(version=1,kind='build',payload=req.model_dump(mode='json')),request.headers.get('Idempotency-Key'),approval_actor())),'dispatch_command':'build'}
+    return _build_native(req)
+
+
+def _build_native(req,*,_synchronous=False,_before_pipeline=None):
     req,store,snapshot,known=_catalogue_export_snapshot(req)
     from .search.catalogue_projection import catalogue_scope
     with catalogue_scope(store,snapshot=snapshot):
-        return _build_from_server_snapshot(req,store,snapshot,known)
+        return _build_from_server_snapshot(req,store,snapshot,known,_synchronous=_synchronous,_before_pipeline=_before_pipeline)
 
 
-def _build_from_server_snapshot(req,store,snapshot,known):
+def _estimator_offer_confirmed(offer,position):
+    if not getattr(offer,'estimator_approval_ref',{}):return False
+    from .search.catalogue_projection import catalogue_review_reason
+    return not catalogue_review_reason(offer,position)
+
+def _build_from_server_snapshot(req,store,snapshot,known,*,_synchronous=False,_before_pipeline=None):
     """Existing document gates applied to the server-projected current catalogue."""
     from .equipment_output_policy import is_graftio_equipment
     unknown=[p.number for index,p in enumerate(req.positions) if index not in known and not p.is_unique and not is_graftio_equipment(p) and not any(o.price_with_vat>0 for o in p.offers)]
@@ -3644,7 +4116,7 @@ def _build_from_server_snapshot(req,store,snapshot,known):
                                _saved_price_unit_is_verified)
     model_conflicts = [
         p.number for p in req.positions for offer in p.offers
-        if (_conflicting_page_article(p.type_mark, offer.page_article)
+        if not _estimator_offer_confirmed(offer,p) and (_conflicting_page_article(p.type_mark, offer.page_article)
             or (offer.product_title and (
                 _conflicting_model_code_in_title(p.type_mark, offer.product_title)
                 or _conflicting_network_cable_spec(
@@ -3662,7 +4134,7 @@ def _build_from_server_snapshot(req,store,snapshot,known):
         raise HTTPException(422, f"Карточки с другой маркой в позициях: {numbers}; замените предложения")
     model_pending = [
         p.number for p in req.positions for offer in p.offers
-        if (offer.match_review_required or
+        if not _estimator_offer_confirmed(offer,p) and (offer.match_review_required or
             (bool(offer.product_title) and _needs_model_review(
                 p.type_mark, offer.product_title, offer.url, offer.page_title,
                 offer.page_article)))
@@ -3709,7 +4181,14 @@ def _build_from_server_snapshot(req,store,snapshot,known):
         fix_date=req.fix_date, skip_search=req.skip_search,
         tsn_work_kind=req.tsn_work_kind, manual_tsn=manual_tsn,
         catalogue_store=store,catalogue_snapshot=snapshot,catalogue_known_indices=known)
-    run_pipeline_async(job, inputs, _browser_factory)
+    from .search.document_context import active_document_operation
+    operation=active_document_operation()
+    if operation is not None:operation.expect_job(job)
+    if _synchronous:
+        if _before_pipeline is not None:_before_pipeline()
+        from .pipeline import run_pipeline
+        run_pipeline(job,inputs,_browser_factory)
+    else:run_pipeline_async(job, inputs, _browser_factory)
     return {"job_id": job_id,"coverage_warnings":warnings}
 
 
@@ -3726,6 +4205,7 @@ def _offer_to_dict(off, type_mark: str = "", *, position=None) -> dict:
     """PriceOffer → форма OfferIn для UI (скриншоты — basename из кэша)."""
     from .search.agent import _needs_model_review
     from .source_quote import quote_review_reason,retired_attachment_reason
+    from .search.product_identity import current_offer_article_evidence
     req = off.requisites
     from .requisites.supplier import seller_origin_notice
     from .region_policy import region_approval
@@ -3737,11 +4217,14 @@ def _offer_to_dict(off, type_mark: str = "", *, position=None) -> dict:
         "product_title": off.product_title,
         "page_title": off.page_title,
         "page_article": off.page_article,
+        "article_match_evidence":current_offer_article_evidence(off,position)if position is not None else {},
         "identity_evidence": off.identity_evidence,
         "price_unit": off.price_unit,
         "normalized_price_unit": "" if unit_review_pending(off) else off.normalized_price_unit,
         "price_unit_evidence": off.price_unit_evidence,
         "source_quote_evidence": off.source_quote_evidence,
+        "estimator_approval_ref":off.estimator_approval_ref,
+        "estimator_approval":off.estimator_approval,
         "catalogue_ref": getattr(off, 'catalogue_ref', {}),
         "catalogue_observed_at": getattr(off, 'catalogue_observed_at', 0),
         "catalogue_source_sha256": getattr(off, 'catalogue_source_sha256', ''),
@@ -3753,7 +4236,7 @@ def _offer_to_dict(off, type_mark: str = "", *, position=None) -> dict:
         "price_capture_evidence": off.price_capture_evidence,
         "price_capture_review_reason": off.price_capture_review_reason,
         "listed_price_with_vat": off.listed_price_with_vat,
-        "match_review_required": off.match_review_required or bool(off.product_title and _needs_model_review(
+        "match_review_required": off.match_review_required or bool(not off.catalogue_ref and off.product_title and _needs_model_review(
             type_mark, off.product_title, off.url, off.page_title, off.page_article)),
         "model_review_accepted": off.model_review_accepted,
         "unit_review_required": unit_review_pending(off) or bool(business_reason),
@@ -3772,8 +4255,94 @@ def _offer_to_dict(off, type_mark: str = "", *, position=None) -> dict:
     }
 
 
+class CandidateApprovalReviewRequest(BaseModel):
+    model_config={'extra':'forbid'}
+    position: PositionIn
+    catalogue_ref: dict
+
+class CandidateApprovalConfirmRequest(CandidateApprovalReviewRequest):
+    expected_material_sha256: str = Field(pattern=r'^[a-f0-9]{64}$')
+    confirmed_product_title: str
+    confirmed_article: str
+    confirmed_raw_amount: float = Field(strict=True,gt=0,allow_inf_nan=False)
+    confirmed_sale_unit: str = Field(min_length=1,max_length=64)
+    requested_unit: str
+    units_per_sale_unit: float = Field(strict=True,gt=0,allow_inf_nan=False)
+    reason: str = Field(min_length=1,max_length=2048)
+
+class CandidateApprovalRevokeRequest(BaseModel):
+    model_config={'extra':'forbid'}
+    approval_id: str = Field(pattern=r'^[a-f0-9]{32}$')
+    expected_revision: int = Field(strict=True,ge=1)
+    reason: str = Field(min_length=1,max_length=2048)
+
+def _enqueue_approval_command(kind,dto,http_request):
+    from .server_auth import approval_actor
+    from fastapi.responses import JSONResponse
+    if http_request is None:raise HTTPException(409,'approval_http_context_required')
+    value={'version':1,'kind':kind,'payload':dto.model_dump(mode='json')}
+    job=_runner_call(lambda:_runner_store().enqueue(value,http_request.headers.get('Idempotency-Key'),approval_actor()))
+    return JSONResponse({'job_id':job,'dispatch_command':kind},status_code=202)
+
+def _project_approval_response(store,position,reference,approval):
+    from .search.catalogue_projection import project_product,catalogue_scope
+    from .search.catalogue import identity_for_position
+    from .search.estimator_approval import reference as approval_reference,ApprovalInvalid
+    with catalogue_scope(store):
+        projected=project_product(store,identity_for_position(position),position)
+        offer=next((o for o in projected.all_offers if o.catalogue_ref==reference),None)
+        if offer is None or offer.estimator_approval_ref!=approval_reference(approval):raise ApprovalInvalid('approval_projection_changed')
+        return {'approval':approval,'estimator_approval_ref':approval_reference(approval),'offer':_offer_to_dict(offer,position.type_mark,position=position)}
+
+@app.post('/candidate-approvals/review')
+def candidate_approval_review(request: CandidateApprovalReviewRequest,http_request:Request=None):
+    if _remote_control():return _enqueue_approval_command('candidate_review',request,http_request)
+    return _candidate_approval_review_native(request)
+
+def _candidate_approval_review_native(request:CandidateApprovalReviewRequest):
+    from .search.estimator_approval import review,ApprovalInvalid
+    try:return review(_catalogue_store(),request.catalogue_ref,request.position.to_result().position)
+    except ApprovalInvalid as error:raise HTTPException(409,str(error))from None
+
+@app.post('/candidate-approvals/confirm')
+def candidate_approval_confirm(request: CandidateApprovalConfirmRequest,http_request:Request=None):
+    if _remote_control():return _enqueue_approval_command('candidate_confirm',request,http_request)
+    return _candidate_approval_confirm_native(request)
+
+def _candidate_approval_confirm_native(request:CandidateApprovalConfirmRequest):
+    from .search.estimator_approval import confirm,reference,ApprovalInvalid
+    from .search.catalogue_projection import project_product,catalogue_scope
+    from .search.catalogue import identity_for_position
+    store=_catalogue_store();position=request.position.to_result().position
+    try:
+        approval=confirm(store,request.catalogue_ref,position,request.model_dump())
+        return _project_approval_response(store,position,request.catalogue_ref,approval)
+    except (ApprovalInvalid,StopIteration)as error:raise HTTPException(409,str(error)if isinstance(error,ApprovalInvalid)else'approval_projection_changed')from None
+
+@app.post('/candidate-approvals/revoke')
+def candidate_approval_revoke(request: CandidateApprovalRevokeRequest,http_request:Request=None):
+    if _remote_control():return _enqueue_approval_command('candidate_revoke',request,http_request)
+    return _candidate_approval_revoke_native(request)
+
+def _candidate_approval_revoke_native(request:CandidateApprovalRevokeRequest):
+    from .search.estimator_approval import revoke,ApprovalInvalid
+    try:return {'approval':revoke(_catalogue_store(),request.approval_id,request.expected_revision,request.reason)}
+    except ApprovalInvalid as error:raise HTTPException(409,str(error))from None
+
 class CaptureRequest(BaseModel):
+    alternative_articles: list[str] = Field(default_factory=list)
+    alternative_names: list[str] = Field(default_factory=list)
+
+    @field_validator('alternative_articles','alternative_names',mode='before')
+    @classmethod
+    def validate_alternatives(cls,value,info):
+        from .models import normalize_alternatives
+        return normalize_alternatives(value,article=info.field_name=='alternative_articles')
+
     url: str
+    full_name: str = ""
+    source_evidence: dict = Field(default_factory=dict)
+    review_fields: dict = Field(default_factory=dict)
     name: str = ""
     inn: str = ""
     type_mark: str = ""
@@ -3786,26 +4355,29 @@ class CaptureRequest(BaseModel):
 def capture(req: CaptureRequest) -> dict:
     """Shared facts-first recapture; the photo belongs only to this new read."""
     from .search.card_attachments import capture_current
+    from .search.product_identity import request_alternatives_scope,native_request_role,legacy_article_request
     from .search.session import research_session,PersistentSupplierHealth
     from .search.failure_policy import ResearchControlError
     from .llm import LLMRequestGuard
     from .models import SpecPosition
     from .search.agent import capture_card_diagnostics
-    position=SpecPosition(number=1,name=req.name,type_mark=req.type_mark,unit=req.unit,qty=req.qty)
+    position=SpecPosition(number=1,name=req.name,type_mark=req.type_mark,unit=req.unit,qty=req.qty,full_name=req.full_name,source_evidence=req.source_evidence,review_fields=req.review_fields,alternative_articles=req.alternative_articles,alternative_names=req.alternative_names)
+    if position.alternative_articles and native_request_role(position)=='unknown' and not legacy_article_request(position):
+        raise HTTPException(422,'Original native model/article binding is required for alternative capture')
     try:
-        with _browser_factory() as browser,research_session(PersistentSupplierHealth(),llm_guard=LLMRequestGuard()),capture_card_diagnostics() as diagnostics:
+        with request_alternatives_scope(position),_browser_factory() as browser,research_session(PersistentSupplierHealth(),llm_guard=LLMRequestGuard()),capture_card_diagnostics() as diagnostics:
             snapshot,offer=capture_current(browser,position,req.url,extract=req.extract)
     except ModelOutputInvalid as error:raise HTTPException(422,error.diagnostic()) from None
     except ResearchControlError as error:raise HTTPException(503,type(error).__name__) from None
     except Exception as error:raise HTTPException(502,'Карточка не получена: '+type(error).__name__) from None
-    result=dict(screenshot_product='',screenshot_context='',screenshot_requisites='',extracted={},requisites={},price_capture_evidence={},price_capture_review_reason='',source_quote_evidence={},identity_evidence={},diagnostics=diagnostics,context_capture_evidence={},context_capture_review_reason='Текущая карточка или её цена не подтверждены',normalized_price_with_vat=None,normalized_price_unit='',quote_qualified=False,unit_review_required=True,unit_review_reason='Текущая цена/единица не подтверждена')
+    result=dict(alternative_articles=req.alternative_articles,alternative_names=req.alternative_names,screenshot_product='',screenshot_context='',screenshot_requisites='',extracted={},requisites={},price_capture_evidence={},price_capture_review_reason='',source_quote_evidence={},identity_evidence={},diagnostics=diagnostics,context_capture_evidence={},context_capture_review_reason='Текущая карточка или её цена не подтверждены',normalized_price_with_vat=None,normalized_price_unit='',quote_qualified=False,unit_review_required=True,unit_review_reason='Текущая цена/единица не подтверждена')
     if snapshot:
         facts=snapshot.facts()
         result.update(screenshot_context=Path(facts['screenshot_context']).name if facts['screenshot_context'] else '',context_capture_evidence=facts['context_capture_evidence'],context_capture_review_reason=facts['context_capture_review_reason'])
     if offer:
         from .offer_selection import offer_is_comparable
         result['quote_qualified']=offer_is_comparable(offer,position)
-        data=_offer_to_dict(offer,req.type_mark);result.update(data)
+        data=_offer_to_dict(offer,req.type_mark,position=position);result.update(data)
         result['requisites']=offer.requisites.model_dump()
         result['extracted']=dict(product_title=offer.product_title,matches_requested_product=not offer.match_review_required,price_with_vat=offer.price_with_vat,listed_price_with_vat=offer.listed_price_with_vat,price_unit=offer.price_unit)
         result['normalized_price_with_vat']=offer.price_with_vat if not offer.unit_review_required else None
@@ -3813,6 +4385,15 @@ def capture(req: CaptureRequest) -> dict:
 
 
 class SearchRequest(BaseModel):
+    alternative_articles: list[str] = Field(default_factory=list)
+    alternative_names: list[str] = Field(default_factory=list)
+
+    @field_validator('alternative_articles','alternative_names',mode='before')
+    @classmethod
+    def validate_alternatives(cls,value,info):
+        from .models import normalize_alternatives
+        return normalize_alternatives(value,article=info.field_name=='alternative_articles')
+
     number: int = 1
     qty: float = 0
     name: str
@@ -3833,7 +4414,7 @@ def search_position(req: SearchRequest) -> dict:
     Cache-first: сперва смотрим в базу (без браузера), вживую ищем только при промахе.
     """
     known = _catalogue_known_row(PositionIn(number=req.number, name=req.name,
-        type_mark=req.type_mark, discipline=req.discipline, unit=req.unit, qty=req.qty,full_name=req.full_name,source_evidence=req.source_evidence,review_fields=req.review_fields))
+        type_mark=req.type_mark, discipline=req.discipline, unit=req.unit, qty=req.qty,full_name=req.full_name,source_evidence=req.source_evidence,review_fields=req.review_fields,alternative_articles=req.alternative_articles,alternative_names=req.alternative_names))
     if known is not None:
         return {**known, 'checked': 0}
     if known is None:
@@ -3843,7 +4424,7 @@ def search_position(req: SearchRequest) -> dict:
             RESEARCH_JOBS[job_id] = {'job_id':job_id,'rows':[None],'completed':0,'total':1,
                 'status':'pending','refresh_first':True,'force_discovery':req.force_discovery}
             _RESEARCH_INPUTS[job_id] = [PositionIn(number=req.number,name=req.name,
-                type_mark=req.type_mark,discipline=req.discipline,unit=req.unit,qty=req.qty,full_name=req.full_name,source_evidence=req.source_evidence,review_fields=req.review_fields)]
+                type_mark=req.type_mark,discipline=req.discipline,unit=req.unit,qty=req.qty,full_name=req.full_name,source_evidence=req.source_evidence,review_fields=req.review_fields,alternative_articles=req.alternative_articles,alternative_names=req.alternative_names)]
             _save_research_job(job_id)  # Immutable input/host snapshot before synchronous dispatch.
         _run_research_job(job_id)
         job = RESEARCH_JOBS[job_id]
@@ -4045,6 +4626,7 @@ async def base_import(file: UploadFile, discipline: str = Form("ЭМ")) -> dict:
 
 @app.get("/jobs/{job_id}")
 def job_status(job_id: str) -> dict:
+    if _remote_control():return _runner_call(lambda:_runner_store().public(job_id))
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(404, "Задача не найдена")
@@ -4058,6 +4640,12 @@ def job_status(job_id: str) -> dict:
 
 @app.get("/jobs/{job_id}/download/{kind}")
 def download(job_id: str, kind: str) -> FileResponse:
+    if _remote_control():
+        store=_runner_store();snap=_runner_call(lambda:store.public(job_id));name=(snap.get('output_names')or{}).get(kind)
+        entry=next((e for e in snap.get('downloads',[])if e['name']==name),None)
+        if not entry:raise HTTPException(404,'runner_artifact_missing')
+        path,_=_runner_call(lambda:store.artifact(job_id,entry['sha256']))
+        return FileResponse(path,filename=entry['name'],media_type=entry['content_type'])
     job = JOBS.get(job_id)
     if not job or job.status!="done" or kind not in job.outputs:
         raise HTTPException(404, "Файл не готов")
@@ -4069,5 +4657,36 @@ def download(job_id: str, kind: str) -> FileResponse:
 # поэтому браузер не блокирует запросы (в отличие от https-страницы на GitHub Pages → http-localhost).
 # Монтируется ПОСЛЕ всех API-маршрутов, чтобы не перехватывать их.
 _WEB_DIR = ENGINE_DIR.parent / "web"
+
+class SupplierMethodChange(BaseModel):
+    model_config={'extra':'forbid'}
+    host:str=Field(min_length=1,max_length=253)
+    method:str=Field(pattern=r'^(http|browser)$')
+    expected_revision:int=Field(strict=True,ge=1)
+    reason:str=Field(min_length=1,max_length=512)
+
+@app.get('/supplier-methods/config')
+def supplier_methods_configuration():
+    from .server_auth import approval_actor
+    from .supplier_methods import store
+    approval_actor()
+    return store().snapshot()
+
+@app.post('/supplier-methods/config')
+def supplier_method_change(value:SupplierMethodChange):
+    from .server_auth import approval_actor
+    from .supplier_methods import store,MethodInvalid
+    actor=approval_actor()
+    try:return store().change(value.host,value.method,value.expected_revision,actor,value.reason)
+    except MethodInvalid as error:raise HTTPException(409,str(error))from None
+
+@app.get('/supplier-methods',include_in_schema=False)
+def supplier_methods_page():
+    from fastapi.responses import HTMLResponse
+    from .server_auth import approval_actor
+    approval_actor()
+    return HTMLResponse((ENGINE_DIR.parent/'supplier-methods.html').read_text(),headers={'Cache-Control':'no-store'})
+
 if _WEB_DIR.exists():
     app.mount("/", StaticFiles(directory=str(_WEB_DIR), html=True), name="ui")
+

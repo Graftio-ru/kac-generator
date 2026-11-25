@@ -30,6 +30,19 @@ FALLBACK_SUPPLIERS_FILE = REPO_ROOT / "Поставщики_резерв_Мос�
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=ENGINE_DIR / ".env", extra="ignore")
 
+    # Optional shared server. Credentials are provisioned by operator, never UI.
+    deployment_mode: Literal['local','server'] = 'local'
+    # Remote control never opens the native runner catalogue.
+    execution_mode: Literal['local','remote'] = 'local'
+    runner_role: Literal['control','executor'] = 'control'
+    runner_username: str = ''
+    runner_password_hash: SecretStr = SecretStr('')
+    runner_password: SecretStr = SecretStr('')
+    runner_control_origin: str = ''
+    server_username: str = ''
+    server_password_hash: SecretStr = SecretStr('')
+    server_public_origin: str = ''
+
     # Existing S3 bucket for dated native card screenshots (not the LLM API key).
     s3_endpoint_url: str = "https://s3.cloud.ru"
     s3_region: str = "ru-central-1"

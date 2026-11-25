@@ -2,7 +2,7 @@
 сохраняет сведения о самовывозе, извлекает цену и реквизиты, отбирает TOP_PRICES максимальных.
 
 Извлечение цены/региона/ИНН со страницы товара делает Claude (по тексту страницы),
-скриншот карточки — Playwright. Реквизиты добиваются через DaData по ИНН.
+скриншот карточки — Playwright. Реквизиты берутся из утверждённого справочника и связанных сведений карточки; без внешнего обогащения.
 """
 from __future__ import annotations
 
@@ -228,7 +228,8 @@ def build_queries(pos: SpecPosition, *, semantic: bool = True) -> list[str]:
     native = native and not any(k in fields for k in ('name','type_mark','model','article','maker'))
     plan = build_article_query_plan(pos.name, clean(cells.get('model')) if native else pos.type_mark,
         article=clean(cells.get('article')) if native else '',
-        manufacturer=clean(cells.get('maker')) if native else '', unit=pos.unit)
+        manufacturer=clean(cells.get('maker')) if native else '', unit=pos.unit,
+        alternative_articles=pos.alternative_articles,alternative_names=pos.alternative_names)
     exact_queries = list(plan.queries)
     if not semantic:
         return exact_queries
@@ -512,6 +513,8 @@ def _single_type_mark_match_status(expected: str, product_identity: str) -> bool
 
 def _type_mark_match_status(expected: str, product_identity: str) -> bool | None:
     """Compare alternative model codes; prefer the most specific exact code."""
+    from .product_identity import current_discovery_mark
+    expected=current_discovery_mark(expected,product_identity)
     variants = _mark_variants(expected)
     if len(variants) == 1:
         return _single_type_mark_match_status(expected, product_identity)
@@ -568,6 +571,8 @@ def _rs24_manufacturer_article(page_text: str) -> str:
 
 def _conflicting_page_article(expected: str, article: str, *, request_role=None) -> bool:
     """A separately printed seller article must equal an unambiguous spec SKU."""
+    from .product_identity import current_discovery_mark
+    expected=current_discovery_mark(expected,article)
     from .product_identity import _active_model_role
     if request_role is None and _active_model_role(expected):return False
     wanted = expected.strip()
@@ -588,6 +593,8 @@ def _model_identity(product_title: str, url: str) -> str:
 
 def _conflicting_numeric_article(expected: str, product_title: str) -> bool:
     """A different printed numeric manufacturer article is not a semantic alias."""
+    from .product_identity import current_discovery_mark
+    expected=current_discovery_mark(expected,product_title)
     article = expected.strip().casefold().replace("к", "k")
     if not re.fullmatch(r"\d{5,8}[a-z]?", article):
         return False
@@ -603,6 +610,8 @@ def _conflicting_numeric_article(expected: str, product_title: str) -> bool:
 
 def _conflicting_full_model_code(expected: str, product_title: str) -> bool:
     """Reject a different full SKU from the same model family printed on the card."""
+    from .product_identity import current_discovery_mark
+    expected=current_discovery_mark(expected,product_title)
     pattern = r"(?<![a-zа-я0-9])([a-zа-я]+\d+(?:[-_][a-zа-я0-9]+(?:[.,][a-zа-я0-9]+)?){2,})(?![a-zа-я0-9])"
     confusables = str.maketrans({"а": "a", "в": "v", "к": "k"})
 
@@ -627,6 +636,8 @@ def _conflicting_full_model_code(expected: str, product_title: str) -> bool:
 
 def _different_full_skus_in_url(expected: str, url: str) -> list[str]:
     """Return conflicting same-family SKUs from the URL, never a price match."""
+    from .product_identity import current_discovery_mark
+    expected=current_discovery_mark(expected,url)
     normalized = _normalise_model_text(expected)
     wanted = re.fullmatch(r"([a-z]+\d+(?:-[a-z0-9]+){3,})", normalized)
     if wanted is None:
@@ -647,6 +658,8 @@ def _conflicting_full_sku_in_url(expected: str, url: str) -> bool:
 
 def _conflicting_model_code_in_title(expected: str, product_title: str) -> bool:
     """A card naming a different model cannot be rescued by a semantic LLM match."""
+    from .product_identity import current_discovery_mark
+    expected=current_discovery_mark(expected,product_title)
     expected_wire = _normalise_model_text(expected)
     printed_wire = _normalise_model_text(product_title)
     # ПУГВнг(А)-LS is a different insulation/fire-performance variant from
@@ -699,6 +712,8 @@ def _conflicting_network_cable_spec(expected_name: str, expected_mark: str,
 def _different_explicit_article(expected: str, product_title: str,
                                 url: str) -> str:
     """Return the competing code printed in both a product title and its URL."""
+    from .product_identity import current_discovery_mark
+    expected=current_discovery_mark(expected,product_title + " " + url)
     from .product_identity import _active_model_interface, _active_request_model_code
     if not expected.strip():
         return ""
@@ -1773,6 +1788,23 @@ def _live_render_profile(browser):
     return 'rendered_owner_v1:'+browser._kac_raw_cohort
 
 def _capture_card(browser,url,requested_url,supplier_host,expected_type_mark,expected_name,expected_unit,expected_qty,required_brand,blocked_hosts,deadline,*,http_consumer=None,render_consumer=None):
+    """Deliver by the fixed method and retain existing request-specific admission.
+
+    A reused rendered document also reaches the independent raw-fact observer
+    before matching. It is not forwarded again to catalogue publication sinks;
+    source dates, method revisions, ownership and native head behavior remain.
+    """
+    from .. import supplier_methods as methods
+    grant=methods.selected(url)
+    native_http_consumer=http_consumer;native_render_consumer=render_consumer
+    if native_http_consumer is not None:
+        def http_consumer(record,source,*,reused=False):
+            methods.current(grant,url)
+            return native_http_consumer(record,source,reused=reused)
+    if native_render_consumer is not None:
+        def render_consumer(data):
+            methods.current(grant,url)
+            return native_render_consumer(data)
     from .session import current_document_cache
     from .card_attachments import capturing_attachment
     cache=current_document_cache()
@@ -1788,17 +1820,26 @@ def _capture_card(browser,url,requested_url,supplier_host,expected_type_mark,exp
     # Rendered pages share only the same actual Browser/session owner; never
     # assume cookie/auth equality between worker contexts or disclose cookies.
     render_profile=_live_render_profile(browser)
+    method_profile=('_method_'+grant['method']+'_revision_'+str(grant['revision']))if grant else ''
+    http_profile+=method_profile
+    render_profile=(render_profile+method_profile)if render_profile else None
     http_key=cache.key(requested_url,supplier_host,route,http_profile);render_key=cache.key(requested_url,supplier_host,route,render_profile) if render_profile else None
     generic=supplier_host not in _REQUEST_BOUND_RENDER_PROFILES
     def evaluate(document,reused=True):
-        bounded_timeout(1);raw=document.facts();diagnostics=_CARD_DIAGNOSTICS.get()
+        """Re-evaluate the original cached source under current method authority without a new wire or re-dating facts."""
+        bounded_timeout(1);methods.current(grant,url);raw=document.facts();diagnostics=_CARD_DIAGNOSTICS.get()
+        if grant and raw['kind']!=('http'if grant['method']=='http'else'rendered'):raise methods.MethodUnavailable('supplier_method_retained_route_refused')
         if reused and diagnostics is not None:diagnostics.append({'url':requested_url,'code':'raw_document_reused','reason':'Исходный документ повторно проверяется для этой позиции; дата получения сохранена','raw_document':{**document.provenance(True),'cache_epoch':cache.epoch}})
-        if raw['kind']=='rendered':return _snapshot_from_raw_rendered(document,requested_url,supplier_host,expected_type_mark,expected_name,expected_unit,expected_qty,required_brand,blocked_hosts,deadline)
+        if raw['kind'] == 'rendered':
+            from .observed_fact_capture import observe_rendered
+            observe_rendered(raw['data'])
+            return _snapshot_from_raw_rendered(document,requested_url,supplier_host,expected_type_mark,expected_name,expected_unit,expected_qty,required_brand,blocked_hosts,deadline)
         record=raw['data']['record'];source=raw['data']['source'];response=httpx.Response(record['status'],headers={'content-type':record['content_type']},content=base64.b64decode(record['body_base64'],validate=True),request=httpx.Request('GET',record['url']))
         response._kac_raw_delivery=(record,source)
         sink=(lambda record,source:http_consumer(record,source,reused=reused)) if http_consumer is not None else None
         return _capture_card_live(*args,neutral_response=response,http_sink=sink,render_sink=render_consumer)
-    hit=cache.peek(http_key) or (cache.peek(render_key) if generic and render_key is not None else None)
+    hit=(cache.peek(render_key)if generic and render_key is not None else None)if grant and grant['method']=='browser'else cache.peek(http_key)
+    if grant is None:hit=hit or(cache.peek(render_key)if generic and render_key is not None else None)
     if hit is not None:return evaluate(hit)
     owner_result=[None];captured=[None];render_captured=[None]
     owner_http=[None];owner_render=[]
@@ -1818,15 +1859,17 @@ def _capture_card(browser,url,requested_url,supplier_host,expected_type_mark,exp
         if not generic or supplier_http_configuration_hash()!=route:return
         live_profile=_live_render_profile(browser)
         if live_profile is None:return
+        live_profile+=method_profile
         raw=RawDocument.create('rendered',requested_url,data['coherent']['document_url'],supplier_host,route,live_profile,data,data['coherent']['observed_at'])
         render_captured[0]=raw
     def capture():
         try:owner_result[0]=_capture_card_live(*args,http_sink=http_sink,render_sink=render_sink if generic or http_consumer is not None else None)
         except NeutralHttpDelivered:pass
         bounded_timeout(1)
-        if render_captured[0] is not None and _live_render_profile(browser)==render_captured[0].facts()['presentation']:cache.publish(render_captured[0])
-        return captured[0]
-    document,reused=cache.capture(http_key,capture)
+        if render_captured[0] is not None and (_live_render_profile(browser)or'')+method_profile==render_captured[0].facts()['presentation']:cache.publish(render_captured[0])
+        return render_captured[0]if grant and grant['method']=='browser'else captured[0]
+    capture_key=render_key if grant and grant['method']=='browser'and render_key is not None else http_key
+    document,reused=cache.capture(capture_key,capture)
     if not reused:
         if http_consumer is not None and owner_http[0] is not None:
             # Owner-local uncacheable deliveries are never handed to followers.
@@ -1837,7 +1880,7 @@ def _capture_card(browser,url,requested_url,supplier_host,expected_type_mark,exp
         if render_consumer is not None:
             for data in owner_render:render_consumer(data)
         return owner_result[0]
-    document=document or (cache.peek(render_key) if generic and render_key is not None else None)
+    document=document or(cache.peek(render_key)if generic and render_key is not None and(not grant or grant['method']=='browser')else None)
     if document is None:
         _reject_card(requested_url,'raw_document_unavailable','Общее получение не предоставило совместимый документ; наличие неизвестно')
         return None
@@ -1851,14 +1894,26 @@ def _capture_card_live(browser,url,requested_url,supplier_host,expected_type_mar
     from .product_identity import http_identity
     from .session import research_deadline,retry_after_seconds,http_capability_advice,finish_http_capability,failed_primary_http
     from ..browser import supplier_http_configuration_hash
+    from .. import supplier_methods as methods
+    grant=methods.selected(url)
     capability=None
     failed_http=False
+    observed=None
+    frame=None
+    response=None
     route_hash=supplier_http_configuration_hash()
     def capability_finish(outcome):
         bounded_timeout(1)
         return finish_http_capability(capability,outcome if supplier_http_configuration_hash()==route_hash else 'unknown')
     def render(attempt=None):
         bounded_timeout(1)  # Parent/card allocation and cancellation remain authoritative.
+        if grant is not None and grant['method']=='http':
+            # HTTP primary shell/protection is a method representation failure;
+            # an observed product lacking price/unit remains a financial refusal.
+            if response is None or response.status_code==200 and observed is None and frame is None:
+                methods.failure(grant,'representation')
+                raise methods.MethodUnavailable('supplier_method_requires_configuration')
+            return None
         if attempt is not None:attempt['fallback_performed']=True
         try:
             from contextlib import nullcontext
@@ -1878,7 +1933,8 @@ def _capture_card_live(browser,url,requested_url,supplier_host,expected_type_mar
     from contextlib import nullcontext
     with deadline_scope(deadline),supplier_transport(url) if neutral_response is None else nullcontext():
         bounded_timeout(1)
-        capability=http_capability_advice(supplier_host,route_hash) if neutral_response is None else None
+        if grant is not None and grant['method']=='browser':return render()
+        capability=http_capability_advice(supplier_host,route_hash) if neutral_response is None and grant is None else None
         if capability is not None and not capability[2]['allowed']:
             advice=capability[2];failed_http=True
             diagnostics=_CARD_DIAGNOSTICS.get()
@@ -1927,6 +1983,9 @@ def _capture_card_live(browser,url,requested_url,supplier_host,expected_type_mar
             if observed is None:
                 try:frame=main_product(text,str(response.url),admission_only=True)
                 except ValueError:frame=None
+                if grant is not None and frame is None and _looks_like_bot_check(text,title):
+                    methods.failure(grant,'protection',response.status_code)
+                    raise methods.MethodUnavailable('supplier_method_requires_configuration')
                 if frame and (_conflicting_model_code_in_title(expected_type_mark,frame['title']) or bool(re.search(r'(?:Артикул производителя|Код производителя|Manufacturer code|MPN)\s*[:：]?\s*'+re.escape(frame['article'])+r'(?![\w.-])',frame['text'],re.I)) and _conflicting_page_article(expected_type_mark,frame['article'])):
                     _reject_card(url,'article_mismatch','Основной товар HTTP-карточки имеет другое обозначение');transport_observed(Outcome.SUCCESS);return None
                 if frame and _admit_card_text(url,frame['text'],frame['title'],expected_type_mark,expected_unit,expected_qty,required_brand,blocked_hosts,supplier_host) is None:
@@ -1934,6 +1993,9 @@ def _capture_card_live(browser,url,requested_url,supplier_host,expected_type_mar
                     return None
             if observed and _conflicting_model_code_in_title(expected_type_mark,observed['title']):
                 _reject_card(url,'article_mismatch','Наблюдаемый основной товар HTTP-карточки имеет другое обозначение');transport_observed(Outcome.SUCCESS);return None
+            if grant is not None and observed and _looks_like_bot_check(observed['text'],observed['title']):
+                methods.failure(grant,'protection',response.status_code)
+                raise methods.MethodUnavailable('supplier_method_requires_configuration')
             if observed and not _looks_like_bot_check(observed['text'],observed['title']):
                 admission=_admit_card_text(url,observed['text'],observed['title'],expected_type_mark,expected_unit,expected_qty,required_brand,blocked_hosts,supplier_host)
                 if admission is None:
@@ -2428,12 +2490,26 @@ def _coherent_identity(page,requested_url,expected_type_mark,expected_name,suppl
         if not valid_identity(evidence,expected_type_mark,expected_name,supplier_host):return {}
     return {**evidence,'observed_at':coherent['observed_at']} if evidence else {}
 
-def _capture_rendered_card(browser,url,requested_url,supplier_host,expected_type_mark,expected_name,expected_unit,expected_qty,required_brand,blocked_hosts,deadline,*,neutral_sink=None):
+def _capture_rendered_card(browser,url,requested_url,supplier_host,expected_type_mark,expected_name,expected_unit,expected_qty,required_brand,blocked_hosts,deadline,*,neutral_sink=None,primary_position=None):
+    """Capture the existing bounded browser frame and retain native financial admission.
+
+    Independent same-document/owner/method-verified saved facts are observed
+    before requested-SKU URL rejection. They never enter the financial neutral
+    sink at that early point, and cannot repair a refused identity or price.
+    """
+    from .. import supplier_methods as methods
+    method_grant=methods.selected(url)
     from .card_batch import CardSnapshot
     from .session import research_deadline
     from ..browser_transport_trace import trace_diagnostics
     neutral_photo=None
     with deadline_scope(deadline), trace_diagnostics(_CARD_DIAGNOSTICS.get()), browser.page(url) as page:
+        if primary_position is not None:
+            from .card_attachments import _http_primary_preflight
+            response=getattr(page,'_kac_selected_http_response',None)
+            if response is None:raise ValueError('selected_http_preflight_source_missing')
+            rejected,_=_http_primary_preflight(primary_position,url,response=response)
+            if rejected:return None
         _render_observation(page,requested_url,'before_product_wait')
         coherent,coherent_ref=_wait_main_card_facts(page,requested_url)
         if coherent['kind']=='navigation_changed':
@@ -2443,6 +2519,12 @@ def _capture_rendered_card(browser,url,requested_url,supplier_host,expected_type
         text=coherent['owner_text'] if coherent['owner_bound'] else coherent['body']
         title=coherent['document_title'] or coherent['main_title']
         if _http_response_is_blocked(response_status, text):
+            from .. import supplier_methods as methods
+            method_check=methods.selected(url)
+            methods.response(method_check,response_status,text)
+            if method_check is not None and _looks_like_bot_check(text,title):
+                methods.failure(method_check,'protection',response_status)
+                raise methods.MethodUnavailable('supplier_method_requires_configuration')
             transport_observed(Outcome.BOT_PROTECTION if _looks_like_bot_check(text,title)
                 else http_outcome(response_status), retry_after=getattr(page,'_kac_retry_after',None))
             _reject_card(url, "http_blocked", _protection_reason(text, title, response_status),
@@ -2452,9 +2534,17 @@ def _capture_rendered_card(browser,url,requested_url,supplier_host,expected_type
             blocked_hosts.add(supplier_host)
             return None
         if not text.strip():
+            from .. import supplier_methods as methods
+            method_check=methods.selected(url)
+            methods.failure(method_check,'representation',response_status)
+            if method_check is not None:raise methods.MethodUnavailable('supplier_method_requires_configuration')
             _reject_card(url,'empty_page','Карточка не предоставила видимый текст в выделенное время; наличие товара не установлено')
             return None
         if _looks_like_bot_check(text, title):
+            from .. import supplier_methods as methods
+            method_check=methods.selected(url)
+            methods.failure(method_check,'protection',response_status)
+            if method_check is not None:raise methods.MethodUnavailable('supplier_method_requires_configuration')
             _reject_card(url, "captcha", _protection_reason(text, title, response_status))
             blocked_hosts.add(supplier_host)
             return None
@@ -2468,6 +2558,22 @@ def _capture_rendered_card(browser,url,requested_url,supplier_host,expected_type
         if not current_url or urlparse(str(getattr(page,'url',''))).scheme not in {'http','https'}:
             _reject_card(requested_url,'redirect_unconfirmed','страница не является HTTP-карточкой поставщика')
             return None
+        # Keep raw facts from an independently owned saved frame even when
+        # the requested SKU below refuses this product. Navigation, supplier,
+        # authentication/listing boundaries and current method still apply.
+        from .observed_fact_capture import fact_capture_active, observe_rendered
+        if (fact_capture_active() and actual_url and card_host(actual_url) == card_host(url)
+                and not _is_listing_url(actual_url)
+                and not re.search(r'/(?:login|signin|auth|captcha|challenge|search)(?:[/?.]|$)', actual_url, re.I)
+                and coherent.get('owner_bound') is True
+                and coherent.get('owner_truncated') is False
+                and canonical_card_url(coherent.get('document_url', '')) == actual_url):
+            before_match, _ = _render_observation(page, requested_url, 'facts_before_requested_match')
+            if before_match.get('observation_status') == 'navigation_changed':
+                _reject_card(requested_url, 'redirect_unconfirmed', 'Документ изменился до сохранения независимых фактов')
+                return None
+            methods.current(method_grant, url)
+            observe_rendered({'coherent': coherent})
         if actual_url:
             if (card_host(actual_url) != card_host(url) or _is_listing_url(actual_url)
                     or _type_mark_match_status(expected_type_mark, actual_url) is False
@@ -2536,7 +2642,9 @@ def _capture_rendered_card(browser,url,requested_url,supplier_host,expected_type
                     else:
                         neutral_photo=(shot,evidence,reason)
                         record.update(screenshot_context=str(shot) if evidence else '',context_capture_evidence=evidence,context_capture_review_reason=reason)
-                if record is not None:neutral_sink(record)
+                if record is not None:
+                    methods.current(method_grant,url)
+                    neutral_sink(record)
         if coherent['kind']=='explicit_price_on_request':
             transport_observed(Outcome.SUCCESS)
             _reject_card(url,'price_on_request','На основной карточке цена предоставляется по запросу; числовая котировка не подтверждена')
@@ -2685,9 +2793,15 @@ def _literal_card_fields(snapshot, *, financial_outcome=None):
     return fields
 
 def _deterministic_card_data(snapshot, *, financial_outcome=None):
-    facts=snapshot.facts()
+    from .owned_purchase_row import validate_snapshot
+    facts=validate_snapshot(snapshot)
     from .owned_purchase_row import from_facts
     row=from_facts(facts)
+    if row and row.get('version')==2:
+        from .owned_purchase_row import decision
+        selected,reason=decision(row,dict(unit=facts['expected_unit']))
+        data=dict(product_title=facts['main_title'],matches_requested_product=bool(facts['identity_evidence']),match_reason='Текущая экономическая цена подтверждена покупным DOM',listed_price_with_vat=row['raw_amount'],price_unit=row['sale_unit'],price_with_vat=selected['price']if selected else None,package_quantity=selected['quantity']if selected else None,purchase_row_v2=row)
+        return data
     if row:
         data=dict(product_title=facts['main_title'],matches_requested_product=bool(facts['identity_evidence']),
                   match_reason='Текущая строка покупки с явной денежной суммой и единицей',
@@ -2735,7 +2849,8 @@ def _finish_captured_card(browser,snapshot,data,*,enrich_seller=True):
     from ..source_quote import observe_captured_quote
     from .product_identity import main_card_article
     from .session import observed_identity
-    facts=snapshot.facts()
+    from .owned_purchase_row import validate_snapshot
+    facts=validate_snapshot(snapshot)
     url=facts['url'];requested_url=facts['requested_url'];supplier_host=facts['supplier_host']
     expected_type_mark=facts['expected_type_mark'];expected_name=facts['expected_name'];expected_unit=facts['expected_unit']
     text=facts['text'];title=facts['title'];main_title=facts['main_title'];page_article=facts['page_article']
@@ -2745,7 +2860,7 @@ def _finish_captured_card(browser,snapshot,data,*,enrich_seller=True):
     if native_reason:
         _reject_card(url,'native_spec_unconfirmed',native_reason)
         return None
-    comparison_type_mark=native_comparison_mark(mark=expected_type_mark,name=expected_name)
+    comparison_type_mark=native_comparison_mark(mark=expected_type_mark,name=expected_name,article=identity_evidence.get("main_article") or page_article)
     queue=current_queue()
     product_title = str(data.get("product_title", ""))
     if _conflicting_model_code_in_title(comparison_type_mark, product_title):
@@ -2837,6 +2952,13 @@ def _finish_captured_card(browser,snapshot,data,*,enrich_seller=True):
         unit_price = _price_per_requested_unit(
             data, expected_unit, product_title
         )
+    from .owned_purchase_row import from_facts,decision
+    current_row=from_facts(facts)
+    if current_row and current_row.get('version')==2:
+        if data.get('listed_price_with_vat')!=current_row['raw_amount'] or _sale_unit(data.get('price_unit'))!=_sale_unit(current_row['sale_unit']):return None
+        selected,reason=decision(current_row,dict(unit=expected_unit))
+        unit_price=selected['price']if selected else None
+        verified_listed_price=current_row['raw_amount']
     unit_review_reason = ""
     if unit_price is None:
         # Explicit printed sale denominator can distinguish a unit
@@ -2875,8 +2997,8 @@ def _finish_captured_card(browser,snapshot,data,*,enrich_seller=True):
     # регион НЕ фильтруем жёстко: страница часто не пишет про самовывоз явно.
     regional = extracted_region(data)
     in_region = regional["in_moscow_region"]
-    # Cached seller hints are cheap; remote enrichment must wait
-    # for current price, unit, capture and late identity authority.
+    # Maintained directory and source-bound merchant evidence only.
+    # Per-card scanning never performs remote requisites enrichment.
     req = wl_requisites_for(url) or Requisites()
     if (not req.name.strip() or not valid_inn(req.inn)) and facts.get('merchant_requisites'):
         req=Requisites.model_validate(facts['merchant_requisites'])
@@ -2938,49 +3060,16 @@ def _finish_captured_card(browser,snapshot,data,*,enrich_seller=True):
         screenshot_product=str(shot) if context_evidence else None,
         screenshot_context=early_candidate.screenshot_context,context_capture_evidence=context_evidence,context_capture_review_reason=context_reason,
     )
-    position = {'unit': expected_unit, 'type_mark': expected_type_mark,
-                'name': expected_name}
-    prerequisites = (not expected_type_mark or bool(late_identity)) and \
-        offer_is_comparable(candidate, position, require_seller=False)
-    if prerequisites:
-        seller_reason = ""
-        try:
-            if enrich_seller and (not req.name.strip() or not valid_inn(req.inn)):
-                inn = re.sub(r"\D", "", str(data.get("seller_inn") or ""))
-                remote_req = fetch_requisites(inn) if valid_inn(inn) else None
-                if (remote_req is None or not remote_req.name.strip()
-                        or not valid_inn(remote_req.inn)):
-                    try:remote_req = fetch_requisites_from_site(browser, url, capture_context=dict(product_url=url,captured_at=facts['captured_at']))
-                    finally:browser._kac_raw_cohort=__import__('uuid').uuid4().hex
-                if remote_req is not None:
-                    req = remote_req
-        except ResearchControlError as error:
-            # A seller-stage deadline/global failure cannot erase
-            # the current card observation or become a green quote.
-            candidate.price_capture_review_reason = (
-                f"Реквизиты продавца не подтверждены: {type(error).__name__}")
-            _reject_card(url, "seller_unconfirmed", candidate.price_capture_review_reason)
-            from .session import observed_quote
-            observed_quote(candidate)
-            if queue is not None:
-                queue.mark(queue.active_url, 'pending')
-            raise
-        except Exception as error:
-            seller_reason = f"Реквизиты продавца не подтверждены: {type(error).__name__}"
-        if not req.name.strip() or not valid_inn(req.inn):
-            seller_reason = seller_reason or "Реквизиты продавца не подтверждены"
-        if seller_reason:
-            _reject_card(url, "seller_unconfirmed", seller_reason)
-            # Anonymous-host seller fallback must never admit this
-            # reviewed candidate. Keep the current proof and pixels.
-            candidate.price_capture_review_reason = seller_reason
-        candidate.requisites = req
+    # enrich_seller remains a compatible keyword; neither value grants remote I/O.
     seller_evidence = captured_seller_evidence(facts, req.seller_source)
     candidate.seller_evidence = seller_evidence
     candidate.requisites = seller_evidence_requisites(seller_evidence, req)
     seller_reason = seller_evidence_reason(seller_evidence)
     if seller_reason:
+        if seller_evidence['decision']['status'] == 'unknown':
+            seller_reason += '; Заполните справочник Поставщики.md: наименование продавца, ИНН и сайт'
         candidate.price_capture_review_reason = seller_reason
+        _reject_card(url, "seller_unconfirmed", seller_reason)
     if str(data.get("city") or "").strip():
         candidate.requisites.city = str(data["city"])
     return candidate
@@ -3288,7 +3377,10 @@ def _factory_request_entry(function):
         with request_scope(pos):return function(browser,pos,*args,**kwargs)
     return scoped
 
+from .product_identity import position_alternatives
+
 @_factory_request_entry
+@position_alternatives
 def research_position(browser, pos: SpecPosition, year: str, quarter: str,
                       existing_offers: list[PriceOffer] | None = None) -> PositionResult:
     """Полный цикл по одной позиции: поиск → отбор TOP максимальных по возрастанию.

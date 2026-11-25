@@ -214,6 +214,10 @@ class ResearchStore:
                 or not isinstance(policy["usage"], dict)
                 or not all(isinstance(k, str) and isinstance(v, list) and all(isinstance(s, str) and len(s) <= 128 for s in v) for k, v in policy["usage"].items())):
             raise Invalid("Invalid explicit telemetry allowlist")
+        from .models import normalize_alternatives
+        for position in positions:
+            for name in ('alternative_articles','alternative_names'):
+                if name in position and normalize_alternatives(position[name],article=name=='alternative_articles')!=position[name]:raise Invalid('Noncanonical alternative policy')
         return _plain({"positions": positions, "configured_hosts": hosts, "primary_hosts": primary,
                        "fallback_hosts": [h for h in hosts if h not in primary], "flags": flags, "policy": policy})
 

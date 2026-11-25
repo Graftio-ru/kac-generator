@@ -6,11 +6,26 @@ identity, price-role, unit/quantity, seller and region rules to current observat
 from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass, asdict
+from enum import Enum
 import hashlib,json,math,re,sqlite3,time,uuid
 from pathlib import Path
 from urllib.parse import urlsplit,urlunsplit
 
 VERSION=1
+class _PrimarySourceAbsent(Enum):
+ VALUE='absent'
+
+def validate_primary_source(value):
+ if type(value)is dict and value.get('role')=='http_primary_dom':
+  if set(value)!={'role','ref','record_sha256','body_sha256','observed_at'}or not re.fullmatch(r'http_cards/[a-f0-9]{32}\.json',value.get('ref','')):raise ValueError('Invalid HTTP primary source')
+  _digest(value['record_sha256']);_digest(value['body_sha256']);_stamp(value['observed_at']);return value
+ if type(value)is not dict or set(value)!={'role','ref','record_sha256','body_sha256','main_facts'} or value.get('role')!='rendered_primary_dom':raise ValueError('Invalid primary source')
+ if type(value['ref'])is not str or not re.fullmatch(r'rendered_cards/[a-f0-9]{32}\.json',value['ref']):raise ValueError('Invalid primary source path')
+ _digest(value['record_sha256']);_digest(value['body_sha256'])
+ frame=value['main_facts']
+ if type(frame)is not dict or set(frame)!={'ref','sha256','observed_at'} or type(frame['ref'])is not str or not re.fullmatch(r'main_facts/[a-f0-9]{32}\.json',frame['ref']):raise ValueError('Invalid primary frame')
+ _digest(frame['sha256']);_stamp(frame['observed_at'])
+ return value
 class CatalogueStoreError(RuntimeError):pass
 class CatalogueConflict(CatalogueStoreError):pass
 
@@ -172,7 +187,16 @@ def validate_native_request_contract(value,identity,issuer):
  """Typed immutable producer intent; never infer roles from title/URL on refresh."""
  if value is None:return None
  fields={'version','identity_sha256','issuer','reader','model','article','mark','name','requested'}
- if type(value) is not dict or set(value)!=fields or value['version']!='native-source-constraints-v1' or value['reader']!='native_pdf':raise ValueError('Invalid native source contract')
+ extended={'alternative_articles','alternative_names','alternatives_policy_sha256'}
+ if type(value)is not dict:raise ValueError('Invalid native source contract')
+ version=value.get('version')
+ if set(value)!=(fields|extended if version=='native-source-constraints-v2'else fields)or version not in {'native-source-constraints-v1','native-source-constraints-v2'}or value['reader']!='native_pdf':raise ValueError('Invalid native source contract')
+ if version=='native-source-constraints-v2':
+  from ..models import normalize_alternatives
+  articles=normalize_alternatives(value['alternative_articles'],article=True);names=normalize_alternatives(value['alternative_names'])
+  if articles!=value['alternative_articles']or names!=value['alternative_names']:raise ValueError('Noncanonical alternatives')
+  from .product_identity import policy_digest
+  if value['alternatives_policy_sha256']!=policy_digest(identity,articles,names):raise ValueError('Invalid alternative policy binding')
  if value['identity_sha256']!=identity.key or value['issuer']!=issuer or issuer not in {'supplier_http','supplier_rendered'}:raise ValueError('Foreign native source contract')
  for key in ('model','article'):_text(value[key],512,empty=True)
  for key in ('mark','name','requested'):_text(value[key],2048)
@@ -182,7 +206,7 @@ def validate_native_request_contract(value,identity,issuer):
  if identity.kind=='article':
   if clean(value['article'])!=identity.code:raise ValueError('Wrong native article contract')
  elif clean(value['model'])!=identity.code or value['article']:raise ValueError('Wrong native model contract')
- if len(_json(value))>8192:raise ValueError('Oversize native source contract')
+ if len(_json(value))>(32768 if version=='native-source-constraints-v2'else 8192):raise ValueError('Oversize native source contract')
  return json.loads(_json(value))
 
 @dataclass(frozen=True)
@@ -220,7 +244,8 @@ class SourceObservation:
  seller_evidence:dict|None=None
  unit_equivalence:dict|None=None
  purchase_row:dict|None=None
- def payload(self):
+ primary_source:object=_PrimarySourceAbsent.VALUE
+ def _validate_integrity(self):
   if not re.fullmatch('[0-9a-f]{32}',_text(self.observation_id,32)):raise ValueError('Invalid observation id')
   self.identity.payload();host=_host(self.supplier_host);requested=_url(self.requested_url);actual=_url(self.url)
   if any(not (urlsplit(u).hostname.removeprefix('www.')==host or urlsplit(u).hostname.endswith('.'+host)) for u in (requested,actual)):raise ValueError('Foreign source owner')
@@ -240,6 +265,9 @@ class SourceObservation:
   if self.availability not in {'in_stock','out_of_stock','on_order','unknown'} or self.state not in {'observed','review','identity_conflict','unpriced'}:raise ValueError('Invalid observation state')
   if self.region_status not in {'','unknown','confirmed','incompatible'} or type(self.region_evidence) is not str or len(self.region_evidence)>8192 or self.in_moscow_region is not None and type(self.in_moscow_region) is not bool:raise ValueError('Invalid regional source facts')
   self.image.validate(self)
+  return requested,actual
+ def payload(self):
+  requested,actual=self._validate_integrity()
   from .purchase_preview import PREVIEW_REASONS
   if self.unit_basis_reason not in ('',*PREVIEW_REASONS) or self.unit_basis is not None and self.unit_basis_reason:raise ValueError('Invalid product preview reason')
   if self.unit_basis is not None:
@@ -263,6 +291,8 @@ class SourceObservation:
     accepted=[s for s in self.seller_evidence['sources'] if s['id'] in decision['resolved_source_ids']]
     if not any(s['raw_name']==self.seller_name and s['raw_inn']==self.seller_inn for s in accepted):raise ValueError('Seller fields differ from source evidence')
   result=asdict(self);result['identity']=self.identity.payload();result['requested_url']=requested;result['url']=actual
+  if self.primary_source is _PrimarySourceAbsent.VALUE:result.pop('primary_source',None)
+  else:validate_primary_source(self.primary_source)
   if self.seller_evidence is None:result.pop('seller_evidence',None)
   if self.unit_equivalence is None:result.pop('unit_equivalence',None)
   if self.purchase_row is None:result.pop('purchase_row',None)
@@ -309,6 +339,12 @@ class CatalogueStore:
   except sqlite3.Error as error:raise CatalogueStoreError('Catalogue store unavailable or corrupt') from error
  @contextmanager
  def _connection(self,write=False):
+  from .document_context import active_document_operation
+  operation=active_document_operation()
+  if operation is not None and getattr(operation,'store',None)is self and operation._transaction is not None:
+   import threading
+   if operation._transaction_thread is not threading.current_thread():raise CatalogueConflict('document_foreign_transaction')
+   yield operation._transaction;return
   db=None
   try:
    db=sqlite3.connect(self.path,timeout=15,isolation_level=None);db.row_factory=sqlite3.Row
@@ -611,6 +647,25 @@ class CatalogueStore:
     if current!=frozen:raise CatalogueConflict('final_source_heads_changed')
     owners[product['product_id']]=row['owner']
   return owners
+ def validate_document_snapshot(self,snapshot,identities,operation):
+  """Private approved-clone authority; never promote acquisition lifecycle."""
+  from .document_context import DocumentOperation,_ISSUER
+  if type(operation)is not DocumentOperation or operation._issuer is not _ISSUER or operation.store is not self:
+   raise CatalogueConflict('document_private_authority_required')
+  with self._connection()as db:
+   if snapshot.get('revision')!=db.execute('SELECT revision FROM meta WHERE id=1').fetchone()[0]:raise CatalogueConflict('document_revision_changed')
+   for identity in identities:
+    product=snapshot.get('products',{}).get(identity.key)
+    if not product or product.get('identity_ambiguous'):raise CatalogueConflict('document_identity_invalid')
+    candidates=self._identity_candidates(db,identity)
+    if len(candidates)!=1 or candidates[0]['id']!=product['product_id']:raise CatalogueConflict('document_identity_changed')
+    operation.validates(self,product)
+    row=db.execute('SELECT * FROM acquisitions WHERE product_id=?',(product['product_id'],)).fetchone()
+    if not row or row['owner']!=product['acquisition_owner'] or {k:row[k]for k in ('status','error','generation','lease_until')}!=product['acquisition']:
+     raise CatalogueConflict('document_owner_changed')
+    current={(r['host'],r['url']):r['current_id']for r in db.execute('SELECT host,url,current_id FROM heads WHERE product_id=?',(product['product_id'],))}
+    if current!={(r['host'],r['url']):r['current']['observation_id']for r in product['heads']}:raise CatalogueConflict('document_heads_changed')
+  return True
  def add_alias(self,alias,target,*,observed_identity,source_url,observed_at,source_title):
   """Explicit source-backed title alias; code, maker and feature contradictions forbidden."""
   a=alias.payload();t=target.payload();o=observed_identity.payload();_url(source_url);_stamp(observed_at);_text(source_title,2048)
@@ -623,6 +678,13 @@ class CatalogueStore:
    if old and old[0]!=target.key:raise CatalogueConflict('Ambiguous alias')
    db.execute('INSERT OR REPLACE INTO aliases VALUES(?,?,?)',(alias.key,target.key,_json(dict(identity=a,observed_identity=o,source_url=source_url,observed_at=observed_at,source_title=source_title))));self._revision(db)
  def append_observation(self,product_id,observation,*,acquisition=None,coverage_status=None):
+  """Append an immutable owned observation after native identity/financial-source checks.
+
+  Explicit known-card captures additionally require a durable same-operation
+  input link; ordinary/document publication keeps its existing contract.
+  """
+  from .known_capture_intent import require_owned_observation_link
+  require_owned_observation_link(self,product_id,observation.observation_id)
   payload=observation.payload()
   if observation.identity.key!=product_id:raise ValueError('Observation identity mismatch')
   encoded=_json(payload)
@@ -672,6 +734,70 @@ class CatalogueStore:
     if url not in {source['url'],source['requested_url']}:raise ValueError('Refresh source URL not related to attempt')
     source_url=source['url']
    revision=self._revision(db);db.execute('INSERT INTO attempts(product_id,host,url,attempted_at,payload,revision) VALUES(?,?,?,?,?,?)',(product_id,host,url,attempted_at,_json(dict(outcome=outcome,reason=reason,observation_id=observation_id,source_url=source_url)),revision))
+ def card_operation(self,product_id,host,url,*,operation_id,acquisition=None,evidence=None,resolve=False,new_intent=None):
+  """Append-only admission journal in existing attempts; unknown delivery never retries."""
+  _host(host);url=_url(url);_digest(product_id)
+  if type(operation_id) is not str or not re.fullmatch('[0-9a-f]{32}',operation_id):raise ValueError('Invalid card operation')
+  if type(resolve) is not bool:raise ValueError('Invalid card operation transition')
+  evidence=evidence or {}
+  if type(evidence) is not dict or len(_json(evidence).encode())>8192:raise ValueError('Invalid card operation evidence')
+  with self._connection(True) as db:
+   self._known(db,product_id)
+   if acquisition is not None and not self._admitted(db,acquisition,product_id):raise CatalogueConflict('Acquisition ownership lost before card admission')
+   if not db.execute('SELECT 1 FROM coverage WHERE product_id=? AND host=?',(product_id,host)).fetchone() or not (urlsplit(url).hostname.removeprefix('www.')==host or urlsplit(url).hostname.endswith('.'+host)):raise ValueError('Foreign card operation')
+   states={}
+   for row in db.execute('SELECT payload FROM attempts WHERE product_id=? AND host=? AND url=? ORDER BY id',(product_id,host,url)):
+    item=self._decode(row['payload']).get('card_operation')
+    if item is not None:
+     if type(item) is not dict or item.get('version')!=1 or item.get('state') not in {'pending','resolved'} or not re.fullmatch('[0-9a-f]{32}',str(item.get('operation_id',''))):raise CatalogueStoreError('Invalid native card operation journal')
+     states[item['operation_id']]=item
+   pending=[v for v in states.values() if v['state']=='pending']
+   if new_intent is not None:
+    if db.execute('SELECT 1 FROM observations WHERE id=?',(operation_id,)).fetchone():raise CatalogueConflict('Explicit capture operation already exists')
+    for existing in db.execute('SELECT payload FROM attempts'):
+     prior=self._decode(existing['payload']).get('card_operation')
+     if prior and prior.get('operation_id')==operation_id:raise CatalogueConflict('Explicit capture operation already exists')
+    if resolve:raise CatalogueConflict('Explicit capture intent cannot resolve history')
+    from .document_context import _authorize_new_capture
+    evidence=dict(evidence,explicit_new_intent=_authorize_new_capture(new_intent,self,product_id,host,url,operation_id,pending))
+   elif not resolve and pending:return dict(allowed=False,pending=pending)
+   if resolve:
+    if operation_id not in states or states[operation_id]['state']!='pending':return dict(allowed=True,pending=pending)
+    if evidence.get('basis')=='observation':
+     row=db.execute('SELECT * FROM observations WHERE id=? AND product_id=? AND host=?',(operation_id,product_id,host)).fetchone()
+     if row is None:raise CatalogueConflict('Card resolution observation missing')
+     observation=self._observation(row)
+     if url not in {observation['requested_url'],observation['url']}:raise CatalogueConflict('Card resolution observation differs')
+    elif evidence.get('basis')=='proven_presend':
+     from .catalogue import definitely_presend
+     if not definitely_presend(evidence.get('events',[])):raise ValueError('Card pre-send resolution unproven')
+    else:raise ValueError('Card outcome is still uncertain')
+   value=dict(version=1,operation_id=operation_id,state='resolved' if resolve else 'pending',evidence=evidence)
+   revision=self._revision(db);stamp=time.time()
+   payload=dict(outcome='unknown',reason='Native card operation '+value['state'],observation_id=None,source_url=None,card_operation=value)
+   db.execute('INSERT INTO attempts(product_id,host,url,attempted_at,payload,revision) VALUES(?,?,?,?,?,?)',(product_id,host,url,stamp,_json(payload),revision))
+   return dict(allowed=True,pending=[])
+ def record_card_capture(self,product_id,host,url,*,operation_id,reference,capability):
+  """Append a durable same-operation input reference, never resolve old uncertainty.
+
+  Exact private issuer/reference and ownership are rechecked under the write
+  transaction; forged, duplicate or stale links raise before publication.
+  """
+  from .document_context import _validate_capture_link
+  _validate_capture_link(capability,self,product_id,host,url,operation_id,reference)
+  with self._connection(True)as db:
+   _validate_capture_link(capability,self,product_id,host,url,operation_id,reference,connection=db)
+   states={}
+   for row in db.execute('SELECT payload FROM attempts WHERE product_id=? AND host=? AND url=? ORDER BY id',(product_id,host,url)):
+    item=self._decode(row['payload']).get('card_operation')
+    if item:states[item['operation_id']]=item
+   current=states.get(operation_id)
+   if current is None or current['state']!='pending' or current['evidence'].get('captured_input'):raise CatalogueConflict('Capture input transition unavailable')
+   evidence=dict(current['evidence'],captured_input=reference)
+   value=dict(version=1,operation_id=operation_id,state='pending',evidence=evidence)
+   payload=dict(outcome='unknown',reason='Native capture input retained; financial outcome pending',observation_id=None,source_url=None,card_operation=value)
+   revision=self._revision(db)
+   db.execute('INSERT INTO attempts(product_id,host,url,attempted_at,payload,revision) VALUES(?,?,?,?,?,?)',(product_id,host,url,time.time(),_json(payload),revision))
  def publish_coverage(self,product_id,host,*,status,observed_at=None,reason='',product_presence='unknown',observation_id=None,diagnostics=None,acquisition=None,deferred_check=None):
   if deferred_check is not None:deferred_check=safe_deferred_check(deferred_check,host)
   _host(host);_text(reason,2048,empty=True)
@@ -709,12 +835,19 @@ class CatalogueStore:
   except (KeyError,TypeError,ValueError,AttributeError) as error:raise CatalogueStoreError('Invalid catalogue identity') from error
  def _observation(self,row):
   try:
-   payload=self._decode(row['payload']);identity=payload['identity'];identity={**identity,'features':tuple(tuple(v) for v in identity['features'])}
-   observed=SourceObservation(**{**payload,'identity':ProductIdentity(**identity),'image':ImageEvidence(**payload['image'])})
-   canonical=observed.payload()
-   if observed.observation_id!=row['id'] or observed.identity.key!=row['product_id'] or observed.supplier_host!=row['host'] or canonical['url']!=row['url'] or observed.observed_at!=row['observed_at']:raise ValueError('Stored source binding mismatch')
+   from .catalogue_observation_storage import decode_stored_observation
+   canonical=decode_stored_observation(self._decode(row['payload']))
+   identity=canonical['identity'];identity=ProductIdentity(**{**identity,'features':tuple(tuple(v)for v in identity['features'])})
+   canonical['identity']=identity.payload() # Existing typed view; identical stored JSON values.
+   if canonical['observation_id']!=row['id'] or identity.key!=row['product_id'] or canonical['supplier_host']!=row['host'] or canonical['url']!=row['url'] or canonical['observed_at']!=row['observed_at']:raise ValueError('Stored source binding mismatch')
    return canonical
   except (KeyError,TypeError,ValueError,AttributeError) as error:raise CatalogueStoreError('Invalid catalogue observation') from error
+ def _stored_attempt(self,row):
+  from .catalogue_observation_storage import validate_stored_attempt
+  try:
+   payload=self._decode(row['payload']);validate_stored_attempt(payload,row)
+   return {**dict(host=row['host'],url=row['url'],attempted_at=row['attempted_at'],**payload),'catalogue_attempt_id':row['id'],'catalogue_attempt_revision':row['revision']}
+  except (KeyError,TypeError,ValueError,AttributeError)as error:raise CatalogueStoreError('Invalid catalogue attempt journal')from error
  def resolve_observation(self,product_id,observation_id):
   """Resolve trusted stored facts, not a client-supplied payload, in one revision."""
   with self._connection() as db:
@@ -784,11 +917,12 @@ class CatalogueStore:
       chunk=ids[offset:offset+400];marks=','.join('?' for _ in chunk)
       observations.update({r['id']:self._observation(r) for r in db.execute(f'SELECT * FROM observations WHERE product_id=? AND id IN ({marks})',(product_id,*chunk))})
     if any(r['current_id'] not in observations or r['last_good_id'] and r['last_good_id'] not in observations for r in head_rows):raise CatalogueStoreError('Broken catalogue head')
+    if any(observations[r[k]]['supplier_host']!=r['host'] or observations[r[k]]['url']!=r['url'] for r in head_rows for k in ('current_id','last_good_id')if r[k]):raise CatalogueStoreError('Catalogue head source binding changed')
     heads=[dict(host=r['host'],url=r['url'],current=observations[r['current_id']],last_good=observations.get(r['last_good_id'])) for r in head_rows]
     allocation=db.execute('SELECT * FROM acquisitions WHERE product_id=?',(product_id,)).fetchone()
     acquisition={k:allocation[k] for k in ('status','error','generation','lease_until')} if allocation else None
     completion=self._completion(db,product_id,allocation)
-    result[key]=dict(product_id=product_id,identity=self._identity(product['identity'],product_id),created_at=product['created_at'],known=True,revision=revision,heads=heads,history=list(observations.values()) if include_history else [],history_included=include_history,coverage={r['host']:self._coverage(r) for r in db.execute('SELECT * FROM coverage WHERE product_id=?',(product_id,))},refresh_attempts=[dict(host=r['host'],url=r['url'],attempted_at=r['attempted_at'],**self._decode(r['payload'])) for r in db.execute('SELECT * FROM attempts WHERE product_id=? ORDER BY attempted_at,id',(product_id,))],acquisition=dict(acquisition) if acquisition else None,acquisition_owner=allocation['owner'] if allocation else None,acquisition_completion=completion)
+    result[key]=dict(product_id=product_id,identity=self._identity(product['identity'],product_id),created_at=product['created_at'],known=True,revision=revision,heads=heads,history=list(observations.values()) if include_history else [],history_included=include_history,coverage={r['host']:self._coverage(r) for r in db.execute('SELECT * FROM coverage WHERE product_id=?',(product_id,))},refresh_attempts=[self._stored_attempt(r) for r in db.execute('SELECT * FROM attempts WHERE product_id=? ORDER BY attempted_at,id',(product_id,))],acquisition=dict(acquisition) if acquisition else None,acquisition_owner=allocation['owner'] if allocation else None,acquisition_completion=completion)
   return dict(revision=revision,products=result)
 
 
@@ -805,6 +939,8 @@ def require_catalogue_completion(snapshot,positions,known,*,configured_hosts,pri
   try:
    if not receipt:raise CompletionUnknown('completion_unknown')
    value=validate_completion_receipt(receipt);allocation=product.get('acquisition') or {}
+   from .product_identity import alternative_policy
+   if value.get('alternatives_policy_sha256','')!=alternative_policy(position)['sha256']:raise CompletionUnknown('completion_policy_changed')
    if (allocation.get('status')!='done' or allocation.get('error') or allocation.get('generation')!=value['generation']
        or product['product_id']!=value['product_id'] or identity.key!=value['requested_identity_sha256']
        or value['configured_hosts']!=list(configured_hosts) or value['primary_hosts']!=list(primary_hosts)
@@ -813,3 +949,96 @@ def require_catalogue_completion(snapshot,positions,known,*,configured_hosts,pri
   except (CompletionUnknown,KeyError,TypeError,ValueError) as error:
    missing.append(str(getattr(position,'number',index))+': '+str(error))
  if missing:raise CatalogueConflict('catalogue_completion_required: '+'; '.join(missing))
+
+
+from .failure_policy import ResearchControlError
+
+class RetainedCardUncertain(ResearchControlError):
+ def __init__(self):super().__init__('Предыдущая операция этой карточки имеет неопределённый исход; автоматический повтор не выполнен')
+
+def provider_attempts(events):
+ from ..research_publication import valid_label
+ output=[]
+ for event in events:
+  if event.get('stage')!='provider_transport':continue
+  label=event.get('label')
+  if not valid_label('provider_transport',label):return None
+  output.append(json.loads(label))
+ return output
+
+def definitely_presend(events):
+ if type(events) is not list or not 0<len(events)<1024:return False
+ if len(json.dumps([v for v in events if v.get('stage')=='provider_transport']).encode())>6000:return False
+ if any(v.get('stage')=='telemetry_rejected' or v.get('omitted_fields') for v in events):return False
+ attempts=provider_attempts(events)
+ return bool(attempts) and all(v['outcome']=='error' and v['proven_presend'] is True and v['endpoint_send_started'] is False for v in attempts)
+
+def _replay_digest(value):return hashlib.sha256(json.dumps(value,ensure_ascii=False,separators=(',',':'),sort_keys=True).encode()).hexdigest()
+
+def _terminal(research,job,header,receipts):
+ if header.get('status') in {'done','error','cancelled'}:return
+ receipt=(receipts or {}).get(job)
+ if type(receipt) is not dict:raise ValueError('Retained running job requires verified terminal receipts')
+ values=[]
+ for role in ('parent','child'):
+  path=Path(receipt[role+'_path'])
+  if path.is_symlink() or path.stat().st_size>1024*1024:raise ValueError('Unsafe terminal receipt')
+  raw=path.read_bytes()
+  if hashlib.sha256(raw).hexdigest()!=receipt[role+'_sha256']:raise ValueError('Terminal receipt changed')
+  values.append(json.loads(raw))
+ parent,child=values
+ if parent.get('child_reaped') is not True or parent.get('cleanup_verified') is not True or child.get('job_id')!=job:raise ValueError('Retained job termination unverified')
+
+def import_retained_uncertainty(catalogue,research,*,job_ids,terminal_receipts=None):
+ """Use only an owned verified seed copy. Never query an old live/original store.
+
+ Frontier/response/outcome hashes bind card identity; provider batch IDs are kept
+ separate from card operation IDs. A reason string alone cannot create a barrier.
+ """
+ from ..schemas import PositionIn
+ from ..research_store import ACQUISITION_FRONTIER_KEY
+ from .acquisition_frontier import validate_frontier,NeutralRecords,FrontierController
+ from .catalogue import identity_for_position
+ report=[]
+ with research.lock:
+  for job in job_ids:
+   header=research.materialize(job,include_events=False)['job'];_terminal(research,job,header,terminal_receipts)
+   inputs,input_sha=research._acquisition_input(job)
+   positions=[PositionIn.model_validate(v) for v in inputs['positions']]
+   for row in research.db.execute('SELECT idx,payload FROM rows WHERE job=? ORDER BY idx',(job,)):
+    idx=row['idx'];raw_frontier=json.loads(row['payload']).get(ACQUISITION_FRONTIER_KEY)
+    if raw_frontier is None:continue
+    frontier=validate_frontier(raw_frontier,job_id=job,input_sha256=input_sha,positions=positions,configured_hosts=inputs['configured_hosts'],index=idx)
+    product_id=identity_for_position(positions[idx]).key
+    if product_id!=frontier['product_id']:raise ValueError('Retained product identity differs')
+    product=catalogue.lookup(identity_for_position(positions[idx]))
+    if product is None:raise ValueError('Retained catalogue product missing')
+    records=NeutralRecords(research.root/'acquisition'/job/product_id,frontier)
+    controller=FrontierController(frontier,records)
+    candidates=[]
+    for query in frontier['queries']:
+     card=query.get('current_card')
+     if card is not None:
+      native=controller.candidate(query['id'],card.get('index',query['cursor']))
+      if native['url']!=card['url'] or native['host']!=card['host']:raise ValueError('Retained current card changed')
+      candidates.append((card,dict(basis='terminal_current_card',frontier_sha256=_replay_digest(frontier))))
+    for card in controller.completed_cards():
+     if card['outcome'] is None:continue
+     outcome=records._read(card['outcome'])
+     if outcome.get('operation_id')!=card['operation_id'] or outcome.get('url')!=card['url'] or outcome.get('host')!=card['host']:raise ValueError('Retained outcome binding differs')
+     completion=outcome.get('completion',{});code=completion.get('evidence',{}).get('code')
+     if completion.get('disposition')!='uncertain' or code not in {'llm_operation_failed','card_operation_budget'}:continue
+     # A previous row's transport batch is not a card binding. Preserve the
+     # native operation's actual unknown outcome; never infer post-send here.
+     evidence=dict(basis='retained_card_outcome_unknown',submission_stage='unknown',frontier_sha256=_replay_digest(frontier),outcome_sha256=card['outcome']['sha256'],uncertainty_code=code)
+     candidates.append((card,evidence))
+    for card,evidence in candidates:
+     committed=catalogue.resolve_observation(product_id,card['operation_id'])
+     if committed is not None:
+      actual=committed['observation']
+      if actual['requested_url']!=card['url'] or actual['supplier_host']!=card['host']:raise ValueError('Retained committed binding differs')
+      report.append(dict(product_id=product_id,operation_id=card['operation_id'],state='already_observed'));continue
+     evidence.update(source_job=job,source_index=idx)
+     answer=catalogue.card_operation(product_id,card['host'],card['url'],operation_id=card['operation_id'],evidence=evidence)
+     report.append(dict(product_id=product_id,url=card['url'],operation_id=card['operation_id'],state='imported' if answer['allowed'] else 'already_pending',evidence=evidence))
+ return report

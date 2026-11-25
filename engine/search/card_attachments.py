@@ -64,7 +64,12 @@ def reusable_photo(offer):
 
 
 def capture_current(browser, position, url, *, extract=True, neutral_sink=None, http_preflight=False, photos=True, financial_outcome=None):
-    """Same current producer, health lease and business rules; no discovery."""
+    """Capture with existing transport/authority, then separately apply native quote rules.
+
+    An active fact scope observes retained HTTP input before expected-product
+    admission. Those raw observations cannot qualify or replace an offer.
+    Native cancellation, seller, ownership and financial failures are unchanged.
+    """
     from . import agent
     from .card_batch import extract_batch
     from .product_identity import card_host
@@ -84,7 +89,10 @@ def capture_current(browser, position, url, *, extract=True, neutral_sink=None, 
             class OwnedHttpSnapshot(Exception):
                 def __init__(self,snapshot):self.snapshot=snapshot
             def delivered(record,source,*,reused=False):
+                """Observe the saved HTTP page before matching; preserve existing refusal and snapshot control flow."""
                 bounded_timeout(1)
+                from .observed_fact_capture import observe_http
+                observe_http(source)
                 import base64
                 from .http_card import main_product
                 from .http_identity_preflight import primary_contradiction,VERSION
@@ -124,17 +132,22 @@ def capture_current(browser, position, url, *, extract=True, neutral_sink=None, 
             except PrimaryContradiction:return None,None
             except OwnedHttpSnapshot as delivery:snapshot=delivery.snapshot
         else:
-            rejected,failed_http=_http_primary_preflight(position,url) if http_preflight else (False,False)
+            from ..supplier_methods import selected
+            grant=selected(url)
+            owned_http_preflight=bool(http_preflight and grant is not None and grant['method']=='http')
+            rejected,failed_http=_http_primary_preflight(position,url) if http_preflight and not owned_http_preflight else (False,False)
             if rejected:return None,None
             from .session import failed_primary_http
             from contextlib import nullcontext
             with failed_primary_http(url) if failed_http else nullcontext():
                 snapshot=agent._capture_rendered_card(browser,url,url,card_host(url),position.type_mark,
                     position.name,position.unit,position.qty,agent._verified_manufacturer_brand(position.type_mark),set(),deadline,
-                    neutral_sink=neutral_sink)
+                    neutral_sink=neutral_sink,primary_position=position if owned_http_preflight else None)
         bounded_timeout(1)
         if snapshot is None:return None,None
-        snapshot.retain(agent.CACHE_DIR)
+        retained_input=snapshot.retain(agent.CACHE_DIR)
+        from .document_context import _capture_input_retained
+        _capture_input_retained(snapshot,retained_input)
         from .owned_purchase_row import from_facts,retain_decision
         import uuid
         operation_id=uuid.uuid4().hex
@@ -160,25 +173,61 @@ def capture_current(browser, position, url, *, extract=True, neutral_sink=None, 
         offer=agent._finish_captured_card(browser,snapshot,data,enrich_seller=extract)
         retain_decision(snapshot,data,operation_id=operation_id,origin=origin,outcome='offer_created' if offer else 'finish_no_offer')
         if financial_outcome is not None:
-            financial_outcome(CaptureFinancialResult(CaptureFinancialOutcome.REJECTED,raw_rejections[0]) if raw_rejections else CaptureFinancialResult(CaptureFinancialOutcome.ACCEPTED if offer else CaptureFinancialOutcome.REJECTED))
+            # A native unit-review placeholder is still useful to ordinary
+            # callers, but is not a confirmed financial publication. Keep the
+            # retained snapshot without replacing an existing catalogue head.
+            review_only=(offer is not None and offer.unit_review_required is True
+                         and not offer.source_quote_evidence)
+            financial_outcome(CaptureFinancialResult(CaptureFinancialOutcome.REJECTED,raw_rejections[0]) if raw_rejections else CaptureFinancialResult(CaptureFinancialOutcome.INSUFFICIENT if review_only else CaptureFinancialOutcome.ACCEPTED if offer else CaptureFinancialOutcome.REJECTED))
         bounded_timeout(1)
         return snapshot,bind_photo(offer) if offer else None
 
 
-def collect_current(browser,position,url,*,extract=True,neutral_sink=None,http_preflight=False):
-    """Real source facts with no screenshot/S3; no fake image for new price."""
+def collect_current(browser, position, url, *, extract=True, neutral_sink=None, http_preflight=False):
+    """Collect source facts without photographs, preserving them independently of quote admission.
+
+    The ordinary capture/extraction/catalogue path remains the quote authority.
+    Additive fact-journal references are emitted even if matching later refuses
+    the item. Facts are neither a normalized price nor a catalogue-head update.
+    Context and diagnostics are settled on cancellation/error without retry.
+    """
+    from . import agent
+    from .observed_fact_capture import fact_capture_scope, observe_rendered
     from .selected_proofs import NOT_SELECTED
+
     def sink(record):
-        if neutral_sink is not None:neutral_sink({**record,'context_capture_review_reason':NOT_SELECTED})
-    snapshot,offer=capture_current(browser,position,url,extract=extract,neutral_sink=sink if neutral_sink is not None else None,http_preflight=http_preflight,photos=False)
+        """Observe the existing owner-verified DOM before forwarding the unchanged native neutral packet."""
+        observe_rendered(record)
+        if neutral_sink is not None:
+            neutral_sink({**record, 'context_capture_review_reason': NOT_SELECTED})
+
+    with fact_capture_scope(agent.CACHE_DIR, position.type_mark) as facts:
+        try:
+            snapshot, offer = capture_current(
+                browser, position, url, extract=extract, neutral_sink=sink,
+                http_preflight=http_preflight, photos=False,
+            )
+        finally:
+            diagnostics = agent._CARD_DIAGNOSTICS.get()
+            if diagnostics is not None:
+                for report in facts.reports:
+                    diagnostics.append({
+                        'url': url, 'code': 'independent_observed_facts',
+                        'reason': 'Сохранённые факты отделены от соответствия и пригодности цены',
+                        'observed_facts': report,
+                    })
     if snapshot is not None:
         from .card_batch import CardSnapshot
-        facts=snapshot.facts();facts.update(screenshot_context='',context_capture_evidence={},context_capture_review_reason=NOT_SELECTED)
-        snapshot=CardSnapshot.create(facts,snapshot.deadline)
-    return snapshot,offer
+        observed = snapshot.facts()
+        observed.update(
+            screenshot_context='', context_capture_evidence={},
+            context_capture_review_reason=NOT_SELECTED,
+        )
+        snapshot = CardSnapshot.create(observed, snapshot.deadline)
+    return snapshot, offer
 
 
-def _http_primary_preflight(position,url):
+def _http_primary_preflight(position,url,*,response=None):
     """One normal bounded HTTP attempt; a rejection is never quote authority."""
     import httpx
     from ..browser import supplier_http_get,supplier_http_configuration_hash,SupplierHttpLimit,SupplierHttpRepresentation,_supplier_failure
@@ -188,8 +237,11 @@ def _http_primary_preflight(position,url):
     from .http_identity_preflight import primary_contradiction,VERSION
     from .failure_policy import supplier_card_transport_diagnostic
     from . import agent
+    from ..supplier_methods import selected
+    grant=selected(url)
+    if grant is not None and grant['method']=='browser':return False,True
     started=time.monotonic();bounded_timeout(1);route=supplier_http_configuration_hash()
-    capability=http_capability_advice(card_host(url),route)
+    capability=http_capability_advice(card_host(url),route)if response is None else None
     def record(code,reason,**fields):
         diagnostics=agent._CARD_DIAGNOSTICS.get()
         if diagnostics is not None:diagnostics.append(dict(code=code,reason=reason,url=url,preflight_version=VERSION,elapsed_seconds=time.monotonic()-started,**fields))
@@ -199,7 +251,8 @@ def _http_primary_preflight(position,url):
     if capability is not None and not capability[2]['allowed']:
         record('http_primary_browser_first','HTTP пропущен по действующему состоянию транспорта; проверяется браузером',http_wire_attempted=False)
         return False,True
-    try:response=supplier_http_get(url,max_bytes=2*1024*1024,max_redirects=3)
+    try:
+        if response is None:response=supplier_http_get(url,max_bytes=2*1024*1024,max_redirects=3)
     except (SupplierHttpRepresentation,SupplierHttpLimit):
         finish('unknown');record('http_primary_unavailable','HTTP не предоставил ограниченный документ; проверяется браузером',http_wire_attempted=True)
         return False,True

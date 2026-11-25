@@ -33,7 +33,7 @@ supplier_card_transport_error supplier_card_network_timeout supplier_card_networ
 supplier_card_http_forbidden supplier_card_http_rate_limited supplier_card_http_unavailable
 supplier_card_bot_protection""".split())
 _UNCERTAIN_STAGES=frozenset(('capture_operation','source_decision','outcome_recovery','outcome_write'))
-_UNCERTAIN_ERRORS=frozenset(('CataloguePublicationError','LLMOperationFailed','SearchBudgetExceeded',
+_UNCERTAIN_ERRORS=frozenset(('MethodUnavailable','CataloguePublicationError','LLMOperationFailed','SearchBudgetExceeded',
     'ResearchControlError','ResearchProgressError','ValueError','Error','TimeoutError',
     'ReadTimeout','ConnectTimeout','ReadError','ConnectError','HTTPStatusError','RequestError'))
 
@@ -102,6 +102,7 @@ def candidate_count(task):
 def record_binding(frontier):
     names=('job_id','product_id','input_sha256','requested_identity_sha256','route_intent_sha256','configured_hosts')
     if frontier['version']==5:names+=('record_origin_generation','planner_version')
+    if 'alternatives_policy_sha256'in frontier:names+=('alternatives_policy_sha256',)
     return {k:json.loads(_json(frontier[k])) for k in names}
 
 
@@ -128,7 +129,7 @@ def validate_frontier(value,*,job_id,input_sha256,positions,configured_hosts,ind
     this validator nor a response checkpoint is financial/source authority.
     """
     if type(value) is not dict or type(value.get('version')) is not int or value['version'] not in (1,2,3,4,5):_fail()
-    _keys(value,_FIELDS+(' record_origin_generation' if value['version']==5 else '')+(' search_route source_intent' if value['version'] in (3,4,5) else ' search_route' if value['version']==2 else ''))
+    _keys(value,_FIELDS+(' alternatives_policy_sha256' if 'alternatives_policy_sha256'in value else '')+(' record_origin_generation' if value['version']==5 else '')+(' search_route source_intent' if value['version'] in (3,4,5) else ' search_route' if value['version']==2 else ''))
     if value['version'] in (3,4,5):
         from .acquisition_source_intent import validate
         try:validate(value['source_intent'])
@@ -142,6 +143,8 @@ def validate_frontier(value,*,job_id,input_sha256,positions,configured_hosts,ind
     if value['job_id']!=job_id or value['input_sha256']!=input_sha256 or value['representative_index']!=index:_fail()
     _hex(job_id,12);_hex(input_sha256);_int(index);_int(value['representative_index'])
     if index>=len(positions) or value['requested_identity_sha256']!=identity_digest(positions[index]):_fail()
+    from .product_identity import alternative_policy
+    if value.get('alternatives_policy_sha256','')!=alternative_policy(positions[index])['sha256']:_fail()
     _hex(value['product_id']);_hex(value['requested_identity_sha256'])
     if expected_product_id is not None and value['product_id']!=expected_product_id:_fail()
     if type(value['configured_hosts']) is not list or value['configured_hosts']!=list(configured_hosts):_fail()
@@ -162,7 +165,7 @@ def validate_frontier(value,*,job_id,input_sha256,positions,configured_hosts,ind
     position=positions[index];field=lambda k:position.get(k,'') if isinstance(position,dict) else getattr(position,k,'')
     identity=identity_for_position(position);allowed=set()
     for maker in set((identity.manufacturer,)+names_for(identity.manufacturer)):
-        allowed.update(build_article_query_plan(field('name'),field('type_mark'),article=identity.code if identity.kind=='article' else '',manufacturer=maker,unit=field('unit')).queries)
+        allowed.update(build_article_query_plan(field('name'),field('type_mark'),article=identity.code if identity.kind=='article' else '',manufacturer=maker,unit=field('unit'),alternative_articles=field('alternative_articles')or [],alternative_names=field('alternative_names')or []).queries)
     ids=set();admitted=set()
     for task in value['queries']:
         _keys(task,_QUERY+(' settled_cards deferred_cards' if value['version'] in (4,5) else '')+(' card_links' if 'card_links' in task else ''));_hex(task['id'])
@@ -237,6 +240,9 @@ def new_frontier(*,job_id,input_sha256,positions,configured_hosts,index,product_
     if indexed:
         if source_intent is None:_fail()
         value.update(version=5,planner_version='native-acquisition-indexed-v5',record_origin_generation=acquisition_generation)
+    from .product_identity import alternative_policy
+    policy=alternative_policy(positions[index])['sha256']
+    if policy:value['alternatives_policy_sha256']=policy
     return validate_frontier(value,job_id=job_id,input_sha256=input_sha256,positions=positions,configured_hosts=configured_hosts,index=index,expected_product_id=product_id)
 
 
@@ -647,8 +653,10 @@ def validate_completion_receipt(value):
               'generation','configured_hosts','primary_hosts','planner_version',
               'source_intent_sha256','runtime_sha256','search_route','components_sha256','frontier_sha256','records_sha256',
               'query_count','card_count','completed_at','sha256'}
-    if type(value) is not dict or set(value) != fields or value['version'] != 'acquisition-completion-v1':
+    if type(value) is not dict or set(value) != (fields|{'alternatives_policy_sha256'} if 'alternatives_policy_sha256'in value else fields) or value['version'] != 'acquisition-completion-v1':
         raise CompletionUnknown('completion_invalid')
+    if 'alternatives_policy_sha256'in value:
+        if type(value['alternatives_policy_sha256'])is not str or not re.fullmatch('[a-f0-9]{64}',value['alternatives_policy_sha256']):raise CompletionUnknown('completion_invalid')
     for key in ('product_id','input_sha256','requested_identity_sha256','source_intent_sha256',
                 'runtime_sha256','components_sha256','frontier_sha256','records_sha256','sha256'):
         if type(value[key]) is not str or not re.fullmatch('[a-f0-9]{64}',value[key]):
@@ -702,7 +710,7 @@ def certify_completion(frontier, context, records, intent, *, resolve_hosts, ver
         identity=identity_for_position(position)
         if identity.key!=value['product_id']:raise CompletionUnknown('completion_foreign_product')
         field=lambda k:position.get(k,'') if isinstance(position,dict) else getattr(position,k,'')
-        plan=build_article_query_plan(field('name'),field('type_mark'),article=identity.code if identity.kind=='article' else '',manufacturer=identity.manufacturer,unit=field('unit'))
+        plan=build_article_query_plan(field('name'),field('type_mark'),article=identity.code if identity.kind=='article' else '',manufacturer=identity.manufacturer,unit=field('unit'),alternative_articles=field('alternative_articles')or [],alternative_names=field('alternative_names')or [])
         planner=StagedDiscoveryPlan(plan.queries,primary,[h for h in hosts if h not in primary],strong_article=identity.kind=='article')
         if planner.hosts!=hosts:raise CompletionUnknown('completion_scope_changed')
         steps={step.query:step for step in plan.steps}
@@ -818,6 +826,7 @@ def certify_completion(frontier, context, records, intent, *, resolve_hosts, ver
             generation=value['acquisition_generation'],configured_hosts=hosts,primary_hosts=primary,
             planner_version=value['planner_version'],source_intent_sha256=intent['sha256'],runtime_sha256=intent['runtime_sha256'],search_route=value['search_route'],components_sha256=digest(intent['components']),
             frontier_sha256=digest(value),records_sha256=digest(seal),query_count=len(value['queries']),card_count=cards,completed_at=time.time())
+        if value.get('alternatives_policy_sha256'):receipt['alternatives_policy_sha256']=value['alternatives_policy_sha256']
         receipt['sha256']=_hash(receipt)
         return VerifiedCompletion(validate_completion_receipt(receipt),_COMPLETION_ISSUER)
     except CompletionUnknown:raise

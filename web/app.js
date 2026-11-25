@@ -4,6 +4,7 @@
 const specFiles = [];
 const letterFiles = [];
 let parsedSpecFiles = [];
+let remoteSourceDocuments = [];
 let sourceOutcomes = [];
 function sourceOutcomeSummary() {
   const reasons = {recognition_page_failed: "страница не прочитана",
@@ -35,6 +36,7 @@ function renderSourceSummary() {
 }
 let sourceUrls = [];
 let activeResearchJob = "";
+/** Poll only the active job, ignore stale responses and display saved candidates without changing price approval. */
 async function pollResearch(jobId) {
   if (!jobId || jobId !== activeResearchJob) return;
   try {
@@ -66,7 +68,7 @@ async function pollResearch(jobId) {
       const p = positions[index];
       if (p._researchStatus === "stale") return;
       p._researchApplied = version;
-      if (p.name !== row.name || p.type_mark !== row.type_mark || p.unit !== row.unit
+      if (JSON.stringify(positionAlternatives(p)) !== JSON.stringify(positionAlternatives(row)) || p.name !== row.name || p.type_mark !== row.type_mark || p.unit !== row.unit
           || p.discipline !== row.discipline || p.is_unique !== row.is_unique
           || (row.qty !== undefined && Number(p.qty) !== Number(row.qty))) {
         p._researchStatus = "stale";
@@ -96,13 +98,7 @@ async function pollResearch(jobId) {
       }
     });
     if (updated) renderPositions();
-    const counts = { complete: 0, partial: 0, failed: 0, skipped: 0 };
-    job.rows.forEach((row) => {
-      if (!row) return;
-      const status = row.quote_status === "sufficient" ? "complete"
-        : row.quote_status === "insufficient" && row.status === "complete" ? "partial" : row.status;
-      if (counts[status] !== undefined) counts[status]++;
-    });
+    const resultSummary = researchPresentation.summaryText(job.rows);
     const matchReviewRows = job.rows.filter((row) => row && row.match_review_count > 0).length;
     const work = job.rows.reduce((sum, row) => {
       if (!row) return sum;
@@ -111,7 +107,7 @@ async function pollResearch(jobId) {
       return sum;
     }, { sites_attempted: 0, sites_finished: 0, queries_attempted: 0, cards_attempted: 0 });
     const workText = `Запросы: ${work.queries_attempted}, карточки: ${work.cards_attempted}; начаты проверки позиция–сайт: ${work.sites_attempted}, зафиксированы результаты: ${work.sites_finished}`;
-    $("baseSummary").textContent = `${workText}. Обработаны строки ${job.completed}/${job.total}: найдены ${counts.complete}, мало источников ${counts.partial}, без цен ${counts.failed}, пропущены ${counts.skipped}; сверить карточки: ${matchReviewRows}`;
+    $("baseSummary").textContent = `${workText}. Обработаны строки ${job.completed}/${job.total}: ${resultSummary}; сверить карточки: ${matchReviewRows}`;
     if (job.status === "cancelled") {
       activeResearchJob = "";
       $("baseSummary").textContent = `Поиск остановлен; непроверенные сайты остаются незавершёнными. ${workText}.`;
@@ -188,6 +184,7 @@ async function continueResearchExplicitly() {
 }
 window.POS.openSource = (index) => {
   const file = parsedSpecFiles[index];
+  if (!file && remoteSourceDocuments[index]?.url) { window.open(engineUrl()+remoteSourceDocuments[index].url,"_blank","noopener"); return; }
   if (!file) return alert("Исходный файл недоступен — распознайте спецификацию повторно");
   if (!sourceUrls[index]) sourceUrls[index] = URL.createObjectURL(file);
   window.open(sourceUrls[index], "_blank", "noopener");
@@ -340,21 +337,7 @@ wireDrop("dropSpec", "specInput", specFiles, "specFiles", [".pdf", ".jpg", ".jpe
 wireDrop("dropLetter", "letterInput", letterFiles, "letterFiles", [".pdf"]);
 
 /* ---------- шаг 1 → 2: распознать + заполнить из базы ---------- */
-$("parseBtn").onclick = async () => {
-  if (!specFiles.length && !letterFiles.length)
-    return alert("Добавьте файлы спецификации или письма");
-  const fd = new FormData();
-  fd.append("object_name", $("objectName").value.trim());
-  fd.append("discipline", $("discipline").value);
-  fd.append("unique_names", $("uniqueNames").value);
-  specFiles.forEach((f) => fd.append("specs", f));
-  letterFiles.forEach((f) => fd.append("letters", f));
-
-  $("parseBtn").disabled = true; $("parseBtn").textContent = "Распознаём…";
-  try {
-    const r = await fetch(engineUrl() + "/parse", { method: "POST", body: fd });
-    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
-    const data = await r.json();
+function applyParsedResult(data) {
     sourceUrls.forEach((url) => url && URL.revokeObjectURL(url));
     sourceUrls = [];
     parsedSpecFiles = [...specFiles];
@@ -373,9 +356,32 @@ $("parseBtn").onclick = async () => {
       $("baseSummary").title = `Сверьте OCR с оригиналом перед сборкой. Требуют решения: ${pending.length}; нет количества: ${missingQty.join(", ") || "нет"}; нет единицы: ${missingUnit.join(", ") || "нет"}.`;
     const failures = sourceOutcomeSummary();
     renderSourceSummary();
-    if (!activeResearchJob) $("baseSummary").textContent = `Сохранено ${positions.length} строк. Автоматический поиск не запущен.`
+    if (!activeResearchJob) $("baseSummary").textContent = `Сохранено ${positions.length} строк. Проверьте распознавание и запустите поиск цен кнопкой «Найти цены».`
       + (failures ? ` Проблемы исходников: ${failures}.` : "");
     if (activeResearchJob) pollResearch(activeResearchJob);
+}
+
+$("parseBtn").onclick = async () => {
+  if (!specFiles.length && !letterFiles.length)
+    return alert("Добавьте файлы спецификации или письма");
+  const fd = new FormData();
+  fd.append("object_name", $("objectName").value.trim());
+  fd.append("discipline", $("discipline").value);
+  fd.append("unique_names", $("uniqueNames").value);
+  specFiles.forEach((f) => fd.append("specs", f));
+  letterFiles.forEach((f) => fd.append("letters", f));
+
+  $("parseBtn").disabled = true; $("parseBtn").textContent = "Распознаём…";
+  try {
+    let data;
+    if (remoteCommands()) {
+      const fingerprint=await uploadFingerprint({object_name:$("objectName").value.trim(),discipline:$("discipline").value,unique_names:$("uniqueNames").value},[['spec',specFiles],['letter',letterFiles]]);
+      const state=await submitCommand('parse',fd,fingerprint);data=state.result;remoteSourceDocuments=(state.source_documents||[]).filter(x=>x.kind==='spec').sort((a,b)=>a.index-b.index);
+    } else {
+      const r=await fetch(engineUrl()+"/parse",{method:"POST",body:fd});await requireOk(r);data=await r.json();
+    }
+    applyParsedResult(data);
+    if (remoteCommands()) consumeCommand('parse');
   } catch (e) {
     alert("Не удалось распознать: " + e.message + "\nМожно заполнить вручную.");
   } finally {
@@ -401,7 +407,7 @@ async function fillFromBase() {
     const r = await fetch(engineUrl() + "/base/fill", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ positions: ready.map((i) => positions[i]).map((p) => ({
-        number: p.number, name: p.name, full_name: p.full_name || p.name, type_mark: p.type_mark, unit: p.unit,
+        number: p.number, name: p.name, full_name: p.full_name || p.name, type_mark: p.type_mark, ...positionAlternatives(p), unit: p.unit,
         qty: p.qty, discipline: p.discipline, needs_review: p.needs_review,
         review_issue: p.review_issue, review_accepted: p.review_accepted,
         review_fields: p.review_fields, source_is_image: p.source_is_image,
@@ -465,7 +471,7 @@ $("buildBtn").onclick = async () => {
     skip_search: true,
     source_outcomes: sourceOutcomes,
     positions: positions.map((p) => ({
-      number: p.number, name: p.name, full_name: p.full_name, type_mark: p.type_mark,
+      number: p.number, name: p.name, full_name: p.full_name, type_mark: p.type_mark, ...positionAlternatives(p),
       unit: p.unit, qty: p.qty, is_unique: p.is_unique, needs_review: p.needs_review,
       review_issue: p.review_issue, review_accepted: p.review_accepted,
       review_fields: p.review_fields, source_is_image: p.source_is_image,
@@ -480,11 +486,12 @@ $("buildBtn").onclick = async () => {
   $("downloads").innerHTML = "";
   setStatus("running", "Запуск…");
   try {
-    const r = await fetch(engineUrl() + "/build", {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-    });
-    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
-    const jobId = (await r.json()).job_id;
+    let jobId;
+    if (remoteCommands()) {
+      const raw=JSON.stringify(body);const state=await submitCommand('build',raw,raw);jobId=state.job_id;consumeCommand('build');
+    } else {
+      const r=await fetch(engineUrl()+"/build",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});await requireOk(r);jobId=(await r.json()).job_id;
+    }
     pollJob(jobId, {
       bar: "barFill", step: "stepText", log: "logBox",
       onDone: (j) => {
@@ -507,3 +514,45 @@ $("buildBtn").onclick = async () => {
 
 const LABELS = { research_xlsx: "Проверки источников (Excel)", research_package: "Проверки и снимки (ZIP)", kac: "КАЦ (Excel)", tkp: "Том ТКП (PDF)", tsn: "ТСН-2001 (Excel)" };
 function setStatus(cls, text) { const el = $("statusText"); el.className = "status " + cls; el.textContent = text; }
+
+// Deterministic precedence: newest logical research input wins over older parse.
+async function restoreRemoteCommands() {
+  try {
+    const plan=remoteRestorePlan();
+    if(plan.kind==='research'||plan.kind==='research_unknown') {
+      positions=plan.positions.map(normalizePos);renderPositions();
+      if(plan.kind==='research_unknown') {
+        $("baseSummary").textContent='Отправка поиска не подтверждена. Сохранённые позиции восстановлены; повтор той же отправки использует прежний ключ.';
+        return;
+      }
+      activeResearchJob=plan.record.job_id;
+      positions.forEach(p=>{p._researchStatus='pending';});
+      renderResearchContinuation(activeResearchJob,null);pollResearch(activeResearchJob);
+      // Read older parse metadata only for original-file links; never apply its positions.
+      const original=pendingCommand('parse')||lastCommand('parse');
+      if(original?.job_id && original.generation<plan.record.generation) {
+        try {
+          const response=await requireOk(await fetch(`${engineUrl()}/jobs/${original.job_id}`));const saved=await response.json();
+          if(saved.job_id===original.job_id) for(const file of saved.source_documents||[]) {
+            if(file.kind==='spec' && Number.isInteger(file.index) && positions.some(p=>p.source_index===file.index && p.source_evidence?.source_hash===file.sha256)
+              && file.url===`/runner-inputs/${original.job_id}/${file.sha256}`)remoteSourceDocuments[file.index]=file;
+          }
+        } catch { /* Restored research remains usable; an unproven original link stays unavailable. */ }
+      }
+    } else if(plan.kind==='parse') {
+      if(!plan.record.job_id)throw new Error('Отправка распознавания не подтверждена. Повторите те же исходники: сохранённый ключ не изменится.');
+      const state=await awaitCommand('parse',plan.record);
+      // Another newer research action could have been submitted while GET waited.
+      if(remoteRestorePlan().kind!=='parse')return restoreRemoteCommands();
+      remoteSourceDocuments=(state.source_documents||[]).filter(x=>x.kind==='spec').sort((a,b)=>a.index-b.index);
+      applyParsedResult(state.result);consumeCommand('parse');
+    }
+    const build=pendingCommand('build')||lastCommand('build');
+    if(build?.job_id) {
+      const state=await awaitCommand('build',build);
+      $("downloads").innerHTML=(state.downloads||[]).map(item=>`<a href="${esc(item.url)}">${esc(item.name)}</a>`).join(' ');
+      setStatus('done','Документы runner восстановлены');consumeCommand('build');
+    }
+  } catch(error) { $("baseSummary").textContent=error.message; }
+}
+if(remoteCommands())restoreRemoteCommands();

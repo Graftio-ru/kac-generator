@@ -233,7 +233,67 @@ def _context_key(offer):
     values=(offer.screenshot_context,offer.url,offer.context_capture_evidence.get('sha256'))
     return values if all(type(v) is str for v in values) else None
 
-def build_research_report(request: ResearchReportRequest, screenshot_links=None, context_links=None) -> bytes:
+def _write_catalogue_journal(wb, positions):
+    """Every retained event; current operation state uses native append order.
+
+    This is disclosure only: no retries, financial decisions or inferred sends.
+    Legacy/client-only rows without native order cannot assert current state.
+    """
+    count=sum(len(p.catalogue_refresh_attempts) for p in positions)
+    if not count:return None
+    if count>1048575:raise ValueError('Журнал источников превышает лимит строк Excel')
+    sheet=_sheet(wb,'Журнал источников',[
+        '№ позиции','Товар каталога','Ревизия снимка','Сайт','Карточка / источник',
+        'ID события каталога','Ревизия события','Дата события (UTC)',
+        'Результат события','Причина / замечание','ID операции',
+        'Состояние в событии','Текущее состояние операции',
+        'Последнее событие операции','Наблюдение / источник','Основание перехода',
+    ],[12,70,20,30,80,22,22,28,35,90,40,25,32,28,70,50])
+    row=2
+    for position in positions:
+        events=position.catalogue_refresh_attempts
+        ids=[a.get('catalogue_attempt_id') for a in events]
+        from ..search.catalogue_projection import _SCOPED_STORE,_SCOPED_SNAPSHOT
+        frozen=_SCOPED_SNAPSHOT.get()
+        product=(frozen.get('products',{}).get(position.catalogue_product_id)if 'products'in frozen else frozen)if type(frozen)is dict else None
+        bound=(_SCOPED_STORE.get()is not None and type(product)is dict
+               and product.get('product_id')==position.catalogue_product_id
+               and product.get('revision')==position.catalogue_revision
+               and product.get('refresh_attempts')==events)
+        ordered=bound and all(type(v)is int and v>0 for v in ids) and len(set(ids))==len(ids)
+        latest={}
+        def operation(a):
+            value=a.get('card_operation')
+            if (type(value)is not dict or value.get('version')!=1
+                or value.get('state')not in {'pending','resolved'}
+                or not re.fullmatch('[a-f0-9]{32}',str(value.get('operation_id','')))):
+                return None,None
+            return (a.get('host'),a.get('url'),value['operation_id']),value
+        if ordered:
+            for event in sorted(events,key=lambda a:a['catalogue_attempt_id']):
+                key,value=operation(event)
+                if key is not None:latest[key]=(event['catalogue_attempt_id'],value['state'])
+        for event in sorted(events,key=lambda a:a['catalogue_attempt_id']) if ordered else events:
+            key,value=operation(event);current=latest.get(key)
+            evidence=value.get('evidence',{}) if value else {}
+            basis=evidence.get('basis','') if type(evidence)is dict else ''
+            values=[position.number,position.catalogue_product_id,position.catalogue_revision,
+                event.get('host',''),event.get('url')or event.get('source_url',''),
+                event.get('catalogue_attempt_id',''),event.get('catalogue_attempt_revision',''),
+                _checked_date(event.get('attempted_at')),event.get('outcome',''),event.get('reason',''),
+                value['operation_id']if value else '',value['state']if value else '',
+                current[1]if current else 'Не установлено',
+                'Да'if current and current[0]==event['catalogue_attempt_id']else 'Нет'if current else 'Не установлено',
+                event.get('observation_id')or event.get('source_url',''),basis]
+            if any(len(str(v or ''))>32767 for v in values):
+                raise ValueError('Поле журнала источников превышает лимит Excel')
+            for column,value in enumerate(values,1):_put(sheet,row,column,value,url=column==5)
+            row+=1
+    return sheet
+
+
+def build_research_report(request: ResearchReportRequest, screenshot_links=None, context_links=None, *, interruption_reason=None) -> bytes:
+    """Build the workbook from saved evidence and disclose any collection interruption."""
     # A retained browser draft cannot bypass a newer server-known refusal.
     # This is review projection, not the final minimum-three admission gate.
     from ..search.base_db import refresh_receipt_snapshot, project_refresh_offers
@@ -253,6 +313,15 @@ def build_research_report(request: ResearchReportRequest, screenshot_links=None,
     context_links = context_links or {}
     wb = Workbook()
     wb.remove(wb.active)
+    interruption = None
+    if interruption_reason:
+        interruption = _sheet(wb, "Состояние сбора", ["Статус", "Причина", "Покрытие"], [24, 75, 95])
+        for column, value in enumerate((
+            "Сбор прерван",
+            interruption_reason,
+            "В отчёте сохранённые результаты. Непроверенные источники и данные, требующие проверки, не подтверждают отсутствие товара.",
+        ), 1):
+            _put(interruption, 2, column, value)
     from ..source_notes import document_notes
     notes = document_notes(request.positions)
     if notes:
@@ -294,6 +363,7 @@ def build_research_report(request: ResearchReportRequest, screenshot_links=None,
         "Карточка / источник",
     ], [12, 30, 28, 90, 75])
 
+    journal=_write_catalogue_journal(wb,request.positions)
     position_row = offer_row = matrix_row = diagnostic_row = 2
 
     for position in request.positions:
@@ -316,6 +386,12 @@ def build_research_report(request: ResearchReportRequest, screenshot_links=None,
             display_status = 'partial'
         if any(o.catalogue_ref for o in good_offers) and len(selected)<3 and display_status=='complete':
             display_status='partial'
+        from ..search.article_query_plan import build_article_query_plan
+        from ..search.catalogue import identity_for_position
+        requested=position.position if hasattr(position,'position')else position
+        identity=identity_for_position(requested)
+        alternative_plan=build_article_query_plan(requested.name,requested.type_mark,article=identity.code if identity.kind=='article'else'',manufacturer=identity.manufacturer,unit=requested.unit,alternative_articles=requested.alternative_articles,alternative_names=requested.alternative_names)
+        alternative_notice=('Не запланированы (не проверялись): '+', '.join(v['value']for v in alternative_plan.unplanned_hints))if alternative_plan.unplanned_hints else ''
         region_warnings = [f"{o.url or o.org_name}: {region_notice(o)}" for o in good_offers if region_notice(o)]
         from ..equipment_output_policy import missing_own_price, is_graftio_equipment, MISSING_PRICE
         own_missing = missing_own_price(position, position.offers)
@@ -323,7 +399,7 @@ def build_research_report(request: ResearchReportRequest, screenshot_links=None,
             position.number, position.name, position.type_mark, position.unit,
             position.qty, _STATUS.get(display_status, "Поиск не запускался"),
             len(good_offers), position.research_target or None,
-            "; ".join(filter(None, [MISSING_PRICE if own_missing else position.research_reason, *region_warnings])), review, review_summary(position.review_fields) or position.review_issue,
+            "; ".join(filter(None, [MISSING_PRICE if own_missing else position.research_reason, alternative_notice, *region_warnings])), review, review_summary(position.review_fields) or position.review_issue,
             "Да" if is_graftio_equipment(position) else "Нет",
             coverage['comparable_sources'], 3,
             {'wide': 'Широкое (5 и более)', 'limited': 'Ограниченное (3–4)',
@@ -339,6 +415,9 @@ def build_research_report(request: ResearchReportRequest, screenshot_links=None,
         for offer in good_offers:
             row = offer_row
             offer_row += 1
+            from ..search.product_identity import current_offer_article_evidence
+            article_provenance=current_offer_article_evidence(offer,position)
+            article_notice=('Разрешённый артикул '+article_provenance['matched_article']+'; исходный '+article_provenance['original_article']+'; политика '+article_provenance['alternatives_policy_sha256'])if article_provenance.get('match_basis')=='estimator_alternative'else''
             details = _quote_details(offer, position)
             displayed_price, displayed_unit = _display_price(offer, position)
             values = [
@@ -350,7 +429,7 @@ def build_research_report(request: ResearchReportRequest, screenshot_links=None,
                  and not offer.model_review_accepted else "Сверена"),
                 offer.price_unit, offer.listed_price_with_vat,
                 "Нужна проверка" if unit_review_pending(offer) else "Подтверждена",
-                "; ".join(filter(None,[offer.unit_review_reason or ("Не указана единица продажи карточки" if unit_review_pending(offer) else ""),unit_capture_review_reason(offer, position),seller_review_reason(offer, good_offers),_seller_origin_notice(offer),offer.refresh_failure_reason,
+                "; ".join(filter(None,[offer.unit_review_reason or ("Не указана единица продажи карточки" if unit_review_pending(offer) else ""),unit_capture_review_reason(offer, position),seller_review_reason(offer, good_offers),_seller_origin_notice(offer),article_notice,offer.refresh_failure_reason,
                     "Проверено: " + datetime.fromtimestamp(offer.refresh_checked_at,timezone.utc).isoformat() if offer.refresh_checked_at else ""])),
                 region_admission_label(offer),
                 "Выбрано предварительно" if _offer_key(offer) in selected else "Нет",
@@ -491,12 +570,14 @@ def build_research_report(request: ResearchReportRequest, screenshot_links=None,
         for row in sheet.iter_rows(min_row=2):
             for cell in row:
                 wrapped = ((sheet.title == "Полнота проверки" and cell.column == 2)
+                           or sheet == interruption
+                           or sheet == journal
                            or sheet == matrix
                            or (sheet == positions and cell.column in {2, 3, 9, 10, 11})
                            or (sheet == offers and cell.column in {2, 4, 5, 6, 9, 15, 16, 17, 18})
                            or (sheet == diagnostics and cell.column in {2, 3, 4, 5}))
                 cell.alignment = Alignment(vertical="top", wrap_text=wrapped)
-            if sheet in {positions, matrix, offers, diagnostics}:
+            if sheet in {positions, matrix, offers, diagnostics, journal, interruption}:
                 lines = max((math.ceil(len(str(c.value or "")) /
                              (sheet.column_dimensions[c.column_letter].width * 0.85))
                              for c in row if c.alignment.wrap_text), default=1)

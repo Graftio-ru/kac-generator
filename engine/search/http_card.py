@@ -5,12 +5,48 @@ from dataclasses import dataclass,field
 from pathlib import Path
 import base64,hashlib,json,re,time,uuid,threading,copy,math
 from collections import OrderedDict
+from contextvars import ContextVar
+from functools import wraps
 _PARSED=OrderedDict()
 _PARSED_LOCK=threading.Lock()
 from urllib.parse import urljoin,urlsplit
 from ..config import CACHE_DIR
 from .product_identity import canonical_card_url,card_host
 from .session import bounded_timeout
+
+# Only string-input entrypoints below create these calculation scopes. Their
+# freshly parsed trees and owned sets are immutable until the invocation exits.
+# No source/evidence result or node survives into another invocation.
+_DOM_CALCULATIONS=ContextVar('http_card_dom_calculations',default=None)
+
+def _immutable_dom(function):
+ @wraps(function)
+ def invoke(*args,**kwargs):
+  token=_DOM_CALCULATIONS.set(dict(visible={},text={},owned={},owned_sets={},text_bytes=0))
+  try:return function(*args,**kwargs)
+  finally:_DOM_CALCULATIONS.reset(token)
+ return invoke
+
+def _dom_memo(kind):
+ def decorate(function):
+  @wraps(function)
+  def calculate(node,*args):
+   context=_DOM_CALCULATIONS.get()
+   if context is None:return function(node,*args)
+   key=node
+   if kind=='owned':
+    owned=args[0];context['owned_sets'][id(owned)]=owned
+    key=(node,id(owned))
+   values=context[kind]
+   if key in values:return values[key]
+   value=function(node,*args)
+   # Cap retained text only; exhaustion skips reuse without changing decisions.
+   size=len(value)*4 if isinstance(value,str) else 0
+   if context['text_bytes']+size<=8*1024*1024:
+    values[key]=value;context['text_bytes']+=size
+   return value
+  return calculate
+ return decorate
 
 @dataclass(eq=False)
 class Node:
@@ -105,6 +141,7 @@ def _owned_nodes(root):
  visit(root)
  return result
 
+@_dom_memo('owned')
 def _owned_value(node,owned):
  if node not in owned:return ''
  parts=[];boundary=None
@@ -121,7 +158,7 @@ def _owned_value(node,owned):
  return ''.join(parts)
 
 
-def _metadata_sibling_identity(parser,product,actual_url,*,with_owner=False):
+def _metadata_sibling_identity(parser,product,actual_url,*,with_owner=False,validated_owner=None):
  # Rejection-only join: metadata cannot supply a price or a body-wide owner.
  norm=lambda value:re.sub(r'\s+',' ',value).strip()
  def shown(node):
@@ -144,7 +181,8 @@ def _metadata_sibling_identity(parser,product,actual_url,*,with_owner=False):
  headings=[n for n in all_nodes if n.tag=='h1']
  if len(headings)!=1 or not shown(headings[0]):return None
  heading=headings[0]
- if any(n.tag=='h1' for n in product.descendants()):return None
+ nested=any(n.tag=='h1' for n in product.descendants())
+ if nested and (validated_owner is None or validated_owner.get('_owner') is not product or validated_owner.get('_heading') is not heading):return None
  def properties(owner,key):
   values=[]
   for node in owner.descendants():
@@ -154,14 +192,17 @@ def _metadata_sibling_identity(parser,product,actual_url,*,with_owner=False):
    if parent is owner:values.append(norm(node.attrs.get('content') or node.attrs.get('href') or node.value()))
   return set(filter(None,values))
  names=properties(product,'name');mpns=properties(product,'mpn');urls=properties(product,'url')
- if names!={norm(visible_text(heading))} or len(mpns)!=1:return None
+ if names!={norm(visible_text(heading))} or len(mpns)>1:return None
+ correlated=not mpns
+ if correlated and (not with_owner or validated_owner is None):return None
  if len(urls)>1 or any(canonical_card_url(urljoin(actual_url,url))!=canonical_card_url(actual_url) for url in urls):return None
  common=heading.parent
  while common is not None and product not in common.descendants():common=common.parent
  if common is None or common.tag in {'body','html','root'} or not shown(common):return None
- card=heading
- while card.parent is not common:card=card.parent
- if card is product or any(itemtype(n,'Product') for n in card.descendants()):return None
+ card=product if nested else heading
+ if not nested:
+  while card.parent is not common:card=card.parent
+  if card is product or any(itemtype(n,'Product') for n in card.descendants()):return None
  owned=[n for n in _owned_nodes(card) if shown(n)]
  def rows(pattern):
   found=[]
@@ -173,12 +214,46 @@ def _metadata_sibling_identity(parser,product,actual_url,*,with_owner=False):
   return [(n,v) for n,v in found if not any(other is not n and other in n.descendants() for other,_ in found)]
  articles=rows(r'(?:Артикул производителя|Код производителя|Manufacturer code|MPN)\s*[:：]?\s*([A-Za-zА-Яа-я0-9._/-]{3,256})')
  codes={v.casefold() for _,v in articles}
- mpn=next(iter(mpns))
- if codes!={mpn.casefold()}:return None
- brands=[n for n in product.descendants() if prop(n,'brand') and 'itemscope' in n.attrs and shown(n)]
- brand_names=set().union(*(properties(n,'name') for n in brands)) if brands else set()
- printed={v for _,v in rows(r'(?:Производитель|Manufacturer|Brand)\s*[:：]?\s*(.{1,128})')}
- if len(brand_names)!=1 or len(printed)!=1 or {v.casefold() for v in brand_names}!={v.casefold() for v in printed}:return None
+ models=properties(product,'model')
+ generic_rows=rows(r'(?:Артикул(?!\s+производителя)|Модель|Article|Model)\s*[:：]?\s*([A-Za-zА-Яа-я0-9._/-]{3,256})')
+ generic_codes={v for _,v in generic_rows}
+ if len(models)>1 or len(generic_codes)>1:return None
+ if correlated:
+  # A generic owned code remains unbound until the approved catalogue joins it.
+  if len(generic_codes)!=1:return None
+  mpn=next(iter(generic_codes))
+  if models and models!={mpn} or codes and codes!={mpn.casefold()}:return None
+ else:
+  mpn=next(iter(mpns))
+  if codes!={mpn.casefold()} or models and models!={mpn} or generic_codes and generic_codes!={mpn}:return None
+ from .manufacturer_aliases import manufacturer_equal,REGISTRY
+ brand_names=set();brand_role_nodes=[]
+ for node in product.descendants():
+  if not prop(node,'brand') or not shown(node):continue
+  parent=node.parent
+  while parent is not None and 'itemscope' not in parent.attrs:parent=parent.parent
+  if parent is not product:continue
+  if 'itemscope' in node.attrs:
+   values=properties(node,'name')
+   if not values:return None
+   declared=norm(node.attrs.get('content')or'')
+   if declared:values.add(declared)
+  else:
+   # A visible scalar property is not a license to use its ancestor's text.
+   if node.tag in {'meta','link'}:return None
+   value=norm(visible_text(node));declared=norm(node.attrs.get('content')or'')
+   if not value or len(value)>128:return None
+   values={value}
+   if declared:values.add(declared)
+  brand_names.update(values);brand_role_nodes.append(node)
+ brand_rows=rows(r'(?:Бренд|Производитель|Manufacturer|Brand)\s*[:：]?\s*(.{1,128})')
+ printed={v for _,v in brand_rows}
+ if not brand_names or not printed:return None
+ all_manufacturers=brand_names|printed
+ first=sorted(brand_names)[0]
+ canonical={entry.canonical for entry in REGISTRY if all(manufacturer_equal(entry.canonical,value)for value in all_manufacturers)}
+ if len(canonical)>1 or not canonical and not all(manufacturer_equal(first,value)and manufacturer_equal(value,first)for value in all_manufacturers):return None
+ manufacturer=next(iter(canonical))if canonical else first
  # Explicit semantic references may bind a technical region outside the
  # purchase branch. Keep the full common owner so intervening contradictions
  # cannot disappear. An unlinked paragraph/metadata description is no authority.
@@ -199,10 +274,11 @@ def _metadata_sibling_identity(parser,product,actual_url,*,with_owner=False):
  text=_owned_value(card,set(_owned_nodes(card))).strip()
  if len(text)>200000:return None
  result=dict(title=visible_text(heading).strip(),article=mpn,text=text,identity_basis='manufacturer_code',code_observations=[dict(role='manufacturer_code',label='itemprop:mpn+printed manufacturer article',value=mpn)])
- if with_owner:result.update(_owner=card,_purchase_owner=purchase_card,manufacturer=next(iter(brand_names)))
+ if with_owner:result.update(_owner=card,_purchase_owner=purchase_card,manufacturer=manufacturer,_manufacturer_rows=brand_rows,_manufacturer_nodes=brand_role_nodes,_manufacturer_values=all_manufacturers,_catalogue_candidate=correlated,_catalogue_rows=[n for n,_ in generic_rows] if correlated else [])
  return result
 
 
+@_dom_memo('visible')
 def _semantic_visible(node):
  while node is not None:
   style=re.sub(r'\s+','',node.attrs.get('style','')).lower()
@@ -211,6 +287,7 @@ def _semantic_visible(node):
   node=node.parent
  return True
 
+@_dom_memo('text')
 def _semantic_text(node):
  if not _semantic_visible(node) or re.fullmatch(r'(?:Снять фильтр|Remove filter)',node.attrs.get('title',''),re.I):return ''
  result=[]
@@ -220,7 +297,7 @@ def _semantic_text(node):
   else:result.append(part)
  return ''.join(result)
 
-def _factory_features(owner):
+def _factory_features(owner,*,caption_cells=False):
  # Typed two-cell technical rows only. Their values never supply a kit/count
  # witness; the inference separately checks their compatibility.
  rows=[]
@@ -234,11 +311,119 @@ def _factory_features(owner):
    continue
   cells=[n for n in node.children if n.tag in ({'td','th'} if node.tag=='tr' else {'div','span','a'})]
   if len(cells)!=2:continue
+  if caption_cells and not re.search(r'(?:label|param[-_]name|property[-_]name)',cells[0].attrs.get('class',''),re.I):continue
+  if caption_cells and any(any(v.tag in {'div','section','article','table','ul','button','input'}for v in cell.descendants()if v is not cell)for cell in cells):continue
   values=[re.sub(r'\s+',' ',_semantic_text(n)).strip() for n in cells]
   if all(values) and len(values[0])<=128 and len(values[1])<=256:rows.append(dict(label=values[0],value=values[1],label_path=cells[0].path(),value_path=cells[1].path(),direct_value=False))
  return rows
 
-def _factory_prose_blocks(owner):
+def _http_product_claims(parser,owner,purchase):
+ """Coverage of the complete owned HTTP DOM, by node identity (never text lookup)."""
+ nodes=[n for n in owner.descendants()if _semantic_visible(n)];features=[]
+ critical=re.compile(r'упаковк|фасовк|комплект|pack|quantity|количеств',re.I)
+ # Closed caption/value structure is evidence of a property, not immunity.
+ for feature in _factory_features(owner):
+  left=next((n for n in nodes if n.path()==feature['label_path']),None)
+  right=next((n for n in nodes if n.path()==feature['value_path']),None)
+  if left is None or right is None:continue
+  caption=bool(re.search(r'(?:label|param[-_]name|property[-_]name)',left.attrs.get('class',''),re.I))
+  simple=not any(v.tag in {'div','section','article','table','ul','button','input'}and _semantic_text(v).strip()for cell in(left,right)for v in cell.descendants()if v is not cell)
+  if (caption and simple)or (critical.search(feature['label'])and simple):features.append(feature)
+ field_nodes={}
+ for i,f in enumerate(features):
+  for key in ('label_path','value_path'):
+   root=next(n for n in nodes if n.path()==f[key])
+   for n in root.descendants():field_nodes.setdefault(id(n),[]).append(i)
+ bound_control_paths=[]
+ if purchase:
+  bound_control_paths=[tuple(q[k])for q in purchase.get('quotations',[])for k in ('price_path','denominator_path')]+[tuple(v['role_path'])for v in purchase.get('monetary_roles',[])]+[tuple(purchase['purchase_control_path'])]
+  for q in purchase.get('quotations',[]):
+   price=next((n for n in nodes if n.path()==q['price_path']),None)
+   if price is not None and price.parent is not None and re.fullmatch(r'[\d\s.,]+(?:₽|RUB|руб\.?)',' '.join(_semantic_text(price.parent).split()),re.I):bound_control_paths.append(tuple(price.parent.path()))
+ entries=[]
+ negative=re.compile(r'без\s+(?:гаек|винтов|болтов|крепеж|крепёж)|только\s+(?:винты|гайки|болты|часть)|(?:прода[её]тся|приобретается|заказывается)\s+отдельно|часть\s+комплекта|неполный\s+комплект|перепаков|расфасов|не\s+вход',re.I)
+ for n in nodes:
+  text=' '.join(' '.join(v for v in n.text if isinstance(v,str)).split())
+  if not text or n.tag in {'script','style','meta','noscript'}:continue
+  ancestors=list(_ancestors(n));ancestors=ancestors[:ancestors.index(owner)+1]if owner in ancestors else ancestors
+  role='primary_unknown';context=n;refs=[]
+  if negative.search(text):role='primary_negative'
+  elif id(n)in field_nodes:role='primary_feature';refs=field_nodes[id(n)]
+  elif n.tag=='h1'and prop(n,'name'):role='primary_title'
+  else:
+   # UI authority is structural AND content bounded; all acquisition/count
+   # assertions are promoted back to primary before these classifications.
+   claim=bool(re.search(r'комплект|упаковк|фасовк|в\s+уп\b|\bуп\s*=|шт\s*в|толщин|высот|CS\s*45|CD\s*45|H\d|га[её]к|винт|болт|креп[её]ж',text,re.I))
+   offers=next((a for a in ancestors if prop(a,'offers')),None)
+   logistics=next((a for a in ancestors if re.search(r'(?:delivery|city_shops|item_tabs_av)',a.attrs.get('class','')+' '+a.attrs.get('id',''),re.I)),None)
+   media=next((a for a in ancestors if re.search(r'(?:image|video)',a.attrs.get('class','')+' '+a.attrs.get('id',''),re.I)and any(v.tag in {'img','video','iframe'}or(v.tag=='a'and re.search(r'video|\.pdf',v.attrs.get('href',''),re.I))for v in a.descendants())),None)
+   related=next((a for a in ancestors if re.search(r'(?:suggest|recommend)',a.attrs.get('class',''),re.I)and any(v.tag=='a'and v.attrs.get('href')for v in a.descendants())),None)
+   avail=next((a for a in ancestors if re.search(r'(?:avail|stock)',a.attrs.get('class',''),re.I)and re.search(r'склад|налич|срок',_semantic_text(a),re.I)),None)
+   nav=next((a for a in ancestors if a.tag in {'a','button'}or a.attrs.get('role')=='tab'or re.search(r'\btab(?:\s|_)|scrollto',a.attrs.get('class',''))),None)
+   money_control=bool(re.fullmatch(r'[\d\s.,₽×+−–—/-]+|упак\.?|на сумму|Добавить в корзину|В корзине|В корзину|Купить|Плати частями ×|от|\d+ платежа',text,re.I))
+   logistics_control=bool(re.fullmatch(r'Доставка в регион|(?:Склад|Магазин) «[^<>]{1,80}»|Курьер|ПВЗ [А-Яа-яA-Za-z0-9 ]{1,40}|\d{1,2} [а-я]{3,12}|бесплатно|ориентировочно, дата доставки зависит от даты оплаты или подтверждения заказа|для посылок массой до \d+ кг|[А-ЯЁ][а-яё]+, (?:ул\.|пр\.|пр-кт) [А-Яа-яЁё0-9 .,-]{1,100}|нет в наличии|[\d\s.,₽]+',text,re.I))
+   geography_control=bool(re.fullmatch(r'[А-ЯЁ][а-яё-]{1,40}',text)and any('geolink'in a.attrs.get('class','')for a in ancestors))
+   stock_control=bool(re.fullmatch(r'со склада г\.[А-Яа-яЁё .-]+,?|\d+(?:[.,]\d+)? упак\.?|срок \d+(?:-\d+)? дней',text,re.I))
+   media_control=bool(re.fullmatch(r'Изображения служат только для ознакомления,|см\. техническую документацию|Видео',text))
+   if media is not None and re.search(r'hosting',n.attrs.get('class','')):
+    from urllib.parse import urlsplit
+    media_control=any(text.casefold()==(urlsplit(v.attrs.get('href','')).hostname or'').removeprefix('www.').split('.')[0]for v in media.parent.descendants()if v.tag=='a')
+   related_target=False
+   if related is not None and n.tag=='a'and n.attrs.get('href'):
+    for group in ancestors:
+     if group is related:break
+     same=[v for v in group.descendants()if v.tag=='a'and v.attrs.get('href')==n.attrs.get('href')]
+     if len(same)>=2 and any(any(c.tag=='img'for c in v.descendants())for v in same):related_target=True;break
+   control_path=next((a for a in ancestors if tuple(a.path())in bound_control_paths),None)
+   if control_path is None and purchase and text in {'+','−','-'}and n.tag=='button':
+    control_path=next((a for a in ancestors[:3]if any(v.path()==purchase['input_path']for v in a.descendants())),None)
+   if not claim and offers is not None and money_control and control_path is not None:role='purchase_control';context=control_path
+   elif not claim and logistics is not None and(logistics_control or geography_control):role='logistics';context=logistics
+   elif not claim and avail is not None and stock_control:role='stock';context=avail
+   elif not claim and media is not None and media_control:role='media';context=media
+   elif not claim and related is not None and (text=='Мы рекомендуем'or related_target):role='related_navigation';context=related
+   elif not claim and nav is not None and (re.fullmatch(r'Описание|Отзывы|Все параметры|Все характеристики|Фото|Видео|Чертежи|Технические параметры|Скачать в PDF',text,re.I)):role='navigation';context=nav
+   elif n.tag in {'h2','h3'}and text=='Видео'and n.parent is not None and any(re.search(r'video',v.attrs.get('href',''))for v in n.parent.descendants()):role='media_heading'
+   elif n.tag in {'h2','h3'}and re.fullmatch(r'Технические параметры|Разрешительная документация|Сроки доставки|Цена и наличие в магазинах',text):role='section_heading'
+   elif re.fullmatch(r'Товар не подлежит обязательной сертификации и декларированию\.',text):role='unrequested_certification_reference'
+  fragment=parser.source[n.start:n.end]
+  entries.append(dict(path=n.path(),text=text,text_sha256=hashlib.sha256(text.encode()).hexdigest(),fragment_sha256=hashlib.sha256(fragment.encode()).hexdigest(),role=role,feature_indices=refs,context_path=context.path(),context_sha256=hashlib.sha256(parser.source[context.start:context.end].encode()).hexdigest()))
+ if len(entries)>8192:raise ValueError('http_claim_coverage_limit')
+ ledger=dict(version=1,role='http_product_claim_coverage',owner_path=owner.path(),owner_sha256=hashlib.sha256(parser.source[owner.start:owner.end].encode()).hexdigest(),entries=entries)
+ return features,ledger
+
+
+def _factory_field_roles(owner,features,purchase=None,*,inline_identity=False):
+ """Exact source leaf roles, not label-based immunity for arbitrary fields."""
+ nodes={tuple(n.path()):n for n in owner.descendants() if _semantic_visible(n)}
+ entries=[]
+ for feature in features:
+  paths=[tuple(feature[k]) for k in ('label_path','value_path')]
+  left,right=[nodes.get(p) for p in paths];role='technical';binding={}
+  if left is not None and right is not None and ((not left.children and not right.children)or inline_identity):
+   value=re.sub(r'\s+',' ',_semantic_text(right)).strip()
+   if _semantic_text(left).strip().rstrip(':：').casefold() in {'номенклатурный номер','sku','код товара','внутренний код'} and (prop(right,'sku')or(inline_identity and any(prop(v,'sku')for v in right.descendants()))) and re.fullmatch(r'[A-Za-zА-Яа-я0-9._/-]{3,128}',value):
+    observed=[n for n in nodes.values() if prop(n,'sku')]
+    if len(observed)==1 and (observed[0] is right or(inline_identity and observed[0]in list(right.descendants()))):role='seller_sku';binding={'value':value,'path':right.path()}
+   elif _semantic_text(left).strip().rstrip(':：').casefold() in {'остаток','количество на складе','stock','stock quantity'} and prop(right,'inventoryLevel') and re.fullmatch(r'\d+(?:[.,]\d+)?(?:\s*(?:уп|упак|шт)\.?)?',value,re.I):
+    role='stock';binding={'value':value,'path':right.path()}
+   elif all(n.tag=='a' and n.attrs.get('href') for n in (left,right)) and {_semantic_text(left).strip(),value}<={'Описание','Отзывы','Характеристики','Description','Reviews','Specifications'}:
+    role='navigation';binding={'label':_semantic_text(left).strip(),'value':value,'paths':[left.path(),right.path()]}
+  if purchase is not None and role=='technical':
+   from decimal import Decimal
+   for quote in purchase['quotations']:
+    root=nodes.get(tuple(quote['price_path']))
+    if root is None or left is None or right is None:continue
+    descendants=list(root.descendants())
+    if left not in descendants or right not in descendants:continue
+    full=re.sub(r'\s+',' ',_semantic_text(root)).strip()
+    pure=re.fullmatch(r'([\d \u00a0\u202f]+(?:[.,]\d{1,2})?)\s*(?:₽|руб\.?|RUB)(?:\s*/\s*(\d+(?:[.,]\d+)?)?\s*(уп|упак|упаковка|упаковки)\.?)?',full,re.I)
+    if pure and Decimal(re.sub(r'\s','',pure[1]).replace(',','.'))==Decimal(quote['amount']) and (not pure[3] or Decimal((pure[2]or'1').replace(',','.'))==Decimal(quote['denominator'])):
+     role='current_price';binding={'quote':quote,'path':root.path(),'text':full};break
+  entries.append({'feature':feature,'role':role,'binding':binding})
+ return {'version':1,'role':'source_bound_field_roles','owner_path':owner.path(),'entries':entries}
+
+def _factory_prose_blocks(owner,*,typed_leaf_paths=(),http_caption=False):
  """Retain untyped prose, separately from declared fields/navigation/stock.
 
  No keyword decides whether a free-form product assertion matters. Unknown
@@ -285,11 +470,13 @@ def _factory_prose_blocks(owner):
  blocks=[]
  for n in nodes:
   if not _semantic_visible(n):continue
+  if not n.children and tuple(n.path()) in typed_leaf_paths:continue
   direct=re.sub(r'\s+',' ',' '.join(v for v in n.text if isinstance(v,str))).strip()
   if not direct:continue
   ancestors=[];parent=n
   while parent is not None and parent is not owner.parent:ancestors.append(parent);parent=parent.parent
   if any(a.tag in {'script','style'} or re.fullmatch(r'(?:Снять фильтр|Remove filter)',a.attrs.get('title',''),re.I) for a in ancestors):continue
+  if http_caption and any(re.search(r'image[-_]warning',a.attrs.get('class',''))for a in ancestors)and direct in {'Изображения служат только для ознакомления,','см. техническую документацию'}:continue
   stock_role=any(a.attrs.get('data-name') in stock_keys for a in ancestors)
   if stock_role:
    stock_enum={'Склады поставщика','Склад интернет-магазина','Есть в наличии','Нет в наличии','Под заказ','Склады','На складах поставщиков','Торгово-выставочные залы и электромаркеты','Наличие товара по области'}
@@ -316,45 +503,111 @@ def _factory_prose_blocks(owner):
   blocks.append(direct)
  return blocks
 
-def _factory_owned_candidate(parser,product,actual_url):
+def _factory_owned_candidate(parser,product,actual_url,*,validated_purchase=None,validated_owner=None,caption_cells=False):
  """Neutral current purchase facts joined to active technical evidence.
 
  The rejection-only join does not itself admit cash. AggregateOffer amounts
  are ignored; only independently visible selected purchase facts are used.
  """
- frame=_metadata_sibling_identity(parser,product,actual_url,with_owner=True)
+ frame=_metadata_sibling_identity(parser,product,actual_url,with_owner=True,validated_owner=validated_owner)
  if not frame:return None
- from .factory_reference import lookup_reference,FactoryEvidenceError
- try:reference=lookup_reference(frame['manufacturer'],frame['article'])
- except (FactoryEvidenceError,OSError,ValueError):return None
- if not reference:return None
+ from .factory_reference import lookup_reference,read_reference,FactoryEvidenceError
+ from .manufacturer_aliases import manufacturer_equal
+ try:
+  reference=lookup_reference(frame['manufacturer'],frame['article'])
+  if not reference:return None
+  correlated=frame.pop('_catalogue_candidate',False)
+  if correlated:
+   technical=read_reference(reference)
+   if technical['article']!=frame['article'] or not manufacturer_equal(technical['manufacturer'],frame['manufacturer']):return None
+   frame['identity_basis']='catalogue_correlated_manufacturer_code'
+   frame['catalogue_correlated_identity']=dict(version=1,role='catalogue_correlated_manufacturer_code',article=frame['article'],manufacturer=frame['manufacturer'],reference=reference,review=technical['review'],supplier_scope_sha256=validated_owner['scope_sha256'],supplier_text_sha256=hashlib.sha256(validated_owner['text'].encode()).hexdigest())
+ except (FactoryEvidenceError,OSError,ValueError,KeyError,TypeError):return None
+ catalogue_rows=frame.pop('_catalogue_rows',[])
+ manufacturer_rows=frame.pop('_manufacturer_rows',[])
+ manufacturer_nodes=frame.pop('_manufacturer_nodes',[])
+ manufacturer_values=frame.pop('_manufacturer_values',set())
  owner=frame.pop('_owner');purchase_card=frame.pop('_purchase_owner');owned=[n for n in owner.descendants() if _semantic_visible(n)]
  from ..source_quote import owned_purchase_facts
- purchase=owned_purchase_facts(frame['text'])
+ if validated_purchase is None:
+  purchase=owned_purchase_facts(frame['text'])
+ else:
+  # Only the source reader supplies this already rederived, typed witness.
+  # Structural factory ownership must be identical to its financial owner.
+  if validated_owner is None or any(frame.get(k)!=validated_owner.get(k) for k in ('title','article')) or frame['text']!=validated_owner.get('text','').strip():return None
+  if owner.path()!=validated_owner.get('scope_path') or hashlib.sha256(parser.source[owner.start:owner.end].encode()).hexdigest()!=validated_owner.get('scope_sha256'):return None
+  if correlated:
+   frame['code_observations']=validated_owner['code_observations']
+  if validated_purchase.get('price_denominator')!=1:return None
+  purchase={'reason':'','raw_amount':float(validated_purchase['raw_amount']),'sale_unit':validated_purchase['sale_unit']}
  from ..price_capture import _unit
  if purchase['reason'] or _unit(purchase['sale_unit'])!='уп':return None
- inputs=[n for n in owned if n.tag=='input' and n.attrs.get('type')=='number' and ('data-count-per-pack' in n.attrs or 'data-pack-size' in n.attrs)]
- if len(inputs)!=1:return None
- control=inputs[0]
- if {control.attrs.get('data-count-per-pack'),control.attrs.get('data-pack-size')}!={'1'}:return None
- # The two packaging fields must belong to this product's purchase control,
- # independently of min/value/MOQ. A transport table cannot qualify it.
- product_id=purchase_card.attrs.get('data-prod-id') or purchase_card.attrs.get('data-product-id')
- parent=control.parent;purchase_owner=None
- while parent is not None:
-  descendants=list(parent.descendants())
-  buttons=[n for n in descendants if _semantic_visible(n) and n.tag in {'button','span','a'} and re.fullmatch(r'(?:В корзину|Купить|Add to cart|Buy)',n.value().strip(),re.I)]
-  if buttons and product_id and all((n.attrs.get('data-prod-id') or n.attrs.get('data-product-id'))==product_id for n in buttons):purchase_owner=parent;break
-  if parent is owner:break
-  parent=parent.parent
- if purchase_owner is None:return None
+ declared=[n for n in owned if 'data-count-per-pack' in n.attrs or 'data-pack-size' in n.attrs]
+ package_candidate=None;pack_counts=None
+ if not declared:
+  if validated_purchase is None:return None
+  # Existing typed quotation already binds the SAME owner, input and action.
+  regions=[n for n in owned if n.path()==validated_purchase['row_path']]
+  fields=[n for n in owned if n.path()==validated_purchase['input_path']]
+  actions=[n for n in owned if n.path()==validated_purchase['purchase_control_path']]
+  if len(regions)!=1 or len(fields)!=1 or len(actions)!=1 or fields[0]not in regions[0].descendants()or actions[0]not in regions[0].descendants():return None
+  purchase_owner=regions[0]
+  package_candidate=dict(version=1,role='factory_package_inference_candidate',purchase_contract=validated_purchase)
+ else:
+  inputs=[n for n in owned if n.tag=='input' and n.attrs.get('type')=='number' and ('data-count-per-pack' in n.attrs or 'data-pack-size' in n.attrs)]
+  if len(inputs)!=1 or len(declared)!=1:return None
+  control=inputs[0]
+  if {control.attrs.get('data-count-per-pack'),control.attrs.get('data-pack-size')}!={'1'}:return None
+  # The two packaging fields must belong to this product's purchase control,
+  # independently of min/value/MOQ. A transport table cannot qualify it.
+  product_id=purchase_card.attrs.get('data-prod-id') or purchase_card.attrs.get('data-product-id')
+  parent=control.parent;purchase_owner=None
+  while parent is not None:
+   descendants=list(parent.descendants())
+   buttons=[n for n in descendants if _semantic_visible(n) and n.tag in {'button','span','a'} and re.fullmatch(r'(?:В корзину|Купить|Add to cart|Buy)',n.value().strip(),re.I)]
+   if buttons and product_id and all((n.attrs.get('data-prod-id') or n.attrs.get('data-product-id'))==product_id for n in buttons):purchase_owner=parent;break
+   if parent is owner:break
+   parent=parent.parent
+  if purchase_owner is None:return None
+  pack_counts={'count_per_pack':control.attrs['data-count-per-pack'],'pack_size':control.attrs['data-pack-size']}
+ typed_leaf_paths=set()
+ for root in manufacturer_nodes:
+  for node in root.descendants():
+   if not node.children and _semantic_visible(node) and re.sub(r'\s+',' ',_semantic_text(node)).strip() in manufacturer_values:typed_leaf_paths.add(tuple(node.path()))
+ for row,_ in manufacturer_rows:
+  for node in row.descendants():
+   if not node.children and _semantic_visible(node) and re.sub(r'\s+',' ',_semantic_text(node)).strip() in (manufacturer_values|{'Бренд','Производитель','Manufacturer','Brand'}):typed_leaf_paths.add(tuple(node.path()))
+ if correlated:
+  for row in catalogue_rows:
+   for node in row.descendants():
+    if not node.children and _semantic_visible(node) and re.sub(r'\s+',' ',_semantic_text(node)).strip() in {frame['article'],'Артикул','Модель','Article','Model'}:typed_leaf_paths.add(tuple(node.path()))
+ if validated_purchase is not None:
+  # Only complete leaf literals at the already rederived quotation paths.
+  # An ancestor containing a price never gains prose-suppression authority.
+  from decimal import Decimal
+  for quote in validated_purchase['quotations']:
+   for node in owned:
+    if node.children or node.path() not in (quote['price_path'],quote['denominator_path']):continue
+    text=re.sub(r'\s+',' ',_semantic_text(node)).strip()
+    pure=re.fullmatch(r'([\d \u00a0\u202f]+(?:[.,]\d{1,2})?)\s*(?:₽|руб\.?|RUB)(?:\s*/\s*(\d+(?:[.,]\d+)?)?\s*(уп|упак|упаковка|упаковки)\.?)?',text,re.I)
+    if pure and Decimal(re.sub(r'\s','',pure[1]).replace(',','.'))==Decimal(quote['amount']) and (not pure[3] or Decimal((pure[2]or'1').replace(',','.'))==Decimal(quote['denominator'])):typed_leaf_paths.add(tuple(node.path()))
  frame['factory_features']=_factory_features(owner)
- frame['factory_prose_blocks']=_factory_prose_blocks(owner)
+ if caption_cells:frame['factory_features'],frame['factory_node_ledger']=_http_product_claims(parser,owner,validated_purchase)
+ frame['factory_field_roles']=_factory_field_roles(owner,frame['factory_features'],validated_purchase,inline_identity=caption_cells)
+ for entry in frame['factory_field_roles']['entries']:
+  if entry['role']!='technical':
+   for key in ('label_path','value_path'):
+    path=tuple(entry['feature'][key]);node=next((n for n in owned if tuple(n.path())==path),None)
+    if node is not None and not node.children:typed_leaf_paths.add(path)
+ frame['factory_prose_blocks']=_factory_prose_blocks(owner,typed_leaf_paths=typed_leaf_paths,http_caption=caption_cells)
  frame['factory_owner_text']=_semantic_text(owner).strip()
  if len(frame['factory_owner_text'])>200000:return None
- frame.update(scope_path=owner.path(),scope_sha256=hashlib.sha256(parser.source[owner.start:owner.end].encode()).hexdigest(),listed_price=purchase['raw_amount'],sale_unit=purchase['sale_unit'],factory_reference=reference,pack_counts={'count_per_pack':control.attrs['data-count-per-pack'],'pack_size':control.attrs['data-pack-size']},purchase_scope_sha256=hashlib.sha256(parser.source[purchase_owner.start:purchase_owner.end].encode()).hexdigest(),merchant_requisites={},merchant_assertions=[])
+ frame.update(scope_path=owner.path(),scope_sha256=hashlib.sha256(parser.source[owner.start:owner.end].encode()).hexdigest(),listed_price=purchase['raw_amount'],sale_unit=purchase['sale_unit'],factory_reference=reference,purchase_scope_sha256=hashlib.sha256(parser.source[purchase_owner.start:purchase_owner.end].encode()).hexdigest(),merchant_requisites={},merchant_assertions=[])
+ if pack_counts is not None:frame['pack_counts']=pack_counts
+ if package_candidate is not None:frame['factory_package_candidate']=package_candidate
  return frame
 
+@_immutable_dom
 def main_product(text,actual_url,*,check_controls=True,admission_only=False):
  """Positive scope only; unknown layouts and multiple products go to render."""
  parser=MainParser(text,check_controls);nodes=[n for n in parser.root.descendants() if _semantic_visible(n)]
@@ -532,8 +785,42 @@ def save_response(response,requested_url):
  return record,{'ref':reference,'record_sha256':hashlib.sha256(payload.encode()).hexdigest(),'body_sha256':record['body_sha256']}
 
 
+def http_primary_source(reference):
+ """Bind existing immutable HTTP bytes to the structural purchase reader."""
+ try:
+  ref=reference.get('ref','')
+  if not re.fullmatch(r'http_cards/[a-f0-9]{32}\.json',ref):return None
+  path=CACHE_DIR/ref
+  if path.is_symlink()or path.parent.is_symlink()or path.resolve().parent!=CACHE_DIR.resolve()/'http_cards'or path.stat().st_size>3*1024*1024:return None
+  raw=path.read_bytes();record=json.loads(raw)
+  if hashlib.sha256(raw).hexdigest()!=reference.get('record_sha256')or record.get('body_sha256')!=reference.get('body_sha256')or type(record.get('version'))is not int or record['version']!=1 or type(record.get('status'))is not int or record['status']!=200:return None
+  return dict(role='http_primary_dom',ref=ref,record_sha256=reference['record_sha256'],body_sha256=reference['body_sha256'],observed_at=record['observed_at'])
+ except (OSError,ValueError,TypeError,KeyError):return None
+
+def _validated_http_owner(evidence):
+ try:
+  if type(evidence)is not dict or set(evidence)!={'role','ref','record_sha256','body_sha256','observed_at'}or evidence.get('role')!='http_primary_dom':return None
+  canonical=http_primary_source(evidence)
+  if canonical!=evidence:return None
+  raw=(CACHE_DIR/evidence['ref']).read_bytes();record=json.loads(raw);body=base64.b64decode(record['body_base64'],validate=True)
+  if len(body)>2*1024*1024 or hashlib.sha256(body).hexdigest()!=evidence['body_sha256']:return None
+  owned=_neutral_owner(body.decode(record.get('encoding')or'utf-8'),record['url'])
+  if not owned:return None
+  record.pop('body_base64');record['role']='http_primary_dom'
+  return record,owned
+ except (OSError,ValueError,TypeError,KeyError,RecursionError):return None
+
 def read_source(evidence,*,allow_rendered=False):
  """Read only a bounded owned capture, never an arbitrary client filesystem path."""
+ if type(evidence)is dict and evidence.get('role')=='http_primary_dom':
+  keys={'role','ref','record_sha256','body_sha256','observed_at'};meta={'scope_path','scope_sha256','code_profile','identity_basis','code_observations'}
+  if set(evidence)-keys-meta or not keys<=set(evidence):return None
+  retained=_read_rendered_source({k:evidence[k]for k in keys})
+  if not retained:return None
+  observed=retained[1]
+  for key in meta & set(evidence):
+   if evidence[key]!=('owned_codes_v1'if key=='code_profile'else observed.get(key)):return None
+  return retained
  if type(evidence) is dict and evidence.get('role')=='rendered_primary_dom':return _read_rendered_source(evidence) if allow_rendered is True else None
  try:
   ref=evidence.get('ref','')
@@ -552,6 +839,9 @@ def read_source(evidence,*,allow_rendered=False):
   if len(body)>2*1024*1024 or hashlib.sha256(body).hexdigest()!=record['body_sha256'] or record['body_sha256']!=evidence.get('body_sha256'):return None
   if type(record.get('version')) is not int or record['version']!=1 or type(record.get('status')) is not int or record['status']!=200:return None
   observed=main_product(body.decode(record.get('encoding') or 'utf-8',errors='replace'),record['url'],check_controls=False)
+  if observed is None:
+   primary=http_primary_source(evidence)
+   return _read_rendered_source(primary)if primary else None
   record.pop('body_base64',None)
   value=(record,observed)
   with _PARSED_LOCK:
@@ -784,7 +1074,203 @@ def _read_render_frame(reference):
  if hashlib.sha256(raw).hexdigest()!=reference['sha256'] or type(frame.get('version')) is not int or frame.get('version')!=1 or frame.get('role')!='main_card_facts' or frame.get('observed_at')!=reference['observed_at']:raise ValueError('rendered_frame_changed')
  return frame
 
-def _read_rendered_source(evidence):
+# Neutral capture projection: deliberately mirrors _MAIN_FACTS_READINESS_JS.
+# Full DOM is retained separately; this text projection is never cash authority.
+def _capture_excluded(node):
+ while node is not None:
+  a=node.attrs;style=re.sub(r'\s+','',a.get('style','')).lower()
+  opacity=re.search(r'(?:^|;)opacity:([+-]?(?:\d+(?:\.\d*)?|\.\d+))(?:!important)?(?:;|$)',style)
+  if (node.tag in {'aside','nav','footer','dialog'} or a.get('role')=='dialog' or 'hidden'in a
+      or a.get('aria-hidden')=='true' or 'data-related-products'in a or 'data-recommendations'in a
+      or any(re.fullmatch(r'related[-_]products|recommendations|recommended[-_]products|product[-_]recommendations|cart[-_]modal',c,re.I)for c in a.get('class','').split())
+      or 'display:none'in style or 'visibility:hidden'in style or 'visibility:collapse'in style
+      or opacity and float(opacity[1])<=0):return True
+  node=node.parent
+ return False
+
+def _capture_text(node,*,complete=False):
+ context=_DOM_CALCULATIONS.get()
+ values=context.setdefault('capture_projection',{})if context is not None else None
+ key=(node,complete)
+ if values is not None and key in values:return values[key]
+ value=_capture_text_uncached(node,complete=complete)
+ if values is not None:
+  size=len(value)*4
+  if context['text_bytes']+size<=8*1024*1024:values[key]=value;context['text_bytes']+=size
+ return value
+
+def _capture_text_uncached(node,*,complete=False):
+ if _capture_excluded(node) or node.tag in {'script','style','template'}:return ''
+ if not complete and (node.tag in {'del','s'} or any(v in node.attrs.get('class','')for v in ('oldPrice','old-price','economy','saving'))):return ''
+ result=[];boundary=None
+ for child in node.text:
+  if isinstance(child,Node):
+   if _capture_excluded(child):continue
+   level=int(child.tag[1])if re.fullmatch('h[1-6]',child.tag)else None
+   control=child.attrs.get('role')in {'tab','button'}or node.attrs.get('role')=='tablist'
+   if not complete and level and not control and _RELATED_SECTION.fullmatch(''.join(_capture_text(c)if isinstance(c,Node)else c for c in child.text).strip()):boundary=level;continue
+   if boundary is not None:
+    if level and level<=boundary:boundary=None
+    else:continue
+   result.append(_capture_text(child,complete=complete))
+  elif boundary is None:result.append(child)
+ value=''.join(result)
+ return '\n'+value+'\n'if node.tag in {'div','p','section','article','h1','h2','h3','h4','h5','h6','br','li','dt','dd','tr','td','th'}else value
+
+@_immutable_dom
+def _neutral_owner(html,url):
+ """Structural, requested-data-free owner. Does not admit a price."""
+ parser=MainParser(html,check_controls=False);all_nodes=list(parser.root.descendants())
+ headings=[n for n in all_nodes if n.tag=='h1']
+ if len(headings)!=1 or _capture_excluded(headings[0]):return None
+ heading=headings[0];title=_capture_text(heading).strip()
+ products=[n for n in all_nodes if itemtype(n,'Product') and not any(p.tag in {'aside','nav','footer','dialog'}or p.attrs.get('role')=='dialog'or'data-related-products'in p.attrs or'data-recommendations'in p.attrs for p in _ancestors(n))]
+ if len(products)>1:return None
+ owner=heading
+ while owner is not None and not(itemtype(owner,'Product')or owner.tag in {'form','main'}):owner=owner.parent
+ if owner is not None and products and owner not in products:return None
+ sibling=False
+ if owner is None and not products:
+  declared=[n for n in all_nodes if n.attrs.get('data-product-id','').strip()and not _capture_excluded(n)]
+  if len(declared)!=1:return None
+  owner=declared[0];sibling=True
+  if any(n.tag=='h1'for n in owner.descendants()):return None
+ if owner is None or _capture_excluded(owner):return None
+ text=(_capture_text(heading).strip()+'\n'if sibling else '')+_capture_text(owner)
+ codes=list(dict.fromkeys(m[1]for m in re.finditer(r'(?:^|\n)\s*(?:Артикул(?: производителя| товара)?|арт\.|Код производителя|Article|SKU|Manufacturer code)\s*[:：]?\s*\n?\s*([A-Za-zА-Яа-я0-9._-]{3,})(?=\s|$)',text,re.I)))
+ if len(codes)>1:return None
+ article=codes[0]if codes else ''
+ if sibling and (not article or article.casefold()not in [v.casefold()for v in re.split(r'[^A-Za-zА-Яа-я0-9._-]+',title)]):return None
+ own=[n for n in owner.descendants()if not _capture_excluded(n)]
+ typed=[]
+ def retain(role,label,value):
+  if not re.fullmatch(r'[A-Za-zА-Яа-я0-9._/-]{3,256}',value):return False
+  item=dict(role=role,label=label,value=value)
+  if item not in typed:typed.append(item)
+  return len(typed)<=32
+ for n in own:
+  if prop(n,'model')or prop(n,'mpn')or prop(n,'sku'):
+   value=(n.attrs.get('content')or _capture_text(n).strip())
+   role='manufacturer_code'if prop(n,'mpn')else 'model'if prop(n,'model')else 'seller_sku'
+   if not retain(role,'itemprop:'+('mpn'if role=='manufacturer_code'else'model'if role=='model'else'sku'),value):return None
+ for role in ('manufacturer_code','model','seller_sku'):
+  if len({v['value']for v in typed if v['role']==role})>1:return None
+ manufacturers={v['value']for v in typed if v['role']=='manufacturer_code'}
+ if manufacturers and article and manufacturers!={article}:return None
+ # A printed generic article may be a declared model while SKU remains distinct.
+ models=[n for n in own if prop(n,'model')]
+ if models and article:
+  if len(models)!=1 or models[0].tag=='meta' or _capture_text(models[0]).strip()!=article:return None
+  parent=models[0].parent;labelled=False
+  from ..purchase_scope import labelled_article_value
+  while parent is not None and parent is not owner:
+   value=re.sub(r'\s+',' ',_capture_text(parent)).strip()
+   if len(value)>200:break
+   if labelled_article_value(value)==article:labelled=True;break
+   parent=parent.parent
+  if not labelled:return None
+ if sibling:
+  # Canonical structured identity is corroboration, never cash authority.
+  structured=[]
+  for n in all_nodes:
+   if n.tag=='script'and n.attrs.get('type','').lower()=='application/ld+json':
+    data=json.loads(''.join(v for v in n.text if isinstance(v,str)))
+    def walk(v,depth=0):
+     if depth>32:raise ValueError('structured_depth')
+     if isinstance(v,dict):
+      if v.get('@type')=='Product':structured.append(v)
+      for c in v.values():walk(c,depth+1)
+     elif isinstance(v,list):
+      for c in v:walk(c,depth+1)
+    walk(data)
+  if len(structured)!=1:return None
+  product=structured[0];brand=product.get('brand')or{};name=product.get('name');sku=str(product.get('sku')or'')
+  if (product.get('url')!=canonical_card_url(url)or sku!=article or not isinstance(name,str)
+      or title not in {name,name+' '+str(brand.get('name',''))+' '+sku}):return None
+  canonicals=[n.attrs.get('href','')for n in all_nodes if n.tag=='link'and'canonical'in n.attrs.get('rel','').split()]
+  if not canonicals or {canonical_card_url(urljoin(url,v))for v in canonicals}!={canonical_card_url(url)}:return None
+ return dict(title=title,article=article,text=text,identity_basis='manufacturer_code'if manufacturers else'legacy_article'if article else'title_only',code_observations=typed,
+             scope_path=owner.path(),scope_sha256=hashlib.sha256(parser.source[owner.start:owner.end].encode()).hexdigest(),
+             _parser=parser,_owner=owner,_nodes=own,_heading=heading,_sibling=sibling,
+             complete_visible_text=(_capture_text(heading,complete=True).strip()+'\n'if sibling else '')+_capture_text(owner,complete=True))
+
+def _ancestors(node):
+ while node is not None:yield node;node=node.parent
+
+def _validated_rendered_owner(evidence):
+ if type(evidence)is dict and evidence.get('role')=='http_primary_dom':return _validated_http_owner(evidence)
+ """Private immutable structural reader; deliberately acyclic/no cash admission."""
+ try:
+  keys={'role','ref','record_sha256','body_sha256','main_facts'}
+  if type(evidence)is not dict or set(evidence)not in (keys,keys|{'photo_binding'})or evidence.get('role')!='rendered_primary_dom'or not re.fullmatch(r'rendered_cards/[a-f0-9]{32}\.json',evidence.get('ref','')):return None
+  root=CACHE_DIR.resolve();path=CACHE_DIR/evidence['ref']
+  if path.parent.is_symlink()or path.is_symlink()or path.resolve().parent!=root/'rendered_cards'or path.stat().st_size>4*1024*1024:return None
+  raw=path.read_bytes()
+  if hashlib.sha256(raw).hexdigest()!=evidence['record_sha256']:return None
+  record=json.loads(raw);body=base64.b64decode(record['body_base64'],validate=True)
+  if (set(record)!={'version','role','representation','requested_url','url','observed_at','encoding','body_base64','body_sha256','frame'}or type(record['version'])is not int or record['version']!=1
+      or record['role']!='rendered_primary_dom'or record['representation']!='visibility_annotated_dom'or record['encoding']!='utf-8'or len(body)>2*1024*1024
+      or hashlib.sha256(body).hexdigest()!=record['body_sha256']or record['body_sha256']!=evidence['body_sha256']):return None
+  stamp=record['observed_at']
+  if type(stamp)not in (int,float)or not math.isfinite(stamp)or not 0<stamp<=time.time()+300 or canonical_card_url(record['url'])!=record['url']or record['requested_url']!=record['url']:return None
+  frame=_read_render_frame(evidence['main_facts']);base={k:evidence[k]for k in ('role','ref','record_sha256','body_sha256')}
+  if (frame.get('rendered_source')!=base or record['frame']!={k:frame.get(k)for k in _RENDER_FRAME}or frame.get('document_url')!=record['url']or frame.get('observed_at')!=stamp
+      or frame.get('owner_bound')is not True or frame.get('owner_truncated')is not False):return None
+  if any(type(frame.get(k))is not str for k in ('document_url','main_title','article','owner_text','purchase_text')):return None
+  owned=_neutral_owner(body.decode('utf-8'),record['url'])
+  norm=lambda v:re.sub(r'\s+',' ',v).strip()
+  if not owned or owned['title']!=frame['main_title']or owned['article']!=frame['article']or norm(owned['text'])!=norm(frame['owner_text']):return None
+  # Raw independent projection retained, not replaced with frame.owner_text.
+  record.pop('body_base64');return record,owned
+ except (OSError,ValueError,TypeError,KeyError,LookupError,RecursionError):return None
+
+def _legacy_structural_owner(evidence,record,owned):
+ """Acyclic tree for an already verified legacy owner, not price admission."""
+ path=CACHE_DIR/evidence['ref']
+ if path.is_symlink()or path.parent.is_symlink()or path.resolve().parent not in {CACHE_DIR.resolve()/'rendered_cards',CACHE_DIR.resolve()/'http_cards'}or path.stat().st_size>4*1024*1024:raise ValueError('legacy_source_boundary')
+ with path.open('rb')as stream:raw=stream.read(4*1024*1024+1)
+ if len(raw)>4*1024*1024 or hashlib.sha256(raw).hexdigest()!=evidence['record_sha256']:raise ValueError('legacy_source_changed')
+ retained=json.loads(raw);body=base64.b64decode(retained['body_base64'],validate=True)
+ if hashlib.sha256(body).hexdigest()!=record['body_sha256']:raise ValueError('legacy_body_changed')
+ html=body.decode('utf-8');parser=MainParser(html,check_controls=False)
+ scopes=[n for n in parser.root.descendants()if n.path()==owned.get('scope_path')]
+ if len(scopes)!=1:raise ValueError('legacy_owner_scope')
+ owner=scopes[0]
+ if hashlib.sha256(html[owner.start:owner.end].encode()).hexdigest()!=owned.get('scope_sha256'):raise ValueError('legacy_owner_changed')
+ return dict(owned,_owner=owner,_nodes=_owned_nodes(owner),_parser=parser)
+
+def _read_rendered_source(evidence,*,identity_only=False):
+ legacy=_legacy_read_rendered_source(evidence,identity_only=identity_only)
+ if legacy:
+  if not identity_only:
+   try:
+    from .owned_purchase_row import _primary_structured_contract
+    from decimal import Decimal
+    record,owned=legacy
+    _primary_structured_contract(record,_legacy_structural_owner(evidence,record,owned),{Decimal(str(owned['listed_price']))})
+   except (OSError,ValueError,TypeError,KeyError,RecursionError):return None
+  return legacy
+ retained=_validated_rendered_owner(evidence)
+ if not retained:return None
+ record,owned=retained
+ if identity_only:return record,{k:v for k,v in owned.items()if not k.startswith('_')}
+ from .owned_purchase_row import _parse_validated_owner
+ quote=_parse_validated_owner(record,owned)
+ if not quote:return None
+ enriched={}
+ products=[n for n in owned['_parser'].root.descendants() if itemtype(n,'Product')]
+ if len(products)==1:
+  factory=_factory_owned_candidate(owned['_parser'],products[0],record['url'],validated_purchase=quote,validated_owner=owned,caption_cells=record.get('role')=='http_primary_dom')
+  if factory:
+   enriched={k:factory[k] for k in ('manufacturer','factory_features','factory_field_roles','factory_prose_blocks','factory_owner_text','factory_reference','purchase_scope_sha256')}
+   for key in ('pack_counts','factory_package_candidate','factory_node_ledger'):
+    if key in factory:enriched[key]=factory[key]
+   if factory.get('identity_basis')=='catalogue_correlated_manufacturer_code':
+    enriched.update(identity_basis=factory['identity_basis'],catalogue_correlated_identity=factory['catalogue_correlated_identity'])
+ return record,{**{k:v for k,v in owned.items()if not k.startswith('_')},**enriched,'listed_price':float(quote['raw_amount']),'sale_unit':quote['sale_unit'],'purchase_contract':quote,'merchant_requisites':{},'merchant_assertions':[]}
+
+
+def _legacy_read_rendered_source(evidence,*,identity_only=False):
  from .product_identity import canonical_card_url
  import math
  try:
@@ -799,17 +1285,23 @@ def _read_rendered_source(evidence):
   if type(stamp) not in (int,float) or not math.isfinite(stamp) or not 0<stamp<=time.time()+300 or canonical_card_url(record['url'])!=record['url'] or record['url']!=record['requested_url']:return None
   frame=_read_render_frame(evidence['main_facts']);base={k:evidence[k] for k in ('role','ref','record_sha256','body_sha256')}
   if frame.get('rendered_source')!=base or record['frame']!={k:frame.get(k) for k in _RENDER_FRAME} or frame.get('document_url')!=record['url'] or frame['owner_bound'] is not True or frame['owner_truncated'] is not False:return None
-  digest='rendered:'+evidence['record_sha256']
+  digest=('identity-rendered:'if identity_only else'rendered:')+evidence['record_sha256']
   with _PARSED_LOCK:
    cached=_PARSED.get(digest)
    if cached is not None:_PARSED.move_to_end(digest)
-  owned=copy.deepcopy(cached[1]) if cached is not None else main_product(body.decode('utf-8'),record['url'],check_controls=False)
+  owned=copy.deepcopy(cached[1]) if cached is not None else main_product(body.decode('utf-8'),record['url'],check_controls=False,admission_only=identity_only)
   if cached is None and owned is not None:
    with _PARSED_LOCK:
     _PARSED[digest]=(None,copy.deepcopy(owned));_PARSED.move_to_end(digest)
     while len(_PARSED)>64:_PARSED.popitem(last=False)
   norm=lambda value:re.sub(r'\s+',' ',value).strip()
-  if not owned or owned['title']!=frame['main_title'] or owned['article']!=frame['article'] or norm(owned['text'])!=norm(frame['owner_text']):return None
+  from ..source_quote import primary_text
+  expected_text=primary_text(frame['owner_text'])if identity_only else frame['owner_text']
+  actual_text=primary_text(owned['text'])if owned and identity_only else owned['text']if owned else ''
+  if not owned or owned['title']!=frame['main_title'] or owned['article']!=frame['article'] or norm(actual_text)!=norm(expected_text):return None
+  if identity_only:owned={**owned,'text':actual_text}
+  if identity_only:
+   record.pop('body_base64');return record,owned
   from ..source_quote import owned_purchase_facts
   parsed=owned_purchase_facts(owned['text']);visible=owned_purchase_facts(frame['purchase_text'] or frame['owner_text'])
   if parsed!=visible:return None
@@ -818,6 +1310,18 @@ def _read_rendered_source(evidence):
   return record,owned
  except (OSError,ValueError,TypeError,KeyError,LookupError,RecursionError):return None
 
+
+_RETAINED_PHOTO_INPUT=ContextVar('native_retained_photo_input',default=None)
+
+from contextlib import contextmanager
+@contextmanager
+def _retained_photo_scope(capability):
+ """Private native import capability; never a caller-supplied root flag."""
+ from .retained_document_import import _photo_root
+ _photo_root(capability,getattr(capability,'photo',None))
+ token=_RETAINED_PHOTO_INPUT.set(capability)
+ try:yield
+ finally:_RETAINED_PHOTO_INPUT.reset(token)
 
 def rendered_photo_valid(evidence,context,reference):
  """Attachment validity only; missing bytes never erase the financial DOM."""
@@ -833,5 +1337,149 @@ def rendered_photo_valid(evidence,context,reference):
   if any(after.get(k)!=frame.get(k) for k in _RENDER_FRAME if k!='observed_at') or after.get('rendered_source',{}).get('body_sha256')!=record['body_sha256'] or not stamp<=context['captured_at']<=after['observed_at'] or after['observed_at']-stamp>30:return False
   from ..review_context import context_valid
   root=CACHE_DIR.resolve();photo=Path(reference);photo=photo if photo.is_absolute() else CACHE_DIR/photo
+  capability=_RETAINED_PHOTO_INPUT.get()
+  if photo.is_absolute() and photo.resolve().parent!=root and capability is not None:
+   from .retained_document_import import _photo_root
+   root=_photo_root(capability,photo)
   return not photo.is_symlink() and photo.resolve().parent==root and photo.stat().st_size<=20*1024*1024 and context_valid(context,str(photo),record['url'],photo.read_bytes())
  except (OSError,ValueError,TypeError,KeyError,LookupError,RecursionError):return False
+
+def read_identity_source(evidence):
+ """Owned immutable identity only; grants no financial/source-price admission."""
+ return _read_rendered_source(evidence,identity_only=True)
+
+@_immutable_dom
+def primary_characteristics(html, *, title, code):
+ """Characteristics ownership only; never reinterpret SKU as a maker article."""
+ from ..purchase_scope import labelled_article_value
+ parser=MainParser(html,check_controls=False)
+ products=[n for n in parser.root.descendants() if itemtype(n,'Product') and _semantic_visible(n)]
+ if len(products)!=1:return None
+ product=products[0];own=_owned_nodes(product);owned=set(own)
+ value=lambda n:re.sub(r'\s+',' ',_owned_value(n,owned)).strip()
+ headings=[n for n in own if n.tag=='h1']
+ if len(headings)!=1 or value(headings[0])!=title:return None
+ def foreign(node):
+  while node is not product:
+   if node is None:return True
+   roles=' '.join(node.attrs.get(k,'') for k in ('class','id','role','aria-label','title'))
+   if re.search(r'variant|вариант|related|recommend|рекоменд|packag|shipping|упаков|доставк',roles,re.I):return True
+   if node is not product and 'itemscope'in node.attrs:return True
+   node=node.parent
+  return False
+ models=[n for n in own if prop(n,'model')]
+ if len(models)!=1 or models[0].tag=='meta' or foreign(models[0]) or value(models[0])!=code:return None
+ node=models[0].parent;labelled=False
+ while node is not None and node is not product:
+  text=value(node)
+  if len(text)>200:break
+  if labelled_article_value(text)==code:labelled=True;break
+  node=node.parent
+ if not labelled:return None
+ mpns={n.attrs.get('content') or value(n) for n in own if prop(n,'mpn')}
+ if mpns and mpns!={code}:return None
+ sku={n.attrs.get('content') or value(n) for n in own if prop(n,'sku')}
+ if len(sku)>1:return None
+ printed={labelled_article_value(value(n)) for n in own if len(value(n))<=200}
+ if printed-{code,''}:return None
+ technical=False;lengths=[]
+ for n in own:
+  if re.fullmatch(r'h[2-6]',n.tag):technical=bool(re.fullmatch(r'Технические (?:параметры|характеристики)|Характеристики|(?:Technical )?specifications',value(n),re.I))
+  elif re.fullmatch(r'Упаковка|Габариты упаковки|Размеры упаковки|Варианты(?: товара| исполнения)?|Другие варианты|Рекомендации|Похожие товары|Сопутствующие товары|Packaging|Package dimensions|Variants?',value(n),re.I):technical=False
+  if n.tag!='tr':continue
+  cells=[c for c in n.children if c.tag in {'td','th'}]
+  if not cells or value(cells[0]).casefold() not in {'длина','length'}:continue
+  if len(cells)<2 or any(c not in owned for c in cells[:2]):return None
+  if any(c.attrs.get(a,'1').strip()!='1' for c in cells for a in ('rowspan','colspan')):return None
+  for extra in cells[2:]:
+   if extra.tag!='td' or extra.children or any(not isinstance(t,str) or t.strip() for t in extra.text):return None
+   if set(extra.attrs)-{'class','id','rowspan','colspan'}:return None
+  if not technical or foreign(cells[1]):return None
+  match=re.fullmatch(r'(\d+(?:[.,]\d+)?)\s*(мм|см|м)',value(cells[1]),re.I)
+  if not match:return None
+  length=float(match[1].replace(',','.'))*{'мм':.001,'см':.01,'м':1}[match[2].casefold()]
+  if not math.isfinite(length) or length<=0:return None
+  lengths.append(dict(metres=length,label=value(cells[0]),value=value(cells[1]),node_path=n.path()))
+ if len(lengths)!=1:return None
+ return dict(model=code,sku=sorted(sku),length=lengths[0])
+
+_CHAR_MAX_FILES=4096
+_CHAR_MAX_BYTES=16*1024*1024
+_CHAR_INDEX={}
+_CHAR_LOCK=threading.Lock()
+
+def locate_primary_characteristics(*,url,observed_at,title,article,source_sha256,primary=False):
+ """Exact immutable frame lookup; an incomplete index never proves uniqueness."""
+ folder=CACHE_DIR/'main_facts';root=CACHE_DIR.resolve()
+ try:
+  if folder.is_symlink() or folder.resolve().parent!=root:return None,'characteristics_index_unsafe'
+  epoch=folder.stat().st_mtime_ns
+  paths=[]
+  for visited,path in enumerate(folder.iterdir(),1):
+   if visited>_CHAR_MAX_FILES:return None,'characteristics_index_bound'
+   if re.fullmatch(r'[a-f0-9]{32}\.json',path.name):paths.append(path)
+  paths.sort()
+  with _CHAR_LOCK:
+   index=_CHAR_INDEX.setdefault(str(root),dict(seen=set(),by_key={},by_primary_key={},bytes=0))
+   index.update(last_reads=0,last_bytes=0,metadata_files=len(paths))
+   if index['bytes']>_CHAR_MAX_BYTES:return None,'characteristics_index_bound'
+   for path in paths:
+    if path.name in index['seen']:continue
+    if len(index['seen'])>=_CHAR_MAX_FILES:return None,'characteristics_index_bound'
+    if path.is_symlink() or not path.is_file():return None,'characteristics_index_unsafe'
+    size=path.stat().st_size
+    if size>1024*1024 or index['bytes']+size>_CHAR_MAX_BYTES:return None,'characteristics_index_bound'
+    with path.open('rb') as file:raw=file.read(1024*1024+1)
+    index['bytes']+=len(raw);index['last_bytes']+=len(raw);index['last_reads']+=1
+    if len(raw)>1024*1024:return None,'characteristics_index_bound'
+    if index['bytes']>_CHAR_MAX_BYTES:return None,'characteristics_index_bound'
+    index['seen'].add(path.name)
+    try:frame=json.loads(raw)
+    except (ValueError,TypeError):continue
+    if (frame.get('version')!=1 or frame.get('role')!='main_card_facts' or frame.get('owner_bound')is not True
+        or frame.get('owner_truncated')is not False or type(frame.get('owner_text'))is not str
+        or type(frame.get('rendered_source'))is not dict):continue
+    key=(frame.get('document_url'),frame.get('observed_at'),frame.get('main_title'),frame.get('article'),hashlib.sha256(frame['owner_text'].encode()).hexdigest())
+    try:hash(key)
+    except TypeError:continue
+    evidence={**frame['rendered_source'],'main_facts':dict(ref='main_facts/'+path.name,sha256=hashlib.sha256(raw).hexdigest(),observed_at=frame.get('observed_at'))}
+    index['by_key'].setdefault(key,[]).append(evidence)
+    from ..source_quote import primary_text
+    primary_key=key[:-1]+(hashlib.sha256(primary_text(frame['owner_text']).encode()).hexdigest(),)
+    index['by_primary_key'].setdefault(primary_key,[]).append(evidence)
+   if folder.stat().st_mtime_ns!=epoch:return None,'characteristics_index_changed'
+   matches=index['by_primary_key'if primary else'by_key'].get((url,observed_at,title,article,source_sha256),[])
+   if len(matches)!=1:return None,'characteristics_source_ambiguous' if matches else 'characteristics_source_missing'
+   return copy.deepcopy(matches[0]),''
+ except (OSError,ValueError,TypeError):return None,'characteristics_source_missing'
+
+def read_primary_characteristics_source(evidence,*,expected_code):
+ """Typed primary characteristics only. Does not grant price or identity admission."""
+ try:
+  if type(evidence)is not dict or set(evidence)!={'role','ref','record_sha256','body_sha256','main_facts'} or evidence.get('role')!='rendered_primary_dom' or not re.fullmatch(r'rendered_cards/[a-f0-9]{32}\.json',evidence.get('ref','')):return None
+  root=CACHE_DIR.resolve();path=CACHE_DIR/evidence['ref']
+  if path.parent.is_symlink() or path.is_symlink() or path.resolve().parent!=root/'rendered_cards' or path.stat().st_size>4*1024*1024:return None
+  raw=path.read_bytes()
+  if hashlib.sha256(raw).hexdigest()!=evidence['record_sha256']:return None
+  record=json.loads(raw);body=base64.b64decode(record['body_base64'],validate=True)
+  if (set(record)!={'version','role','representation','requested_url','url','observed_at','encoding','body_base64','body_sha256','frame'}
+      or type(record['version'])is not int or record['version']!=1 or record['role']!='rendered_primary_dom' or record['representation']!='visibility_annotated_dom'
+      or record['encoding']!='utf-8' or len(body)>2*1024*1024 or hashlib.sha256(body).hexdigest()!=record['body_sha256'] or record['body_sha256']!=evidence['body_sha256']):return None
+  stamp=record['observed_at']
+  if type(stamp)not in (int,float) or not math.isfinite(stamp) or not 0<stamp<=time.time()+300 or canonical_card_url(record['url'])!=record['url'] or record['url']!=record['requested_url']:return None
+  frame=_read_render_frame(evidence['main_facts']);base={k:evidence[k] for k in ('role','ref','record_sha256','body_sha256')}
+  if (frame.get('rendered_source')!=base or record['frame']!={k:frame.get(k) for k in _RENDER_FRAME}
+      or frame.get('document_url')!=record['url'] or frame.get('requested_url')!=record['url'] or frame.get('observed_at')!=stamp
+      or frame.get('article')!=expected_code or frame.get('owner_bound')is not True or frame.get('owner_truncated')is not False):return None
+  html=body.decode('utf-8');owned=main_product(html,record['url'],check_controls=False,admission_only=True)
+  norm=lambda value:re.sub(r'\s+',' ',value).strip()
+  if not owned or owned['title']!=frame['main_title'] or norm(owned['text'])!=norm(frame['owner_text']):
+   owned=_neutral_owner(html,record['url'])
+   if not owned or owned['title']!=frame['main_title']or norm(owned['text'])!=norm(frame['owner_text']):return None
+  manufacturer_codes={v['value'] for v in owned.get('code_observations',[]) if v.get('role')=='manufacturer_code'}
+  if manufacturer_codes and manufacturer_codes!={expected_code}:return None
+  characteristics=primary_characteristics(html,title=frame['main_title'],code=expected_code)
+  if not characteristics:return None
+  # Preserve the parser's separately typed legacy article/SKU; never overwrite it.
+  record.pop('body_base64');return record,dict(owned,text=frame['owner_text'],characteristics=characteristics)
+ except (OSError,ValueError,TypeError,KeyError,LookupError,RecursionError):return None

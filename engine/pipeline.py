@@ -63,7 +63,12 @@ class JobInputs:
 
 def run_pipeline(job: JobState, inputs: JobInputs, browser_factory) -> None:
     from .search.catalogue_projection import catalogue_scope
+    from .search.document_context import active_document_operation
+    operation=active_document_operation()
     if inputs.catalogue_store is not None:
+        if operation is not None:
+            with operation.publication(job,inputs),catalogue_scope(inputs.catalogue_store,snapshot=inputs.catalogue_snapshot):
+                return _run_pipeline_scoped(job,inputs,browser_factory)
         with catalogue_scope(inputs.catalogue_store,snapshot=inputs.catalogue_snapshot):
             return _run_pipeline_scoped(job,inputs,browser_factory)
     return _run_pipeline_scoped(job,inputs,browser_factory)
@@ -83,6 +88,9 @@ def _run_pipeline_scoped(job: JobState, inputs: JobInputs, browser_factory) -> N
         res.sources_found = found.sources_found
         res.sources_target = found.sources_target
 
+    from .search.document_context import active_document_operation
+    operation=active_document_operation()
+    output_root=operation.output_dir if operation is not None else OUTPUT_DIR
     staged_outputs={};published=[];staging=None
     def check_output_control():
         from .search.session import bounded_timeout
@@ -90,7 +98,7 @@ def _run_pipeline_scoped(job: JobState, inputs: JobInputs, browser_factory) -> N
     def stage_path(name):
         nonlocal staging
         check_output_control()
-        if staging is None:staging=tempfile.TemporaryDirectory(prefix='.final-',dir=OUTPUT_DIR)
+        if staging is None:staging=tempfile.TemporaryDirectory(prefix='.final-',dir=output_root)
         return Path(staging.name)/name
     try:
         job.status = "running"
@@ -237,7 +245,7 @@ def _run_pipeline_scoped(job: JobState, inputs: JobInputs, browser_factory) -> N
             _catalogue_final_preflight([r.position for r in results],inputs.catalogue_snapshot,inputs.catalogue_known_indices,inputs.catalogue_store)
         final_outputs={}
         for kind,value in staged_outputs.items():
-            check_output_control();source=Path(value);destination=OUTPUT_DIR/source.name
+            check_output_control();source=Path(value);destination=output_root/source.name
             os.link(source,destination);published.append((source,destination))
             check_output_control();final_outputs[kind]=str(destination)
         check_output_control()
@@ -264,5 +272,8 @@ def run_pipeline_async(job: JobState, inputs: JobInputs, browser_factory) -> thr
     from contextvars import copy_context
     context=copy_context()
     t = threading.Thread(target=context.run, args=(run_pipeline,job,inputs,browser_factory), daemon=True)
+    from .search.document_context import active_document_operation
+    operation=active_document_operation()
+    if operation is not None:operation.bind_worker(job,t)
     t.start()
     return t

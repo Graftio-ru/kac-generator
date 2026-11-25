@@ -20,6 +20,10 @@ def current_literal_quote(facts, *, financial_outcome=None):
     if not retained or not retained[1]:
         return None
     record, owned = retained
+    if record.get('role')=='http_primary_dom':
+        from .http_card import http_primary_source
+        source=http_primary_source(source)
+        if source is None:return None
     title, text = owned['title'], owned['text']
     if (canonical_card_url(record['url']) != canonical_card_url(facts['url'])
             or record['observed_at'] != facts['captured_at']
@@ -28,16 +32,30 @@ def current_literal_quote(facts, *, financial_outcome=None):
         return None
     if len(text) > 20000:
         return None
-    purchase = owned_purchase_facts(text)
-    listed, sale = purchase['raw_amount'], purchase['sale_unit']
-    if purchase['reason'] or listed != owned['listed_price']:
-        return None
+    typed_purchase=owned.get('purchase_contract')
+    if typed_purchase is not None:
+        # read_source has independently rederived this exact owned quotation.
+        if typed_purchase.get('version')!=2 or typed_purchase.get('role')!='current_owned_purchase_row':
+            return None
+        listed,sale=typed_purchase['raw_amount'],typed_purchase['sale_unit']
+        if listed!=owned['listed_price']:
+            return None
+    else:
+        purchase = owned_purchase_facts(text)
+        listed, sale = purchase['raw_amount'], purchase['sale_unit']
+        if purchase['reason'] or listed != owned['listed_price']:
+            return None
     if owned.get('factory_reference'):
         from .factory_reference import derive_singleton,FactoryEvidenceError
         position=dict(name=facts['expected_name'],type_mark=facts['expected_type_mark'],unit=facts['expected_unit'])
         try:proof=derive_singleton(source,position)
         except (FactoryEvidenceError,OSError,ValueError,KeyError):return None
         data=dict(product_title=title,matches_requested_product=True,match_reason='Заводской артикул и состав: выведенная эквивалентность одной упаковки комплекту',listed_price_with_vat=listed,price_unit=sale,price_with_vat=listed,package_quantity=1,listed_price_covers_multiple_requested_units=True,factory_unit_proof=proof)
+        if typed_purchase is not None:
+            from .owned_purchase_row import derive
+            row=derive(source,url=facts['url'],observed_at=facts['captured_at'],title=title,article=identity.get('main_article',''),text=text)
+            if not row or row.get('version')!=2:return None
+            data['purchase_row_v2']=row
         evidence=observe_captured_quote(text,actual_url=facts['url'],observed_at=facts['captured_at'],url=facts['url'],title=title,article=identity.get('main_article',''),listed=listed,normalized=listed,sale_unit=sale,requested_unit=facts['expected_unit'],data=data,expected_name=facts['expected_name'],expected_mark=facts['expected_type_mark'])
         view=dict(data,url=facts['url'],identity_evidence=identity,source_quote_evidence=evidence,normalized_price_unit=facts['expected_unit'])
         return data if evidence and not quote_review_reason(view,position) else None

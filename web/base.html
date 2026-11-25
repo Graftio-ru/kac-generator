@@ -30,11 +30,12 @@
   <div class="card">
     <h2><span class="step">1</span> Параметры</h2>
     <div class="row">
-      <div>
+      <div data-local-only>
         <label>Адрес локального движка</label>
         <input type="text" id="engine" value="http://127.0.0.1:8765" />
         <div class="hint" id="engineStatus">проверка…</div>
       </div>
+      <div data-server-only hidden><div class="hint" id="serverStatus" role="status">Подключение к сервису…</div></div>
       <div>
         <label>Дисциплина по умолчанию</label>
         <select id="discipline"><option>ЭМ</option><option>АК</option></select>
@@ -96,11 +97,13 @@
   </div>
 
   <p class="sub" style="text-align:center">
-    UI и движок работают локально на вашей машине. База цен общая со Сметчиком.
+    <span data-local-only>UI и движок работают локально на вашей машине. База цен общая со Сметчиком.</span><span data-server-only hidden>Рабочие данные сохраняются на сервере. Для работы достаточно открыть этот сайт.</span>
   </p>
 </div>
 <div class="lightbox" id="lightbox"><img id="lightboxImg" src="" alt=""></div>
 <script>window.POS = { showSearch: true, showTsn: false, baseBadge: false };</script>
+<script src="runtime-config.js"></script>
+<script src="static/research-status.js"></script>
 <script src="common.js"></script>
 <script src="base.js"></script>
 </body>

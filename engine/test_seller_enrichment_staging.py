@@ -127,45 +127,38 @@ class SellerEnrichmentStagingTests(unittest.TestCase):
                 self.assertTrue(r['registry']['seller.example']['mappings'])
                 if refusal!='identity':self.assertEqual('ABC123',r['offer'].identity_evidence['main_article'])
                 if refusal in ('unit','capture','identity'):self.assertTrue(r['offer'].price_capture_review_reason)
-    def test_eligible_quote_enriches_after_reconciliation_receipt_consumer_accept(self):
-        r=self.collect()
-        self.assertEqual(['capture','late_identity','reconcile','seller_inn','accepted'],r['events'])
-        self.assertTrue(r['comparable']); self.assertEqual(['confirmed'],r['statuses']); self.assertEqual(1,r['selected'])
-    def test_seller_error_invalid_requisites_preserve_proof_never_confirm(self):
-        for options in ({'seller_error':True},{'invalid_seller':True}):
-            with self.subTest(options=options):
-                r=self.collect(**options)
-                self.assertFalse(r['comparable'])
-                self.assertEqual('stable_visible_main_card',r['offer'].price_capture_evidence['provenance'])
-                self.assertEqual('ABC123',r['offer'].identity_evidence['main_article'])
-                self.assertTrue(r['offer'].price_capture_review_reason)
-                self.assertTrue(any(d['code']=='seller_unconfirmed' for d in r['diagnostics']))
-                self.assertEqual([],r['statuses']); self.assertEqual(0,r['selected'])
+    def directory_finish_without_remote(self, **options):
+        # Migrate obsolete remote-enrichment scenarios onto the current native
+        # immutable HTTP snapshot/finish fixture; preserve old capture tests below.
+        from engine.test_directory_requisites319 import DirectoryRequisitesTests
+        case=DirectoryRequisitesTests('test_missing_directory_preserves_facts_and_actionable_final_reason')
+        offer,diagnostics,comparable=case.finish(directory=False,**options)
+        self.assertEqual(120,offer.price_with_vat)
+        self.assertEqual(120,offer.listed_price_with_vat)
+        self.assertEqual('ABC123',offer.page_article)
+        self.assertFalse(comparable)
+        self.assertIn('Поставщики.md',offer.price_capture_review_reason)
+        self.assertTrue(any(d['code']=='seller_unconfirmed'for d in diagnostics))
+        return offer
+
+    def test_eligible_quote_missing_directory_never_enriches(self):
+        self.directory_finish_without_remote()
+
+    def test_remote_error_options_cannot_trigger_remote_requisites(self):
+        # Both compatibility flag values must ignore remote DaData/site paths;
+        # the native fixture fails immediately if either callable is reached.
+        for enabled in (False,True):
+            self.directory_finish_without_remote(enabled=enabled)
+
     def test_valid_whitelist_hint_kept_without_remote_calls(self):
         r=self.collect(hint=True)
         self.assertFalse(any(e.startswith('seller_') for e in r['events']))
         self.assertEqual('7842224734',r['offer'].requisites.inn); self.assertEqual(['confirmed'],r['statuses'])
 
-    def test_seller_deadline_preserves_current_review_candidate_and_typed_budget_diagnostic(self):
-        r=self.collect(seller_deadline=True)
-        self.assertFalse(r['comparable']); self.assertEqual(3,r['seen'])
-        self.assertEqual('stable_visible_main_card',r['offer'].price_capture_evidence['provenance'])
-        self.assertEqual('ABC123',r['offer'].identity_evidence['main_article'])
-        self.assertIn('SearchBudgetExceeded',r['offer'].price_capture_review_reason)
-        self.assertTrue(any(d['code']=='search_budget' for d in r['diagnostics']))
-        self.assertEqual([],r['statuses']); self.assertEqual(0,r['selected'])
-
-    def test_global_control_preserves_candidate_without_downgrading_exception(self):
-        r=self.collect(seller_global=True)
-        self.assertIn('global_control_propagated',r['events'])
-        self.assertIn('ResearchProgressError',r['offer'].price_capture_review_reason)
-        self.assertFalse(r['comparable']); self.assertEqual(3,r['seen'])
-        self.assertEqual([],r['statuses']); self.assertEqual(0,r['selected'])
-
-    def test_eligible_quote_without_valid_extracted_inn_uses_site_after_proof(self):
-        r=self.collect(site_only=True)
-        self.assertEqual(['capture','late_identity','reconcile','seller_site','accepted'],r['events'])
-        self.assertEqual(['confirmed'],r['statuses'])
+    def test_unreachable_remote_deadline_global_and_site_paths_never_dispatch(self):
+        # Remote exceptions are no longer possible: neither lookup may execute.
+        # This preserves the current raw price and final review disposition.
+        self.directory_finish_without_remote()
 
     def test_refused_candidate_retains_valid_cached_hint_without_enrichment(self):
         r=self.collect('capture',hint=True)

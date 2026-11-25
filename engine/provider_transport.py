@@ -41,6 +41,39 @@ class ProviderAttempt:
     endpoint_send_started: bool
     proven_presend: bool
     attempt_started_at: float = 0.0
+    transport_category: str = 'unknown'
+    transport_errno: int | None = None
+    transport_http_status: int | None = None
+
+def safe_transport_details(error):
+    """Finite typed facts only; never read exception text, request or headers."""
+    unknown=dict(transport_category='unknown',transport_errno=None,transport_http_status=None)
+    try:
+        import errno, socket, ssl
+        pending=[error];seen=set();chain=[]
+        while pending:
+            current=pending.pop()
+            if current is None or id(current) in seen:continue
+            if len(chain)>=16:return unknown
+            seen.add(id(current));chain.append(current)
+            pending.extend((BaseException.__cause__.__get__(current),BaseException.__context__.__get__(current)))
+        categories=set();numbers=set();statuses=set()
+        known_errno=set(errno.errorcode)|{getattr(socket,n)for n in dir(socket)if n.startswith('EAI_')and type(getattr(socket,n))is int}
+        for current in chain:
+            if isinstance(current,socket.gaierror):categories.add('dns')
+            elif isinstance(current,ssl.SSLError):categories.add('tls')
+            elif isinstance(current,httpx.ProxyError):categories.add('proxy')
+            elif isinstance(current,(httpx.TimeoutException,TimeoutError)):categories.add('timeout')
+            elif isinstance(current,httpx.HTTPStatusError):
+                status=current.response.status_code
+                if type(status)is int and 100<=status<=599:statuses.add(status);categories.add('http_status')
+            if isinstance(current,OSError)and type(current.errno)is int and current.errno in known_errno:numbers.add(current.errno)
+        if len(categories)>1 or len(numbers)>1 or len(statuses)>1:return unknown
+        category=next(iter(categories),'unknown')
+        if category=='unknown'and any(isinstance(c,(httpx.ConnectError,ConnectionError))for c in chain):category='connect'
+        return dict(transport_category=category,transport_errno=next(iter(numbers),None),transport_http_status=next(iter(statuses),None))
+    except BaseException:return unknown
+
 
 def _permanent_connection(error):
     import ssl, socket
@@ -126,7 +159,10 @@ def _check_retry_configuration(client, url):
         from .llm import LLMUnavailable
         raise LLMUnavailable('API модели: неподдерживаемые внутренние повторы транспорта')
 
-def _request_trace(client, request):
+def _request_trace(client, request, *, run_guard=None, provider=None):
+    if run_guard is not None and run_guard.run_limits is not None:
+        from .search.session import bounded_timeout
+        run_guard.check();bounded_timeout(1)
     trace = _CURRENT_TRACE.get()
     if trace is not None:
         from .llm import model_transport_timeout
@@ -147,6 +183,15 @@ def _request_trace(client, request):
         _check_retry_configuration(client,request.url)
         trace.supported = _supported(client,request.url)
         request.extensions['trace'] = trace
+    # Mechanical admission is independent of optional transport trace metadata.
+    if run_guard is not None and run_guard.run_limits is not None:
+        from .search.session import bounded_timeout
+        run_guard.check();bounded_timeout(1)
+        _check_retry_configuration(client,request.url)
+        try:payload=json.loads(request.content)
+        except (ValueError,TypeError,httpx.RequestNotRead):payload=None
+        run_guard.check_physical_route('cloud',provider=provider,endpoint=str(request.url))
+        run_guard.admit_physical('cloud',provider=provider,payload=payload)
 
 
 def _connection_exception(error):
@@ -231,7 +276,7 @@ def _run_provider(provider, client, operation, timeout_seconds=120):
             connection = _connection_exception(error)
             proven = trace.proof()
             attempt = ProviderAttempt(logical_id,provider,ordinal,trace.phase,'error',
-                _safe_type(error),time.time(),time.monotonic()-started,trace.endpoint_started,proven,observed)
+                _safe_type(error),time.time(),time.monotonic()-started,trace.endpoint_started,proven,observed,**safe_transport_details(error))
             attempts.append(attempt); _record(attempt)
             control=trace.admission_control or _control_cause(error)
             if control is not None:
@@ -279,8 +324,11 @@ def provider_post(url, *, provider, headers, json, timeout, proxy=None):
     if type(seconds) not in (int,float) or not math.isfinite(seconds) or seconds<=0:raise ValueError('Invalid provider wire timeout')
     options = ({'proxy':proxy,'trust_env':False,'verify':True,'follow_redirects':False}
                if proxy else {'trust_env':False} if provider == 'cloudru' else {})
+    from .llm import captured_request_guard
+    guard=captured_request_guard()
+    if guard is not None:guard.check_physical_route('cloud',provider=provider,endpoint=url)
     with httpx.Client(**options) as client:
-        client.event_hooks['request'].append(lambda request: _request_trace(client,request))
+        client.event_hooks['request'].append(lambda request: _request_trace(client,request,run_guard=guard,provider=provider))
         def request(clipped, trace):
             _check_retry_configuration(client,httpx.URL(url))
             trace.supported = _supported(client,httpx.URL(url))
@@ -291,6 +339,9 @@ def provider_post(url, *, provider, headers, json, timeout, proxy=None):
 @contextmanager
 def sdk_trace_client():
     # Keep SDK/default HTTPX routing; attach only safe trace callback to actual requests.
+    from .llm import captured_request_guard
+    guard=captured_request_guard()
+    if guard is not None:guard.check_physical_route('cloud',provider='anthropic')
     with httpx.Client() as client:
-        client.event_hooks['request'].append(lambda request: _request_trace(client,request))
+        client.event_hooks['request'].append(lambda request: _request_trace(client,request,run_guard=guard,provider='anthropic'))
         yield client

@@ -11,7 +11,17 @@ SOURCE_FILES=LEGACY_FILES+('app.py','models.py','schemas.py','offer_selection.py
     'equipment_output_policy.py','search/base_db.py','search/whitelist.py','search/session.py','search/failure_policy.py','llm.py',
     'cloudru_failover.py','search/supplier_discovery.py','search/discovery_plan.py','search/article_query_plan.py',
     'search/acquisition_lease.py','run_catalogue_acquisition.py','search/card_attachments.py','search/acquisition_recovery.py','search/http_identity_preflight.py','search/selected_proofs.py','pipeline.py','builders/research_report_xlsx.py','run_catalogue_refresh.py')
-SOURCE_FILES=SOURCE_FILES+('search/acquisition_scheduler.py','search/card_link_discovery.py')
+HISTORICAL_SOURCE_FILES=SOURCE_FILES+('search/acquisition_scheduler.py','search/card_link_discovery.py')
+PRE_FACTORY_SOURCE_FILES=HISTORICAL_SOURCE_FILES+('search/catalogue_observation_storage.py',)
+PRE_PURCHASE_SOURCE_FILES=PRE_FACTORY_SOURCE_FILES+('search/factory_reference.py',)
+PRE_LITERAL_SOURCE_FILES=PRE_PURCHASE_SOURCE_FILES+('search/owned_purchase_row.py',)
+PRE_ESTIMATOR_SOURCE_FILES=PRE_LITERAL_SOURCE_FILES+('search/literal_card_quote.py',)
+PRE_SERVER_SOURCE_FILES=PRE_ESTIMATOR_SOURCE_FILES+('search/estimator_approval.py',)
+PRE_RUNNER_SOURCE_FILES=PRE_SERVER_SOURCE_FILES+('server_auth.py','config.py',)
+PRE_SERVICE_SOURCE_FILES=PRE_RUNNER_SOURCE_FILES+('runner_control.py','runner_executor.py','runner_protocol.py',)
+PRE_METHOD_SOURCE_FILES=PRE_SERVICE_SOURCE_FILES+('runner_service.py','runner_cloud.py','runner_cloud_http.py',)
+PRE_KNOWN_CAPTURE_SOURCE_FILES=PRE_METHOD_SOURCE_FILES+('supplier_methods.py',)
+SOURCE_FILES=PRE_KNOWN_CAPTURE_SOURCE_FILES+('known_card_runner.py','search/known_capture_intent.py','search/document_context.py')
 class IntentInvalid(ValueError):pass
 
 def plain(value):return json.loads(json.dumps(value,sort_keys=True,allow_nan=False))
@@ -20,6 +30,7 @@ def hex64(value):
     if type(value) is not str or not re.fullmatch('[a-f0-9]{64}',value):raise IntentInvalid('source_intent_invalid')
 
 def components(engine, names=SOURCE_FILES):
+    """Hash the requested engine closure without importing Settings; default arguments bind the complete current authorization source set."""
     return {name:hashlib.sha256((Path(engine)/name).read_bytes()).hexdigest() for name in names}
 
 def legacy_digest(runtime, sources):
@@ -27,6 +38,7 @@ def legacy_digest(runtime, sources):
     return digest(dict(runtime,parsers=sources))
 
 def validate(value):
+    """Validate supported historical attestation shapes for reading, not execution. Current attest/verify require the complete current component set; accepting an old shape never authorizes new capture code."""
     fields={'version','runtime_sha256','components','legacy_components','legacy_sha256','receipt','sha256'}
     if type(value) is not dict or set(value)!=fields or value['version'] not in {'acquisition-source-intent-v2','acquisition-source-intent-v3','acquisition-source-intent-v4','acquisition-source-intent-v5','acquisition-source-intent-v6','acquisition-source-intent-v7'}:raise IntentInvalid('source_intent_invalid')
     for key in ('runtime_sha256','legacy_sha256','sha256'):hex64(value[key])
@@ -34,9 +46,12 @@ def validate(value):
     excluded={'acquisition-source-intent-v2':selected|{'search/acquisition_recovery.py','search/http_identity_preflight.py'},'acquisition-source-intent-v3':selected|{'search/http_identity_preflight.py'},'acquisition-source-intent-v4':selected,'acquisition-source-intent-v5':set(),'acquisition-source-intent-v6':set(),'acquisition-source-intent-v7':set()}[value['version']]
     if value['version'] not in ('acquisition-source-intent-v6','acquisition-source-intent-v7'):excluded=excluded|{'search/acquisition_scheduler.py'}
     if value['version']!='acquisition-source-intent-v7':excluded=excluded|{'search/card_link_discovery.py'}
-    names=tuple(n for n in SOURCE_FILES if n not in excluded)
+    names=tuple(n for n in HISTORICAL_SOURCE_FILES if n not in excluded)
+    current_names=SOURCE_FILES if value['version']=='acquisition-source-intent-v7' else names
     for key,names in (('components',names),('legacy_components',LEGACY_FILES)):
-        if type(value[key]) is not dict or set(value[key])!=set(names):raise IntentInvalid('source_components_invalid')
+        allowed=(set(names),set(current_names)) if key=='components' else (set(names),)
+        if key=='components' and value['version']=='acquisition-source-intent-v7':allowed=allowed+(set(PRE_FACTORY_SOURCE_FILES),set(PRE_PURCHASE_SOURCE_FILES),set(PRE_LITERAL_SOURCE_FILES),set(PRE_ESTIMATOR_SOURCE_FILES),set(PRE_SERVER_SOURCE_FILES),set(PRE_RUNNER_SOURCE_FILES),set(PRE_SERVICE_SOURCE_FILES),set(PRE_METHOD_SOURCE_FILES),set(PRE_KNOWN_CAPTURE_SOURCE_FILES))
+        if type(value[key]) is not dict or set(value[key]) not in allowed:raise IntentInvalid('source_components_invalid')
         for item in value[key].values():hex64(item)
     receipt=value['receipt']
     if receipt is not None:
@@ -56,6 +71,8 @@ def validate(value):
     return plain(value)
 
 def attest(runtime,sources,*,legacy_sources=None,receipt=None):
+    """Create an attestation only from the complete current source set; legacy route evidence is retained separately and cannot omit new authorization components."""
+    if type(sources)is not dict or set(sources)!=set(SOURCE_FILES):raise IntentInvalid('current_source_components_required')
     legacy_sources=legacy_sources or {name:sources[name] for name in LEGACY_FILES}
     value=dict(version='acquisition-source-intent-v7',runtime_sha256=digest(runtime),components=sources,
         legacy_components=legacy_sources,legacy_sha256=legacy_digest(runtime,legacy_sources),receipt=receipt)
@@ -63,6 +80,8 @@ def attest(runtime,sources,*,legacy_sources=None,receipt=None):
     return validate(value)
 
 def verify(value,runtime,sources,frontier):
+    """Require exact current runtime/source hashes and original frontier provenance; historical shape compatibility does not permit executing missing or changed modules."""
+    if type(sources)is not dict or set(sources)!=set(SOURCE_FILES):raise IntentInvalid('current_source_components_required')
     value=validate(value)
     if value['runtime_sha256']!=digest(runtime) or value['components']!=sources:raise IntentInvalid('acquisition_source_changed')
     if legacy_digest(runtime,value['legacy_components'])!=frontier['route_intent_sha256'] or value['legacy_sha256']!=frontier['route_intent_sha256']:raise IntentInvalid('original_runtime_or_sources_changed')

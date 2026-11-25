@@ -8,6 +8,85 @@ import time
 from urllib.parse import urlsplit, urlunsplit
 
 
+_CURRENT_ALTERNATIVES=ContextVar('current_position_alternatives',default=None)
+
+def policy_digest(identity,articles,names):
+    import hashlib,json
+    value=dict(version='position-alternatives-v1',identity_sha256=identity.key,original_article=identity.code,alternative_articles=articles,alternative_names=names)
+    return hashlib.sha256(json.dumps(value,sort_keys=True,ensure_ascii=True,separators=(',',':')).encode()).hexdigest()if articles or names else ''
+
+def alternative_policy(position=None):
+    from ..models import normalize_alternatives
+    import hashlib,json
+    from .catalogue import identity_for_position
+    if position is None:
+        active=_CURRENT_ALTERNATIVES.get()
+        return dict(active) if active else dict(alternative_articles=[],alternative_names=[],original_article='',sha256='')
+    field=lambda k,d='':position.get(k,d)if isinstance(position,dict)else getattr(position,k,d)
+    articles=normalize_alternatives(field('alternative_articles',[]),article=True)
+    names=normalize_alternatives(field('alternative_names',[]))
+    identity=identity_for_position(position)
+    value=dict(version='position-alternatives-v1',identity_sha256=identity.key,original_article=identity.code,alternative_articles=articles,alternative_names=names)
+    value['sha256']=policy_digest(identity,articles,names)
+    return value
+
+def legacy_article_request(position):
+    """Legacy single literal SKU has no separately typed native model to replace."""
+    field=lambda k,d=None:position.get(k,d)if isinstance(position,dict)else getattr(position,k,d)
+    return not field('source_evidence',{})and not field('review_fields',{})and bool(re.fullmatch(r'[A-Za-zА-Яа-я0-9._-]{3,}',field('type_mark','')))
+
+@contextmanager
+def request_alternatives_scope(position):
+    policy=alternative_policy(position);policy['_legacy_article']=legacy_article_request(position)
+    token=_CURRENT_ALTERNATIVES.set(policy)
+    native_token=_NATIVE_REQUEST_CONTEXT.set(_native_constraints(position))
+    try:yield
+    finally:
+        _NATIVE_REQUEST_CONTEXT.reset(native_token)
+        _CURRENT_ALTERNATIVES.reset(token)
+
+def position_alternatives(function):
+    from functools import wraps
+    @wraps(function)
+    def invoke(browser,pos,*args,**kwargs):
+        with request_alternatives_scope(pos):return function(browser,pos,*args,**kwargs)
+    return invoke
+
+def permitted_article(position,article,*,original=None):
+    policy=alternative_policy(position)
+    original=original if original is not None else policy['original_article']
+    if type(article)is not str or not article.strip():return None
+    exact=lambda value:value.strip().casefold()
+    if exact(article)==exact(original):return dict(original_article=original,observed_article=article,matched_article=original,match_basis='original',alternatives_policy_sha256=policy['sha256'])
+    for allowed in policy['alternative_articles']:
+        if exact(article)==exact(allowed):return dict(original_article=original,observed_article=article,matched_article=allowed,match_basis='estimator_alternative',alternatives_policy_sha256=policy['sha256'])
+    return None
+
+
+def owned_article_source(observation):
+    """Per-use immutable ownership, never authorization or a cached decision."""
+    from .http_card import locate_primary_characteristics,read_identity_source
+    source,reason=locate_primary_characteristics(url=observation['url'],observed_at=observation['observed_at'],title=observation['title'],article=observation['manufacturer_code'],source_sha256=observation['source_sha256'],primary=True)
+    if reason:return None
+    retained=read_identity_source(source)
+    if not retained:return None
+    record,owned=retained
+    norm=lambda value:' '.join(value.split())
+    if (record['url']!=observation['url']or record['observed_at']!=observation['observed_at']or owned['title']!=observation['title']or owned['article']!=observation['manufacturer_code']or norm(owned['text'])!=norm(observation['source_text'])):return None
+    return source
+
+
+def article_match_evidence(observation,position):
+    match=permitted_article(position,observation['manufacturer_code'])
+    if not match:return {}
+    if match['match_basis']=='estimator_alternative':
+        source=owned_article_source(observation)
+        if not source:return {}
+        match['source_binding']=source
+    match['observation_id']=observation['observation_id'];match['source_sha256']=observation['source_sha256'];match['url']=observation['url'];match['observed_at']=observation['observed_at']
+    return match
+
+
 def canonical_card_url(url):
     if not isinstance(url, str):
         return ''
@@ -144,10 +223,26 @@ def _native_constraints(position=None, *, mark=None, name=None):
     return None
 
 
-def native_comparison_mark(position=None, *, mark=None,name=None):
+def current_discovery_mark(expected,text):
+    """Only current explicit full SKU hints affect early filters; admission stays native."""
+    policy=_CURRENT_ALTERNATIVES.get()
+    if not policy:return expected
+    binding=_NATIVE_REQUEST_CONTEXT.get()
+    original=policy['original_article']
+    if expected not in {original,binding['mark']if binding else original}:return expected
+    if not binding and not policy.get('_legacy_article',False):return expected
+    if binding and not binding['article']:return expected  # A model is never an article permission.
+    matches=[value for value in policy['alternative_articles']if re.search(r'(?<![\w.-])'+re.escape(value)+r'(?![\w.-])',text,re.I)]
+    if len(matches)!=1:return expected
+    return ' / '.join(v for v in (binding['model']if binding else '',matches[0])if v)
+
+
+def native_comparison_mark(position=None, *, mark=None,name=None,article=None):
     binding=_native_constraints(position,mark=mark,name=name)
     if binding and binding['article']:
-        return ' / '.join(v for v in (binding['model'],binding['article']) if v)
+        match=permitted_article(position,article,original=binding['article'])if article else None
+        actual=article if match else binding['article']
+        return ' / '.join(v for v in (binding['model'],actual) if v)
     return (position.get('type_mark','') if isinstance(position,dict) else getattr(position,'type_mark','')) if position is not None else mark
 
 
@@ -171,7 +266,7 @@ def native_article_reason(position,title,article, *, mark=None,name=None):
     # Supplier-number labels are never passed as article. Full literal primary
     # title codes remain independent evidence, without using URL/model aliases.
     exact=lambda value: ' '.join(str(value).split()).casefold()
-    if article and exact(article)!=exact(expected):return 'Артикул производителя основного товара противоречит спецификации'
+    if article and exact(article)!=exact(expected) and not permitted_article(position,article,original=expected):return 'Артикул производителя основного товара противоречит спецификации'
     printed=bool(re.search(r'(?<![\w.-])'+re.escape(expected)+r'(?![\w.-])',title,re.I))
     if not article and not printed:return 'Артикул производителя не подтверждён основным товаром'
     if binding['model'] and binding['model']!=expected:
@@ -327,8 +422,14 @@ def valid_identity(evidence, expected_mark=None, expected_name=None, host=None, 
     if native_article_reason(request_position,title,article,mark=wanted,name=name):return False
     if source_text is not None and native_source_spec_reason(request_position,title,source_text,article,mark=wanted,name=name):return False
     native_binding=_native_constraints(request_position,mark=wanted,name=name)
-    checks_mark=' / '.join(v for v in (native_binding['model'],native_binding['article']) if v) if native_binding and native_binding['article'] else wanted
-    model_role=native_request_role(request_position)=='model' or request_position is None and _active_model_role(wanted,name)
+    matched=permitted_article(request_position,article,original=native_binding['article']if native_binding else wanted)
+    if matched and matched['match_basis']=='estimator_alternative' and not native_binding:
+        policy=alternative_policy(request_position)
+        legacy=legacy_article_request(request_position)if request_position is not None else policy.get('_legacy_article',False)
+        if not legacy or wanted!=policy['original_article']:return False
+    checked_article=(wanted if native_request_role(request_position)=='model' or native_binding and not native_binding['article'] else article if matched else native_binding['article']if native_binding else wanted)
+    checks_mark=' / '.join(v for v in (native_binding['model'],checked_article) if v) if native_binding and native_binding['article'] else checked_article
+    model_role=native_request_role(request_position)=='model' or request_position is None and _active_model_role(wanted,name) or bool(native_binding and native_binding['model'] and not native_binding['article'])
     if ((not model_role and _conflicting_page_article(checks_mark, article,request_role='unknown'))
         or _conflicting_model_code_in_title(checks_mark, title)
         or _conflicting_model_code_in_title(checks_mark, urlsplit(actual).path)
@@ -362,6 +463,10 @@ def valid_http_source(evidence):
 
 
 def http_identity(record,observed,source,expected_mark,expected_name,host):
+    if record.get('role')=='http_primary_dom':
+        from .http_card import http_primary_source
+        source=http_primary_source(source)
+        if source is None:return {}
     evidence=dict(version=1,provenance='http_main_product',source_url=canonical_card_url(record['requested_url']),canonical_url=canonical_card_url(record['url']),host=host,expected_mark=expected_mark,expected_name=expected_name,main_title=observed['title'],main_article=observed['article'],observed_at=record['observed_at'],http_source={**source,'scope_path':observed['scope_path'],'scope_sha256':observed['scope_sha256'],'code_profile':'owned_codes_v1','identity_basis':observed['identity_basis'],'code_observations':observed['code_observations']})
     return evidence if valid_identity(evidence,expected_mark,expected_name,host) else {}
 
@@ -503,3 +608,18 @@ def capture_current_identity(page, path, source_url, expected_mark, expected_nam
             return {}
     refuse('identity_stability_timeout')
     return {}
+
+def current_offer_article_evidence(offer,position):
+    """Display from a current immutable server record, never client metadata."""
+    from . import catalogue_projection as projection
+    from .catalogue import identity_for_position
+    field=lambda k,d=None:offer.get(k,d)if isinstance(offer,dict)else getattr(offer,k,d)
+    reference=field('catalogue_ref',{})or {}
+    store=projection._SCOPED_STORE.get()or projection._STORE
+    if store is None or set(reference)!={'product_id','observation_id'}:return {}
+    try:
+        if identity_for_position(position).key!=reference['product_id']:return {}
+        record=store.resolve_observation(reference['product_id'],reference['observation_id'])
+        if not record or not record['current']:return {}
+        return article_match_evidence(record['observation'],position)
+    except (KeyError,ValueError,TypeError):return {}

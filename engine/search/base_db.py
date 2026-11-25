@@ -38,6 +38,10 @@ _MATCH_SYSTEM = (
 )
 
 
+def _position_metadata(pos):
+    return dict(alternative_articles=list(pos.alternative_articles),alternative_names=list(pos.alternative_names),full_name=pos.full_name,source_evidence=pos.source_evidence,review_fields=pos.review_fields)
+
+
 def _norm_key(pos: SpecPosition) -> str:
     """Нормализованный ключ позиции: имя|марка|дисциплина (нижний регистр, схлопнутые пробелы)."""
     def n(s: str) -> str:
@@ -52,7 +56,10 @@ def _tokens(s: str) -> set[str]:
 def _refresh_context(pos):
     from ..price_capture import _unit
     unit = _unit(pos.unit) or pos.unit.strip().casefold()
-    return json.dumps([unit, float(pos.qty)], ensure_ascii=False)
+    from .product_identity import alternative_policy
+    value=[unit,float(pos.qty)];policy=alternative_policy(pos)['sha256']
+    if policy:value.append(policy)
+    return json.dumps(value,ensure_ascii=False)
 
 
 def _capture_time(offer):
@@ -145,7 +152,7 @@ def reconcile_refresh(pos, urls, observations=(), *, started_at, reason='', diag
         entry = data.get('entries', {}).get(_norm_key(pos))
         if not entry:
             entry = data.setdefault('entries', {}).setdefault(_norm_key(pos),dict(key=_norm_key(pos),
-                name=pos.name,type_mark=pos.type_mark,unit=pos.unit,qty=pos.qty,discipline=pos.discipline,
+                name=pos.name,type_mark=pos.type_mark,unit=pos.unit,qty=pos.qty,discipline=pos.discipline,**_position_metadata(pos),
                 offers=[],candidates=[],sources_found=0,sources_checked=0,validation_version=_VALIDATION_VERSION))
         receipts = entry.setdefault('refresh_receipts', {}).setdefault(_refresh_context(pos), {})
         raw = [PriceOffer(**value) for value in (entry.get('candidates') or entry.get('offers') or [])]
@@ -266,25 +273,36 @@ def _result_from_entry(entry: dict, pos: SpecPosition, year: str, quarter: str) 
                         _is_listing_url, _saved_price_unit_is_verified,
                         _conflicting_full_sku_in_url, _satro_minimum_order_conflict,
                         _needs_model_review)
-    valid = lambda offer: not (
+    def valid(offer):
+        if offer.catalogue_ref:return True  # Native current-source checks remain final authority.
+        from .product_identity import native_comparison_mark
+        mark=native_comparison_mark(pos,article=offer.page_article)
+        return not (
         _is_listing_url(offer.url)
         or _satro_minimum_order_conflict(offer.url, offer.product_title,
                                          pos.unit, pos.qty)
-        or _conflicting_explicit_article(pos.type_mark, offer.product_title, offer.url)
-        or _conflicting_model_code_in_title(pos.type_mark, offer.product_title)
-        or _conflicting_network_cable_spec(pos.name, pos.type_mark,
+        or _conflicting_explicit_article(mark, offer.product_title, offer.url)
+        or _conflicting_model_code_in_title(mark, offer.product_title)
+        or _conflicting_network_cable_spec(pos.name, mark,
                                            offer.product_title + " " + offer.page_title)
-        or _conflicting_page_article(pos.type_mark, offer.page_article)
-        or _conflicting_numeric_article(pos.type_mark, offer.product_title)
-        or _conflicting_numeric_article(pos.type_mark, offer.page_title)
-        or _conflicting_full_model_code(pos.type_mark, offer.product_title)
-        or _conflicting_full_model_code(pos.type_mark, offer.page_title)
-        or _conflicting_full_sku_in_url(pos.type_mark, offer.url)
+        or _conflicting_page_article(mark, offer.page_article)
+        or _conflicting_numeric_article(mark, offer.product_title)
+        or _conflicting_numeric_article(mark, offer.page_title)
+        or _conflicting_full_model_code(mark, offer.product_title)
+        or _conflicting_full_model_code(mark, offer.page_title)
+        or _conflicting_full_sku_in_url(mark, offer.url)
     )
     cands = [PriceOffer(**o) for o in
              (entry.get("candidates") or entry.get("offers") or [])]
+    from . import catalogue_projection as projection
+    store=projection._SCOPED_STORE.get()or projection._STORE
+    if store is not None and any(o.catalogue_ref for o in cands):
+        from .catalogue import identity_for_position
+        projected=projection.project_product(store,identity_for_position(pos),pos)
+        current={tuple(sorted(o.catalogue_ref.items())):o for o in projected.all_offers}if projected else {}
+        cands=[current.get(tuple(sorted(o.catalogue_ref.items())),o)if o.catalogue_ref else o for o in cands]
     for offer in cands:
-        offer.match_review_required = offer.match_review_required or bool(offer.product_title and _needs_model_review(
+        offer.match_review_required = offer.match_review_required or bool(not offer.catalogue_ref and offer.product_title and _needs_model_review(
             pos.type_mark, offer.product_title, offer.url, offer.page_title, offer.page_article))
         from ..price_capture import unit_capture_review_reason
         if unit_capture_review_reason(offer, pos):
@@ -391,21 +409,24 @@ def upsert(pos: SpecPosition, result: PositionResult, *, confirmed_observations=
                             _conflicting_full_sku_in_url, _satro_minimum_order_conflict)
 
         def valid(offer: PriceOffer) -> bool:
+            if offer.catalogue_ref:return True
+            from .product_identity import native_comparison_mark
+            mark=native_comparison_mark(pos,article=offer.page_article)
             return not (
                 _is_listing_url(offer.url)
                 or _satro_minimum_order_conflict(offer.url, offer.product_title,
                                                  pos.unit, pos.qty)
                 or (not offer.unit_review_required and unit_capture_review_reason(offer, pos))
-                or _conflicting_explicit_article(pos.type_mark, offer.product_title, offer.url)
-                or _conflicting_model_code_in_title(pos.type_mark, offer.product_title)
-                or _conflicting_network_cable_spec(pos.name, pos.type_mark,
+                or _conflicting_explicit_article(mark, offer.product_title, offer.url)
+                or _conflicting_model_code_in_title(mark, offer.product_title)
+                or _conflicting_network_cable_spec(pos.name, mark,
                                                    offer.product_title + " " + offer.page_title)
-                or _conflicting_page_article(pos.type_mark, offer.page_article)
-                or _conflicting_numeric_article(pos.type_mark, offer.product_title)
-                or _conflicting_numeric_article(pos.type_mark, offer.page_title)
-                or _conflicting_full_model_code(pos.type_mark, offer.product_title)
-                or _conflicting_full_model_code(pos.type_mark, offer.page_title)
-                or _conflicting_full_sku_in_url(pos.type_mark, offer.url)
+                or _conflicting_page_article(mark, offer.page_article)
+                or _conflicting_numeric_article(mark, offer.product_title)
+                or _conflicting_numeric_article(mark, offer.page_title)
+                or _conflicting_full_model_code(mark, offer.product_title)
+                or _conflicting_full_model_code(mark, offer.page_title)
+                or _conflicting_full_sku_in_url(mark, offer.url)
             )
 
         incoming = [offer.model_copy(deep=True) for offer in (result.all_offers or result.offers)]
@@ -446,7 +467,7 @@ def upsert(pos: SpecPosition, result: PositionResult, *, confirmed_observations=
         result.sources_target = settings.min_sources
         data["entries"][key] = {
             "key": key,
-            "name": pos.name, "type_mark": pos.type_mark,
+            "name": pos.name, "type_mark": pos.type_mark,**_position_metadata(pos),
             "unit": pos.unit, "discipline": pos.discipline,
             "qty": pos.qty,
             "captured_at": date.today().isoformat(),
@@ -479,7 +500,7 @@ def replace_exact(pos: SpecPosition, result: PositionResult) -> int:
             raise ValueError("Reviewed quotes failed cache validation")
         if validated.all_offers:
             data.setdefault("entries", {})[key] = {
-                "key": key, "name": pos.name, "type_mark": pos.type_mark,
+                "key": key, "name": pos.name, "type_mark": pos.type_mark,**_position_metadata(pos),
                 "unit": pos.unit, "discipline": pos.discipline,
                 "qty": pos.qty,
                 "captured_at": date.today().isoformat(),
@@ -506,6 +527,7 @@ def entries() -> list[dict]:
         out.append({
             "key": e.get("key", ""), "name": e.get("name", ""),
             "type_mark": e.get("type_mark", ""), "unit": e.get("unit", ""),
+            "alternative_articles":e.get("alternative_articles",[]),"alternative_names":e.get("alternative_names",[]),
             "discipline": e.get("discipline", ""),
             "offers_count": len(offers),
             "max_price": max(prices) if prices else 0,
@@ -549,7 +571,8 @@ def remove(key: str) -> bool:
 
 def _position_from_entry(e: dict) -> SpecPosition:
     return SpecPosition(number=1, name=e.get("name", ""), type_mark=e.get("type_mark", ""),
-                        unit=e.get("unit", "шт") or "шт",qty=e.get('qty',0), discipline=e.get("discipline", "ЭМ"))
+                        unit=e.get("unit", "шт") or "шт",qty=e.get('qty',0), discipline=e.get("discipline", "ЭМ"),
+                        alternative_articles=e.get("alternative_articles",[]),alternative_names=e.get("alternative_names",[]),full_name=e.get("full_name",e.get("name","")),source_evidence=e.get("source_evidence",{}),review_fields=e.get("review_fields",{}))
 
 
 def positions_from_xlsx(path: str | Path, default_discipline: str = "ЭМ") -> list[SpecPosition]:

@@ -1,4 +1,6 @@
 """Publish owned source captures; refresh never discovers a new supplier URL."""
+from __future__ import annotations
+
 import hashlib
 import json
 import math
@@ -6,10 +8,17 @@ import re
 import time
 import uuid
 from pathlib import Path
+from typing import TYPE_CHECKING
 from concurrent.futures import CancelledError
 
 from .catalogue import ProductIdentity, SourceObservation, ImageEvidence
 from .failure_policy import ResearchControlError
+
+if TYPE_CHECKING:
+    from ..models import PriceOffer, SpecPosition
+    from .card_batch import CardSnapshot
+    from .catalogue import Acquisition, CatalogueStore
+    from .catalogue_images import CatalogueImageStore
 
 _PUBLICATION_REASONS = {
     'catalogue_seller_binding_invalid': 'Происхождение реквизитов продавца не связано с текущим источником',
@@ -18,6 +27,7 @@ _PUBLICATION_REASONS = {
     'catalogue_owner_unconfirmed': 'Независимый основной товар не подтверждён',
     'catalogue_article_conflict': 'Артикулы одного поколения источника противоречат друг другу',
     'catalogue_generation_mismatch': 'Предложение относится к другому поколению источника',
+    'catalogue_quote_evidence_missing': 'Подтверждение цены отсутствует; независимая строка покупки не установлена',
     'catalogue_source_binding_invalid': 'Привязка исходных данных основного товара не подтверждена',
     'catalogue_source_amount_unobserved': 'Цена не наблюдается в сохранённом источнике',
     'catalogue_purchase_price_conflict': 'Выбрана другая ценовая ветка вместо текущего основного предложения',
@@ -118,11 +128,16 @@ def publish_facts(store, identity, position, facts, *, image_store, offer=None, 
     url = canonical_card_url(facts['url'])
     stamp = facts['captured_at']
     source=facts.get('http_source') or facts.get('rendered_source')
+    if source and str(source.get('ref','')).startswith('http_cards/'):
+        from .http_card import http_primary_source,read_source
+        retained=read_source(source,allow_rendered=True)
+        if retained and retained[0].get('role')=='http_primary_dom':
+            source=http_primary_source(source);facts=dict(facts,http_source=source)
     try:text=verified_owned_text(facts['text'],source,url=url,observed_at=stamp) if source else primary_text(facts['text'])
     except (ValueError,TypeError,KeyError,OSError):raise CataloguePublicationError('catalogue_source_binding_invalid') from None
-    purchase=_bound_purchase(facts,image_store)
     from .owned_purchase_row import from_facts
     row=from_facts(facts)
+    purchase=None if row and row.get('version')==2 else _bound_purchase(facts,image_store)
     raw = offer.listed_price_with_vat if offer is not None else None
     if row:
         from ..price_capture import _unit
@@ -142,6 +157,11 @@ def publish_facts(store, identity, position, facts, *, image_store, offer=None, 
     else:
         raw, currency, vat, availability, terms, conditional = _interpret(text, raw)
         sale = offer.price_unit if offer is not None else facts.get('sale_unit','')
+    if row and row.get('version')==2:
+        # Full immutable owner text stays in source_text; only the selected
+        # current quote's verified role scope supplies pricing conditions.
+        raw,currency,vat,availability,terms,conditional=_interpret(row['price_text']+'\n'+row['terms_text'],row['raw_amount'])
+        sale=row['sale_unit']
     if facts.get('rendered_source'):
         from .http_card import read_source
         source=facts['rendered_source'];retained=read_source(source,allow_rendered=True)
@@ -200,6 +220,10 @@ def publish_facts(store, identity, position, facts, *, image_store, offer=None, 
             contract=original_contract or dict(version='native-source-constraints-v1',identity_sha256=identity.key,
                 issuer=values['issuer'],reader='native_pdf',**{k:binding[k] for k in ('model','article','mark','name','requested')})
             contract={**contract,'issuer':values['issuer']}
+            from .product_identity import alternative_policy
+            policy=alternative_policy(position)
+            if policy['sha256']:
+                contract={**contract,'version':'native-source-constraints-v2','alternative_articles':policy['alternative_articles'],'alternative_names':policy['alternative_names'],'alternatives_policy_sha256':policy['sha256']}
             values['native_request_contract']=validate_native_request_contract(contract,identity,values['issuer'])
             values['validation_version']=_NATIVE_ARTICLE_INTENT
     from .purchase_preview import derive_unit_basis,has_preview_sequence
@@ -218,6 +242,12 @@ def publish_facts(store, identity, position, facts, *, image_store, offer=None, 
         values['unit_equivalence']=proof
     from .primary_availability import scoped_availability
     values['availability']=scoped_availability(text,raw,owner_bound=verified_owner,unit_basis=basis)
+    from ..price_capture import _unit
+    from .purchase_preview import valid_unit_basis
+    if (verified_owner and facts.get('main_facts') and basis is not None and valid_unit_basis(values,basis)
+        and {_unit(values['sale_unit']),_unit(position.unit)}=={'шт','м'}):
+        source=_primary_characteristics_reference(facts,image_store.root,values)
+        if source is not None:values['primary_source']=source
     identity_reason=_identity_reason(dict(values,identity=identity.payload()),position)
     if identity_reason:
         if not verified_owner:
@@ -239,11 +269,32 @@ def publish_facts(store, identity, position, facts, *, image_store, offer=None, 
         raise CatalogueConflict('Capture publication was not admitted')
     return observation
 
+def _primary_characteristics_reference(facts,root,values):
+    """Persist only independently owned characteristics, never financial admission."""
+    try:
+        from .http_card import read_primary_characteristics_source
+        from .catalogue import validate_primary_source
+        locator=facts['main_facts'];reference=locator['ref']
+        if type(reference)is not str or not re.fullmatch(r'main_facts/[a-f0-9]{32}\.json',reference):return None
+        root=Path(root).resolve();folder=root/'main_facts';path=folder/Path(reference).name
+        if folder.is_symlink() or path.is_symlink() or path.resolve().parent!=root/'main_facts' or path.stat().st_size>1024*1024:return None
+        with path.open('rb')as file:raw=file.read(1024*1024+1)
+        if len(raw)>1024*1024 or hashlib.sha256(raw).hexdigest()!=locator['sha256']:return None
+        frame=json.loads(raw);source={**frame['rendered_source'],'main_facts':dict(locator)};validate_primary_source(source)
+        retained=read_primary_characteristics_source(source,expected_code=values['manufacturer_code'])
+        if not retained:return None
+        record,owned=retained
+        if (record['url']!=values['url'] or record['observed_at']!=values['observed_at'] or locator['observed_at']!=values['observed_at']
+            or owned['title']!=values['title'] or owned['text']!=values['source_text']):return None
+        return source
+    except (OSError,ValueError,TypeError,KeyError,RecursionError):return None
+
 def _validated_snapshot_facts(position,snapshot,image_store):
     from .product_identity import valid_identity
     if hashlib.sha256(snapshot.payload.encode()).hexdigest() != snapshot.sha256:
         raise CataloguePublicationError('catalogue_snapshot_changed')
-    facts = snapshot.facts()
+    from .owned_purchase_row import validate_snapshot
+    facts = validate_snapshot(snapshot)
     proof = facts.get('identity_evidence') or {}
     if (not valid_identity(proof,expected_mark=position.type_mark,expected_name=position.name,request_position=position,source_text=facts.get('text',''))
         or proof.get('main_title') != facts.get('main_title')):
@@ -291,30 +342,79 @@ def _validated_snapshot_facts(position,snapshot,image_store):
         facts = dict(facts,page_article=actual_article)
     return facts
 
-def publish_snapshot(store, identity, position, snapshot, *, image_store, offer=None, acquisition=None, supplier_host=None, observation_id=None):
-    facts=_validated_snapshot_facts(position,snapshot,image_store)
-    proof=facts.get('identity_evidence') or {}
-    facts = dict(facts,issuer='supplier_http' if proof.get('provenance')=='http_main_product' else 'supplier_rendered')
-    if supplier_host is not None:
-        facts['supplier_host']=supplier_host
-    if offer is not None:
-        evidence = offer.source_quote_evidence or {}
-        if facts.get('purchase_text') and not evidence:
-            purchase=_bound_purchase(facts,image_store)
-            from ..price_capture import _unit
-            if (offer.listed_price_with_vat is not None and (purchase['raw_amount'] is None or not math.isclose(offer.listed_price_with_vat,purchase['raw_amount'],rel_tol=1e-8,abs_tol=.005))):raise CataloguePublicationError('catalogue_purchase_price_conflict')
-            placeholder=not purchase['sale_unit'] and offer.price_unit in ('','не указана') and offer.unit_review_required
-            if offer.price_unit and not placeholder and _unit(offer.price_unit)!=_unit(purchase['sale_unit']):raise CataloguePublicationError('catalogue_purchase_unit_conflict')
-            # A current raw unit mismatch is source evidence, not an offer
-            # receipt. Publish independently observed facts for review only.
-            offer=None
-        if offer is not None:
-            if (evidence.get('observed_at') != facts['captured_at'] or evidence.get('url') != facts['url']
+def _publication_offer(
+    facts: dict[str, object], offer: PriceOffer | None, image_store: CatalogueImageStore,
+) -> PriceOffer | None:
+    """Separate a bound quote from independently observed raw purchase facts.
+
+    A nonempty quote must match this source generation. An absent quote never
+    authorizes caller financial fields: retain only facts independently rederived from
+    the owned purchase row or legacy purchase frame. Refuse contradictory raw
+    amount/unit fields instead of silently discarding a bad caller's offer.
+    Missing both proofs is distinct from evidence of another generation.
+    """
+    if offer is None:
+        return None
+    evidence = offer.source_quote_evidence or {}
+    if evidence:
+        if (evidence.get('observed_at') != facts['captured_at']
+                or evidence.get('url') != facts['url']
                 or evidence.get('title') != facts['main_title']):
-                raise CataloguePublicationError('catalogue_generation_mismatch')
-            from ..price_capture import _unit
-            facts = dict(facts, package_quantity=evidence.get('quantity') if _unit(offer.price_unit)=='уп' else None)
-    return publish_facts(store,identity,position,facts,image_store=image_store,offer=offer,acquisition=acquisition,verified_owner=True,observation_id=observation_id)
+            raise CataloguePublicationError('catalogue_generation_mismatch')
+        return offer
+
+    from .owned_purchase_row import from_facts
+    from ..price_capture import _unit
+
+    row = from_facts(facts)
+    purchase = row if row and row.get('version') == 2 else _bound_purchase(facts, image_store)
+    if purchase is None:
+        raise CataloguePublicationError('catalogue_quote_evidence_missing')
+    raw_amount = purchase['raw_amount']
+    listed_amount = offer.listed_price_with_vat
+    if listed_amount is not None and (raw_amount is None or not math.isclose(
+            listed_amount, raw_amount, rel_tol=1e-8, abs_tol=.005)):
+        raise CataloguePublicationError('catalogue_purchase_price_conflict')
+    placeholder = (not purchase['sale_unit']
+                   and offer.price_unit in ('', 'не указана')
+                   and offer.unit_review_required)
+    if (offer.price_unit and not placeholder
+            and _unit(offer.price_unit) != _unit(purchase['sale_unit'])):
+        raise CataloguePublicationError('catalogue_purchase_unit_conflict')
+    # Do not carry normalized-price or financial-proof fields into this branch.
+    # publish_facts derives the raw observation again from the immutable source.
+    return None
+
+
+def publish_snapshot(
+    store: CatalogueStore, identity: ProductIdentity, position: SpecPosition,
+    snapshot: CardSnapshot, *, image_store: CatalogueImageStore,
+    offer: PriceOffer | None = None, acquisition: Acquisition | None = None,
+    supplier_host: str | None = None, observation_id: str | None = None,
+) -> SourceObservation:
+    """Validate a captured source and persist its facts with an optional bound quote.
+
+    Source, identity and seller validation remain mandatory for raw observations.
+    Quote absence discards caller financial fields; independently derived facts
+    remain subject to native projection. Present conflicting quote evidence fails
+    before any observation is appended.
+    """
+    facts = _validated_snapshot_facts(position, snapshot, image_store)
+    proof = facts.get('identity_evidence') or {}
+    if 'purchase_row_v2' not in facts:
+        facts = dict(facts, issuer='supplier_http' if proof.get('provenance') == 'http_main_product'
+                     else 'supplier_rendered')
+    if supplier_host is not None:
+        facts['supplier_host'] = supplier_host
+    offer = _publication_offer(facts, offer, image_store)
+    if offer is not None and 'purchase_row_v2' not in facts:
+        from ..price_capture import _unit
+        evidence = offer.source_quote_evidence
+        facts = dict(facts, package_quantity=evidence.get('quantity')
+                     if _unit(offer.price_unit) == 'уп' else None)
+    return publish_facts(store, identity, position, facts, image_store=image_store,
+                         offer=offer, acquisition=acquisition, verified_owner=True,
+                         observation_id=observation_id)
 
 def _neutral_facts(record, requested_url, root):
     """Verify the existing immutable main-facts file, not a diagnostic string."""
@@ -361,7 +461,7 @@ def capture_and_publish(store,identity,position,url,*,browser,image_store,captur
     from .card_attachments import capture_current
     if observation_id is not None and (type(observation_id) is not str or not re.fullmatch(r"[0-9a-f]{32}",observation_id)):
         raise CataloguePublicationError("catalogue_operation_id_invalid")
-    from .product_identity import _resolved_model_role, _original_native_model_role, _NATIVE_MODEL_INTENT, _NATIVE_ARTICLE_INTENT, native_request_role
+    from .product_identity import _resolved_model_role, _original_native_model_role, _NATIVE_MODEL_INTENT, _NATIVE_ARTICLE_INTENT, native_request_role, request_alternatives_scope
     from .catalogue import identity_for_position
     if native_request_role(position) in {'article','model'} and (position.source_evidence or {}).get('reader')=='native_pdf':
         expected=store.lookup(identity_for_position(position))
@@ -370,7 +470,7 @@ def capture_and_publish(store,identity,position,url,*,browser,image_store,captur
     product=store.lookup(identity)
     current=next((h['current'] for h in (product or {}).get('heads',[]) if h['url']==url and h['current']['identity']==identity.payload() and h['current']['validation_version'] in {_NATIVE_MODEL_INTENT,_NATIVE_ARTICLE_INTENT}),{})
     from .factory_reference import request_scope
-    with _resolved_model_role(current,identity), _original_native_model_role(store,identity,position),request_scope(position):
+    with request_alternatives_scope(position), _resolved_model_role(current,identity), _original_native_model_role(store,identity,position),request_scope(position):
         return _capture_and_publish_owned(store,identity,position,url,browser=browser,image_store=image_store,capture=capture,acquisition=acquisition,supplier_host=supplier_host,observation_id=observation_id,photo_only=photo_only)
 
 def _capture_and_publish_owned(store,identity,position,url,*,browser,image_store,capture=None,acquisition=None,supplier_host=None,observation_id=None,photo_only=False):
@@ -409,6 +509,10 @@ def _capture_and_publish_owned(store,identity,position,url,*,browser,image_store
                 if current is None:return None
                 from ..source_quote import primary_text,verified_owned_text
                 source=facts.get('http_source') or facts.get('rendered_source')
+                if source and str(source.get('ref','')).startswith('http_cards/'):
+                    from .http_card import http_primary_source,read_source
+                    retained=read_source(source,allow_rendered=True)
+                    if retained and retained[0].get('role')=='http_primary_dom':source=http_primary_source(source)
                 text=verified_owned_text(facts['text'],source,url=facts['url'],observed_at=facts['captured_at']) if source else primary_text(facts['text'])
                 amount,currency,vat,availability,terms,conditional=_interpret(text,raw['listed_price_with_vat'])
                 from ..price_capture import _sale_lot,_unit

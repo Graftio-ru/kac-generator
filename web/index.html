@@ -7,6 +7,7 @@
 <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
+<a href="/supplier-methods" style="display:inline-block;margin:12px">Способы получения данных поставщиков</a>
 <div class="wrap">
   <header class="app-header">
     <span class="mark">
@@ -30,11 +31,12 @@
   <div class="card">
     <h2><span class="step">1</span> Параметры и спецификация</h2>
     <div class="row">
-      <div>
+      <div data-local-only>
         <label>Адрес локального движка</label>
         <input type="text" id="engine" value="http://127.0.0.1:8765" />
         <div class="hint" id="engineStatus">проверка…</div>
       </div>
+      <div data-server-only hidden><div class="hint" id="serverStatus" role="status">Подключение к сервису…</div></div>
       <div>
         <label>Дисциплина (лист КАЦ)</label>
         <select id="discipline"><option>ЭМ</option><option>АК</option></select>
@@ -108,11 +110,13 @@
   </div>
 
   <p class="sub" style="text-align:center">
-    UI и движок работают локально на вашей машине. База цен общая с Базой-менеджером.
+    <span data-local-only>UI и движок работают локально на вашей машине. База цен общая с Базой-менеджером.</span><span data-server-only hidden>Рабочие данные сохраняются на сервере. Для работы достаточно открыть этот сайт.</span>
   </p>
 </div>
 <div class="lightbox" id="lightbox"><img id="lightboxImg" src="" alt=""></div>
 <script>window.POS = { showSearch: true, showTsn: false, baseBadge: true };</script>
+<script src="runtime-config.js"></script>
+<script src="static/research-status.js"></script>
 <script src="common.js"></script>
 <script src="app.js"></script>
 </body>

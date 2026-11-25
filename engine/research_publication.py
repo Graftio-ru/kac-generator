@@ -86,13 +86,16 @@ def valid_label(stage, raw):
     integer = lambda v: type(v) is int and 0 <= v <= 1000000000
     boolean = lambda v: type(v) is bool
     status = lambda v: v is None or (type(v) is int and 100 <= v <= 599)
+    transport = {"transport_category": enum({"unknown","dns","tls","proxy","timeout","connect","http_status"}),
+                 "transport_errno": lambda v: v is None or type(v)is int and -65535<=v<=65535,
+                 "transport_http_status": status}
     if stage == "provider_transport":
         rules = {"logical_id": identifier, "provider": enum(PROVIDERS), "ordinal": integer,
                  "phase": enum({"unknown", "tcp_connect", "tls", "proxy_tls", "proxy_connect", "endpoint_send", "endpoint_response"}),
                  "outcome": enum({"response", "error"}), "exception_type": enum(ERROR_TYPES),
                  "observed_at": finite, "elapsed_seconds": finite, "endpoint_send_started": boolean,
                  "proven_presend": boolean, "attempt_started_at": finite}
-        return shape(value, rules)
+        return shape(value, rules) or shape(value, {**rules, **transport})
     if stage == "model_output":
         return shape(value, {"provider": enum(PROVIDERS), "reason": enum({"valid_json", "invalid_json", "empty_output",
                             "truncated_output", "invalid_schema", "invalid_rows", "empty_positions", "refused_output"}),
@@ -107,7 +110,7 @@ def valid_label(stage, raw):
                     "elapsed_seconds": finite, "hint": enum({"query_no_results", "query_upstream_failure", "temporary_capacity"})}
         array = lambda rules: lambda v: isinstance(v, list) and len(v) <= 64 and all(shape(a, rules) for a in v)
         return shape(value, {"search_operation_id": identifier, "search_transport_attempt_count": integer,
-                            "search_transport_failure_count": integer, "search_transport_attempts": array(attempt),
+                            "search_transport_failure_count": integer, "search_transport_attempts": lambda v: isinstance(v,list) and len(v)<=64 and all(shape(a,attempt) or shape(a,{**attempt,**transport}) for a in v),
                             "search_transport_elapsed_seconds": finite, "response_status": status,
                             "search_response_failures": array(response)})
     return False
@@ -166,6 +169,23 @@ class IntegrationStore(ResearchStore):
 
 class BufferedPublicationError(StoreError):
     """Publisher owns the delta; retry its flush, never resend the source event."""
+
+
+class DerivedProgressGate:
+    """Inline cadence for derived rows only; never retain evidence or decisions."""
+    def __init__(self, *, clock=time.monotonic, seconds=1.):
+        self.clock, self.seconds = clock, seconds
+        self.last = None
+        self.dirty = False
+    def publish(self, build, *, force=False):
+        self.dirty = True
+        now = self.clock()
+        if not force and self.last is not None and 0 <= now-self.last < self.seconds:
+            return False
+        build()  # Failed publication remains dirty and does not advance cadence.
+        self.last = self.clock()
+        self.dirty = False
+        return True
 
 
 class DeltaPublisher:

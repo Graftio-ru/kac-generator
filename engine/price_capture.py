@@ -1083,7 +1083,7 @@ def _historical_image_unit_capture_review_reason(offer, position=None):
     identity = field('identity_evidence', {}) or {}
     if not valid_identity(identity,
             expected_mark=pos('type_mark') if position is not None else None,
-            expected_name=pos('name') if position is not None else None):
+            expected_name=pos('name') if position is not None else None,request_position=position):
         return REVIEW + ': идентичность товара не подтверждена'
     if (canonical_card_url(field('url')) != identity.get('canonical_url')
             or evidence.get('title') != identity.get('main_title')

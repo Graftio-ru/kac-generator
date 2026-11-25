@@ -222,12 +222,55 @@ class LLMAccountError(LLMUnavailable):
         return result
 
 
+_JOB_REQUEST_LIMITS=ContextVar('job_request_limits',default=None)
+_PHYSICAL_MAX={'cloud':3,'search_query':2,'search_account':1}
+# Official Cloud model context metadata; NOT a local tokenizer or billed-token cap.
+# https://cloud.ru/docs/foundation-models/ug/topics/overview__available__models
+CLOUD_FLASH_PROVIDER_CONTEXT_TOKENS=1048576
+
+def _request_limits(value):
+    from types import MappingProxyType
+    if value is None:return None
+    if not isinstance(value,dict) and not isinstance(value,MappingProxyType):raise ValueError('Invalid physical request limits')
+    if set(value)!=set(_PHYSICAL_MAX)or any(type(value[k])is not int or not 0<=value[k]<=cap for k,cap in _PHYSICAL_MAX.items()):raise ValueError('Invalid physical request limits')
+    return MappingProxyType(dict(value))
+
+@contextmanager
+def job_request_limits(limits):
+    """Programmatic single-run mechanical envelope; not a monetary admission."""
+    current=_JOB_REQUEST_LIMITS.get()
+    if current is not None and limits is not None:raise ValueError('Nested job request limits cannot reset physical counters')
+    caps=_request_limits(limits)
+    state=current if current is not None else None if caps is None else dict(limits=caps,counts=dict.fromkeys(_PHYSICAL_MAX,0),lock=threading.RLock())
+    token=_JOB_REQUEST_LIMITS.set(state)
+    try:yield
+    finally:_JOB_REQUEST_LIMITS.reset(token)
+
+
+def captured_request_guard():
+    """Capture for a native client before context may leave its creation thread."""
+    from .search.session import bounded_timeout,SearchBudgetExceeded
+    guard=_REQUEST_GUARD.get()
+    if guard is not None:guard.check()
+    bounded_timeout(1)
+    if _JOB_REQUEST_LIMITS.get()is not None and (guard is None or guard._request_state is not _JOB_REQUEST_LIMITS.get()):
+        raise SearchBudgetExceeded('Required per-run physical request guard is unbound')
+    return guard
+
+
 class LLMRequestGuard:
     """Bound provider lanes independently; latch only proven global failures."""
 
-    def __init__(self, approved_hosts=()):
+    def __init__(self, approved_hosts=(), *, run_limits=None):
         from .search.failure_policy import RouteObservations
-        self.lock = threading.RLock()
+        state=_JOB_REQUEST_LIMITS.get()
+        caps=_request_limits(run_limits)if run_limits is not None else state['limits']if state is not None else None
+        if state is not None and caps!=state['limits']:raise ValueError('Per-run request limits cannot change inside job')
+        if state is None and caps is not None:state=dict(limits=caps,counts=dict.fromkeys(_PHYSICAL_MAX,0),lock=threading.RLock())
+        self._request_state=state
+        self._run_limits=caps
+        self.lock=state['lock']if state is not None else threading.RLock()
+        self._physical_counts=state['counts']if state is not None else dict.fromkeys(_PHYSICAL_MAX,0)
         from .search.admission import OrderedSlots
         self._lanes = {'llm': OrderedSlots(1), 'search_api': OrderedSlots(settings.search_api_workers)}
         self._local = threading.local()
@@ -241,6 +284,45 @@ class LLMRequestGuard:
         with self.lock:
             if self.failure is not None:
                 raise self.failure
+
+    @property
+    def run_limits(self):return self._run_limits
+
+    def check_physical_route(self,kind,provider=None,endpoint=None):
+        from .search.session import bounded_timeout,SearchBudgetExceeded
+        self.check();bounded_timeout(1)
+        if self.run_limits is None:return
+        routes={'search_query':('xmlriver-google','https://xmlriver.com/search/xml'),
+                'search_account':('xmlriver-account','https://xmlriver.com/api/get_info/')}
+        valid=(provider=='cloudru' and endpoint in (None,'https://foundation-models.api.cloud.ru/v1/chat/completions'))if kind=='cloud'else kind in routes and (provider,endpoint)==routes[kind]
+        if not valid:raise SearchBudgetExceeded('Per-run physical request route is not approved')
+
+    def admit_physical(self,kind,provider=None,payload=None):
+        """One irreversible slot per actual request event, never per decorator."""
+        from .search.session import bounded_timeout,SearchBudgetExceeded
+        with self.lock:
+            self.check();bounded_timeout(1)
+            if self.run_limits is None:return
+            if kind not in _PHYSICAL_MAX:raise SearchBudgetExceeded('Per-run physical request kind is not approved')
+            if kind=='cloud':
+                self.check_physical_route(kind,provider=provider)
+                allowed={'model','max_tokens','messages','temperature','top_p','response_format','thinking','chat_template_kwargs'}
+                valid=(type(payload)is dict and not(set(payload)-allowed)and payload.get('model')=='deepseek-ai/DeepSeek-V4-Flash'
+                    and type(payload.get('max_tokens'))is int and 1<=payload['max_tokens']<=4096)
+                messages=payload.get('messages')if type(payload)is dict else None
+                valid=valid and type(messages)is list and bool(messages)
+                if valid:
+                    for message in messages:
+                        if type(message)is not dict or set(message)!={'role','content'}or message['role']not in {'system','user','assistant'}:valid=False;break
+                        content=message['content']
+                        if type(content)is str:continue
+                        if type(content)is not list or not content or any(type(block)is not dict or set(block)!={'type','text'}or block['type']!='text'or type(block['text'])is not str for block in content):valid=False;break
+                if not valid:raise SearchBudgetExceeded('Per-run Cloud payload is not approved text Flash/output<=4096')
+            if self._physical_counts[kind]>=self.run_limits[kind]:raise SearchBudgetExceeded('Per-run physical request allowance exhausted')
+            self._physical_counts[kind]+=1
+
+    def physical_counts(self):
+        with self.lock:return dict(self._physical_counts)
 
     def reject(self, failure):
         with self.lock:
@@ -431,10 +513,21 @@ _REQUEST_GUARD = ContextVar('llm_request_guard', default=None)
 
 @contextmanager
 def llm_request_scope(guard):
-    token = _REQUEST_GUARD.set(guard if guard is not None else _REQUEST_GUARD.get())
+    selected=guard if guard is not None else _REQUEST_GUARD.get()
+    state=getattr(selected,'_request_state',None)
+    active=_JOB_REQUEST_LIMITS.get()
+    if active is not None and state is not None and state is not active:
+        from .search.session import bounded_timeout,SearchBudgetExceeded
+        previous=_REQUEST_GUARD.get()
+        if previous is not None:previous.check()
+        selected.check();bounded_timeout(1)
+        raise SearchBudgetExceeded('Different per-run physical request state cannot replace active job')
+    token = _REQUEST_GUARD.set(selected)
+    limits_token=_JOB_REQUEST_LIMITS.set(state)if state is not None else None
     try:
         yield
     finally:
+        if limits_token is not None:_JOB_REQUEST_LIMITS.reset(limits_token)
         _REQUEST_GUARD.reset(token)
 
 

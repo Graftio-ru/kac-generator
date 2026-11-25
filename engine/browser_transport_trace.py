@@ -23,6 +23,93 @@ def trace_diagnostics(sink):
         _DIAGNOSTICS.reset(token)
 
 
+_OWNED_BINDING = ContextVar('owned_browser_operation_binding', default=None)
+_OWNED_PHASES = frozenset({'attach', 'send', 'owned_await', 'detach', 'recovery'})
+_OWNED_CLASSES = frozenset({'Error', 'TimeoutError', 'TargetClosedError', 'ValueError', 'TypeError',
+    'RuntimeError', 'CancelledError', 'ResearchControlError', 'SearchBudgetExceeded',
+    'ResearchInternalFailure', 'AcquisitionOwnershipLost', 'ResearchProgressError'})
+_OWNED_REASONS = frozenset({'ERR_ABORTED', 'ERR_FAILED', 'ERR_CONNECTION_CLOSED',
+    'ERR_CONNECTION_RESET', 'ERR_CONNECTION_REFUSED', 'ERR_CONNECTION_TIMED_OUT',
+    'ERR_TIMED_OUT', 'ERR_NAME_NOT_RESOLVED', 'ERR_INTERNET_DISCONNECTED',
+    'ERR_PROXY_CONNECTION_FAILED', 'ERR_TUNNEL_CONNECTION_FAILED', 'ERR_NETWORK_CHANGED',
+    'ERR_EMPTY_RESPONSE', 'ERR_SSL_PROTOCOL_ERROR', 'ERR_CERT_AUTHORITY_INVALID'})
+
+def _owned_binding(value):
+    clean = {}
+    if type(value) is dict:
+        for key in ('job_id', 'product_id', 'task_id', 'operation_id'):
+            v = value.get(key)
+            if type(v) is str and re.fullmatch('[0-9a-f]{12,64}', v): clean[key] = v
+        for key in ('generation', 'position_index'):
+            v = value.get(key)
+            if type(v) is int and (1 if key == 'generation' else 0) <= v <= 1000000: clean[key] = v
+    return clean
+
+@contextmanager
+def owned_trace_scope(binding):
+    token = _OWNED_BINDING.set(_owned_binding(binding))
+    try: yield
+    finally: _OWNED_BINDING.reset(token)
+
+def owned_browser_diagnostic(value):
+    """Closed passive metadata only; never supplier/control classification authority."""
+    try:
+        if type(value) is not dict or value.get('version') != 1: return None
+        phase = value.get('phase')
+        if phase not in _OWNED_PHASES: return None
+        result = dict(version=1, phase=phase,
+            error_type=value.get('error_type') if value.get('error_type') in _OWNED_CLASSES else 'Exception',
+            reason=value.get('reason') if value.get('reason') in _OWNED_REASONS else 'unknown',
+            observed_at=_number(value.get('observed_at')),
+            recovery_remaining_seconds=_number(value.get('recovery_remaining_seconds')),
+            research_remaining_seconds=_number(value.get('research_remaining_seconds')),
+            control_error=value.get('control_error') is True,
+            owned_await_pending=value.get('owned_await_pending') is True,
+            cleanup_required=value.get('cleanup_required') is True,
+            cancellation_observation='not_sampled', ownership_observation='binding_only',
+            binding=_owned_binding(value.get('binding')))
+        cleanup=value.get('cleanup_failure')
+        if type(cleanup) is dict and cleanup.get('phase') in {'owned_await','detach'}:
+            result['cleanup_failure']=dict(phase=cleanup['phase'],error_type=cleanup.get('error_type') if cleanup.get('error_type') in _OWNED_CLASSES else 'Exception',reason=cleanup.get('reason') if cleanup.get('reason') in _OWNED_REASONS else 'unknown')
+        trace = value.get('trace')
+        if type(trace) is dict and set(trace) == {'ref','sha256'}:
+            if (type(trace['ref']) is str and re.fullmatch(r'browser_transport_traces/[0-9a-f]{32}\.json', trace['ref'])
+                    and type(trace['sha256']) is str and re.fullmatch('[0-9a-f]{64}',trace['sha256'])):
+                result['trace'] = dict(trace)
+        return result if len(json.dumps(result,separators=(',',':')).encode()) <= 2048 else None
+    except BaseException: return None
+
+def record_owned_browser_failure(page, phase, error, deadline, *, pending=False, secondary=False):
+    """Sticky first owned boundary; observer failure cannot replace native errors."""
+    try:
+        trace = getattr(page, '_kac_arrival_trace', None)
+        previous=owned_browser_diagnostic(getattr(page, '_kac_owned_browser_failure', None))
+        if previous is not None:
+            previous['cleanup_required']=previous['cleanup_required'] or getattr(page,'_kac_context_cleanup_required',False) is True
+            if secondary and phase in {'owned_await','detach'} and 'cleanup_failure' not in previous:
+                previous['cleanup_failure']=dict(phase=phase,error_type=type(error).__name__,reason=_reason(str(error)[:4096]))
+            value=owned_browser_diagnostic(previous)
+            if value is not None:
+                page._kac_owned_browser_failure=value
+                if trace is not None:trace.data['first_owned_failure']=value
+            return
+        from .search.session import research_deadline
+        now = time.monotonic(); outer = research_deadline()
+        # Extract only a closed ERR code; never retain message/type module/locals.
+        reason = _reason(str(error)[:4096])
+        value = owned_browser_diagnostic(dict(version=1, phase=phase,
+            error_type=type(error).__name__, reason=reason, observed_at=time.time(),
+            recovery_remaining_seconds=None if deadline is None else max(0,deadline-now),
+            research_remaining_seconds=None if outer is None else max(0,outer-now),
+            control_error=isinstance(error,ResearchControlError), owned_await_pending=pending,
+            cleanup_required=getattr(page,'_kac_context_cleanup_required',False) is True,
+            binding=(trace.data.get('operation_binding') if trace is not None else _OWNED_BINDING.get())))
+        if value is None: return
+        page._kac_owned_browser_failure = value
+        if trace is not None: trace.data.setdefault('first_owned_failure',value)
+    except BaseException: pass
+
+
 def safe_url(value):
     if value in ('about:blank', 'chrome-error://chromewebdata/'):
         return value
@@ -63,6 +150,7 @@ class ArrivalTrace:
         self.attempt = 0
         self.generation = 0
         self.data = dict(version=1, role='browser_transport_trace', requested_url=safe_url(requested_url),
+                         operation_binding=_owned_binding(_OWNED_BINDING.get()),
                          clock='python_monotonic_event_receipt', capture='unavailable',
                          attempts=[], documents=[], points=[], resources={}, failures=[],
                          first_facts=None, final_facts=None, first_observation=None, final_observation=None, errors=[], dropped=0)
@@ -152,7 +240,7 @@ class ArrivalTrace:
     def attempt_error(self, error):
         if self.data['attempts'] and self.data['attempts'][-1]['id'] == self.attempt:
             self.data['attempts'][-1]['error'] = dict(at=self.elapsed(), error_type=type(error).__name__,
-                                                       reason=_reason(str(error)))
+                                                       reason=_reason(str(error)[:4096]))
         self.point('attempt_error')
 
     def request(self, params):
@@ -262,6 +350,11 @@ class ArrivalTrace:
             return
         self.closed = True
         control = None
+        if error is not None and self.page is not None:
+            cause=owned_browser_diagnostic(getattr(self.page,'_kac_owned_browser_failure',None))
+            if cause is not None:
+                try: error._kac_owned_browser_failure=cause
+                except BaseException: pass
         self.data.update(ended_at=self.elapsed(), outcome='error' if error else 'returned',
                          primary_error_type=type(error).__name__ if error else None)
         if self.channel is not None:
@@ -284,6 +377,10 @@ class ArrivalTrace:
                 self.page._kac_browser_transport_trace = reference
             if error is not None:
                 error._kac_browser_transport_trace = reference
+                cause=owned_browser_diagnostic(getattr(error,'_kac_owned_browser_failure',None))
+                if cause is not None:
+                    cause['trace']=reference
+                    error._kac_owned_browser_failure=owned_browser_diagnostic(cause)
             if self.sink is not None:
                 self.sink.append(dict(code='browser_transport_trace', reason='Passive arrival metadata retained',
                                       browser_transport_trace=reference))

@@ -122,10 +122,9 @@ class AcquisitionLeaseKeeper:
     with self._lock:self._entries.pop(self._key(entry.admission),None)
     try:
      if not self.store.validate_acquisition(entry.admission,owner=self.owner).allowed:entry.lost=True;continue
-     if entry.identity is not None:
-      for host,saved in self.store.lookup(entry.identity)['coverage'].items():
-       if saved['status']=='unknown':
-        self.store.publish_coverage(entry.admission.product_id,host,status='deferred',reason=reason,acquisition=entry.admission)
+     # Stop ownership is authoritative. Preserve unknown source coverage and
+     # immutable card intents; eager per-host diagnostic rewrites/lookup can
+     # consume the entire reserved publication time across a large input.
      revoked=(self.store.cancel_acquisition(entry.admission,reason=reason,owner=self.owner) if cancelled else self.store.finish_acquisition(entry.admission,error=reason,owner=self.owner))
      if revoked:
       with self._lock:self._revoked.add(self._key(entry.admission))

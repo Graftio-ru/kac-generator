@@ -45,7 +45,7 @@ def _load_primary() -> dict[str, dict]:
             continue
         name, kpp, inn, url = cells[0], cells[1], cells[2], cells[3]
         # пропускаем шапку и разделитель
-        if not re.search(r"https?://", url) or not inn.isdigit():
+        if not name or not re.search(r"https?://", url) or not inn.isdigit():
             continue
         host = _host(url)
         if host:

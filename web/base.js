@@ -51,7 +51,7 @@ $("saveAllBtn").onclick = async () => {
     const r = await fetch(engineUrl() + "/base/save", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ positions: withOffers.map((p) => ({
-        number: p.number, name: p.name, type_mark: p.type_mark, unit: p.unit,
+        number: p.number, name: p.name, type_mark: p.type_mark, ...positionAlternatives(p), unit: p.unit,
         qty: p.qty, discipline: p.discipline, offers: p.offers,
       })) }),
     });
@@ -119,14 +119,14 @@ async function loadEntryToWorkspace(entry) {
     const r = await fetch(engineUrl() + "/base/fill", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ positions: [{
-        number: positions.length + 1, name: entry.name, type_mark: entry.type_mark,
+        number: positions.length + 1, name: entry.name, type_mark: entry.type_mark, ...positionAlternatives(entry),
         unit: entry.unit, discipline: entry.discipline, offers: [],
       }] }),
     });
     const d = await r.json();
     const res = d.results[0];
     const p = normalizePos({
-      number: positions.length + 1, name: res.name, type_mark: res.type_mark,
+      number: positions.length + 1, name: res.name, type_mark: res.type_mark, ...positionAlternatives(res),
       unit: res.unit, discipline: res.discipline,
       offers: res.offers, _candidates: res.offers,
     });

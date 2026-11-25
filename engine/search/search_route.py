@@ -2,7 +2,7 @@
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
-import json,math,time
+import json,math,time,socket
 from urllib.parse import urlsplit
 from .failure_policy import SearchServiceUnavailable,SearchTransportAttempt,ResearchControlError
 
@@ -67,7 +67,7 @@ def resolve_initial_route(*,deadline=None):
     """At most one bounded admin GET; caller must first exclude known-only jobs."""
     import httpx
     from ..config import settings
-    from ..llm import _REQUEST_GUARD
+    from ..llm import captured_request_guard
     from .session import bounded_timeout,deadline_scope,transport_started
     preference=getattr(settings,'xmlriver_backend_preference','auto')
     preference_until=None
@@ -76,7 +76,7 @@ def resolve_initial_route(*,deadline=None):
         # stop, cancellation or deadline. Legacy auto eligibility stays intact.
         preference_until=min(time.monotonic()+10,deadline) if deadline is not None else time.monotonic()+10
         with deadline_scope(preference_until):
-            guard=_REQUEST_GUARD.get()
+            guard=captured_request_guard()
             if guard is not None:guard.check()
             bounded_timeout(max(0,preference_until-time.monotonic()))
         preference=_validated_preference(preference,settings.xmlriver_url)
@@ -85,27 +85,67 @@ def resolve_initial_route(*,deadline=None):
         if preference=='xmlriver-google':raise SearchServiceUnavailable('configuration_missing')
         return None,None
     if not (settings.xmlriver_user and settings.xmlriver_key):raise SearchServiceUnavailable('configuration_missing')
-    until=preference_until if preference_until is not None else (min(time.monotonic()+10,deadline) if deadline is not None else time.monotonic()+10)
-    guard=_REQUEST_GUARD.get()
+    # Client/CA initialization consumes the caller's global allocation, not
+    # the ten-second account wire allocation. Recheck global controls after it.
+    until=None
+    attempts=[];account_calls=0;last_status=None
+    import uuid
+    from .failure_policy import SearchTransportReport
+    operation_id=uuid.uuid4().hex
+    guard=captured_request_guard()
     def check():
         if guard is not None:guard.check()
-        return bounded_timeout(max(0,until-time.monotonic()))
-    with deadline_scope(until):
+        with deadline_scope(until):
+            return bounded_timeout(10 if until is None else max(0,until-time.monotonic()))
+    def report():
+        return SearchTransportReport(operation_id,account_calls,tuple(attempts),max(0,time.monotonic()-started),response_status=last_status)
+    def retain(failure):
+        if attempts and isinstance(failure,SearchServiceUnavailable) and (guard is None or getattr(guard,'failure',None) is not failure):
+            failure.search_transport_report=report()
+        return failure
+    with deadline_scope(deadline):
         remaining=check();observed=time.time();started=time.monotonic()
+        if guard is not None:
+            guard.check_physical_route('search_account',provider='xmlriver-account',endpoint='https://xmlriver.com/api/get_info/')
         try:
             with httpx.Client(timeout=httpx.Timeout(remaining,connect=min(10,remaining)),follow_redirects=False) as client:
-                check();transport_started('search_account_api')
-                with client.stream('GET','https://xmlriver.com/api/get_info/',params={'user':settings.xmlriver_user,'key':settings.xmlriver_key},headers={'Accept-Encoding':'identity'}) as response:
-                    if response.status_code!=200:
-                        category='account_access' if response.status_code in (401,403) else 'account_balance' if response.status_code==402 else 'http_error'
-                        raise SearchServiceUnavailable(category,status=response.status_code)
-                    if response.headers.get('content-encoding','').strip().lower() not in ('','identity'):raise SearchServiceUnavailable('invalid_structure',validation_branch='content_encoding')
-                    chunks=[];size=0
-                    for chunk in response.iter_raw():
-                        check();size+=len(chunk)
-                        if size>65536:raise SearchServiceUnavailable('invalid_structure',validation_branch='response_size')
-                        chunks.append(chunk)
-                    check();payload=json.loads(b''.join(chunks))
+                admission_until=min(time.monotonic()+30,deadline) if deadline is not None else time.monotonic()+30
+                for index in range(2):
+                    until=min(time.monotonic()+10,admission_until)
+                    remaining=check();client.timeout=httpx.Timeout(remaining,connect=min(10,remaining))
+                    transport_started('search_account_api')
+                    if guard is not None:guard.admit_physical('search_account')
+                    check();account_calls+=1;attempt_observed=time.time();attempt_started=time.monotonic()
+                    try:
+                        with client.stream('GET','https://xmlriver.com/api/get_info/',params={'user':settings.xmlriver_user,'key':settings.xmlriver_key},headers={'Accept-Encoding':'identity'}) as response:
+                            last_status=response.status_code
+                            if response.status_code!=200:
+                                category='account_access' if response.status_code in (401,403) else 'account_balance' if response.status_code==402 else 'http_error'
+                                raise SearchServiceUnavailable(category,status=response.status_code)
+                            if response.headers.get('content-encoding','').strip().lower() not in ('','identity'):raise SearchServiceUnavailable('invalid_structure',validation_branch='content_encoding')
+                            chunks=[];size=0
+                            for chunk in response.iter_raw():
+                                check();size+=len(chunk)
+                                if size>65536:raise SearchServiceUnavailable('invalid_structure',validation_branch='response_size')
+                                chunks.append(chunk)
+                            check();payload=json.loads(b''.join(chunks))
+                        break
+                    except httpx.HTTPError as error:
+                        from ..provider_transport import safe_transport_details
+                        details=safe_transport_details(error)
+                        transient=(type(error)is httpx.ConnectError and details['transport_category']=='dns'
+                            and details['transport_errno']==socket.EAI_AGAIN and details['transport_http_status']is None and last_status is None)
+                        # Expired local wire time cannot masquerade as global expiry;
+                        # recheck authoritative controls and the shared allowance.
+                        until=admission_until;check()
+                        limits=guard.run_limits if guard is not None else None
+                        permitted=(limits is None or guard.physical_counts()['search_account']<limits['search_account'])
+                        retry=transient and index==0 and permitted and admission_until-time.monotonic()>0
+                        error_name=next((name for name in ('ConnectTimeout','ReadTimeout','WriteTimeout','PoolTimeout','ConnectError','ReadError','WriteError','CloseError','ProxyError','RemoteProtocolError','LocalProtocolError','UnsupportedProtocol','DecodingError','TooManyRedirects','HTTPStatusError','HTTPError') if type(error)is getattr(httpx,name)),'HTTPError')
+                        attempt=SearchTransportAttempt(error_name,attempt_observed,max(0,time.monotonic()-attempt_started),retry,**details)
+                        attempts.append(attempt)
+                        if retry:continue
+                        raise
             if type(payload) is not dict:raise SearchServiceUnavailable('invalid_structure',validation_branch='payload_type')
             if payload.get('error'):
                 code=str(payload['error'].get('code','')) if type(payload['error']) is dict else ''
@@ -116,12 +156,16 @@ def resolve_initial_route(*,deadline=None):
             capabilities=dict(engine=payload.get('engine'),balance_positive=balance>0)
             profile=select_route(capabilities,settings.xmlriver_url,settings.xmlriver_lr,preference=preference)
             check()
-            receipt=dict(observed_at=observed,http_status=200,account_api_calls=1,search_requests=0,engine={k:capabilities['engine'][k] for k in ('yandex','google')},balance_positive=True,selection_reason='operator_selected_google' if preference=='xmlriver-google' else 'primary_enabled' if profile['backend']=='xmlriver-yandex' else 'primary_engine_disabled')
+            receipt=dict(observed_at=observed,http_status=200,account_api_calls=account_calls,search_requests=0,engine={k:capabilities['engine'][k] for k in ('yandex','google')},balance_positive=True,selection_reason='operator_selected_google' if preference=='xmlriver-google' else 'primary_enabled' if profile['backend']=='xmlriver-yandex' else 'primary_engine_disabled')
+            if attempts:
+                receipt['account_transport_failures']=[attempt.diagnostic() for attempt in attempts]
+                receipt['account_admission']=report().diagnostic()
             return profile,receipt
-        except ResearchControlError:raise
-        except json.JSONDecodeError:raise SearchServiceUnavailable('invalid_structure',validation_branch='json_decode') from None
-        except UnicodeError:raise SearchServiceUnavailable('invalid_structure',validation_branch='unicode_decode') from None
-        except (TypeError,ValueError):raise SearchServiceUnavailable('invalid_structure',validation_branch='structure_exception') from None
+        except ResearchControlError as failure:
+            raise retain(failure)
+        except json.JSONDecodeError:raise retain(SearchServiceUnavailable('invalid_structure',validation_branch='json_decode')) from None
+        except UnicodeError:raise retain(SearchServiceUnavailable('invalid_structure',validation_branch='unicode_decode')) from None
+        except (TypeError,ValueError):raise retain(SearchServiceUnavailable('invalid_structure',validation_branch='structure_exception')) from None
         except httpx.HTTPError as error:
             # Exact known classes only: subclass names and exception/request data
             # may contain credentials and must never enter persisted diagnostics.
@@ -137,6 +181,8 @@ def resolve_initial_route(*,deadline=None):
             }
             elapsed=time.monotonic()-started
             elapsed=max(0.0,elapsed) if math.isfinite(elapsed) else 0.0
-            attempt=SearchTransportAttempt(safe_types.get(type(error),'HTTPError'),observed,elapsed,False)
-            raise SearchServiceUnavailable('transport_error',transport_attempts=(attempt,),
-                transport_elapsed_seconds=elapsed) from None
+            from ..provider_transport import safe_transport_details
+            if not attempts:attempts.append(SearchTransportAttempt(safe_types.get(type(error),'HTTPError'),observed,elapsed,False,**safe_transport_details(error)))
+            failure=SearchServiceUnavailable('transport_error',transport_attempts=tuple(attempts),transport_elapsed_seconds=elapsed)
+            failure.search_transport_report=report()
+            raise failure from None

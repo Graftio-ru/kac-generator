@@ -1,0 +1,7 @@
+{$KAC_PUBLIC_HOST} {
+    reverse_proxy estimator:8765 {
+        header_up Host {http.request.hostport}
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-Host {http.request.hostport}
+    }
+}

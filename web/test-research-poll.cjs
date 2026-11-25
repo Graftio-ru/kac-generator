@@ -11,6 +11,9 @@ function setup(fetch) {
   const context = vm.createContext({positions: [position], activeResearchJob: "old", fetch, summary,
     engineUrl: () => "", requireOk: async () => {}, renderPositions: () => {},
     $: () => summary, setTimeout: () => {}});
+  const common = fs.readFileSync(`${__dirname}/common.js`, "utf8");
+  vm.runInContext(common.slice(common.indexOf("const ALTERNATIVE_FIELDS"), common.indexOf("function alternativesLocked")), context);
+  vm.runInContext(common.slice(common.indexOf("function applyCatalogueMetadata"), common.indexOf("function addPosition")), context);
   vm.runInContext(poll, context);
   return context;
 }

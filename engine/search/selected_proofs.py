@@ -67,18 +67,22 @@ def selected_for_report(offers,position):
     from types import SimpleNamespace
     return final_offers(SimpleNamespace(all_offers=offers,offers=offers,position=position))
 
-def capture_selected_proofs(store,positions,*,browser,image_store,acquisition=None,control=lambda:None,paused=lambda:False,max_attempts=6):
+def capture_selected_proofs(store,positions,*,browser,image_store,acquisition=None,control=lambda:None,paused=lambda:False,max_attempts=6,attempted=None,on_attempt=lambda urls:None,selected_url=None,browser_factory=None):
     """At most3 final sources, finite replacement pool; no discovery or old image."""
-    import time
+    import time,uuid
+    from contextlib import nullcontext
     from .catalogue import identity_for_position,ProductIdentity
     from .catalogue_projection import project_product,catalogue_scope
     from .catalogue_producer import capture_and_publish,CataloguePublicationError
     from .failure_policy import supplier_card_transport_diagnostic
     from .session import SupplierDeferred
     if type(max_attempts) is not int or not 3<=max_attempts<=6:raise ValueError('Invalid selected proof budget')
+    if selected_url is not None and (type(selected_url)is not str or len(positions)!=1):raise ValueError('Invalid selected proof target')
     report=[]
+    shared_attempts=attempted
+    if shared_attempts is not None and len(positions)!=1:raise ValueError('Shared proof attempts require one position')
     for position in positions:
-        identity=identity_for_position(position);attempted=set();failures=[]
+        identity=identity_for_position(position);attempted=shared_attempts if shared_attempts is not None else set();failures=[]
         while True:
             control();product=store.lookup(identity)
             if not product or product.get('identity_ambiguous'):break
@@ -87,15 +91,25 @@ def capture_selected_proofs(store,positions,*,browser,image_store,acquisition=No
                 chosen=price_candidates(result);pending=[o for o in chosen if not proof_ready(o,position)]
             if not pending or len(attempted)>=max_attempts:break
             if paused():return dict(paused=True,positions=report,reason='Выбранные снимки ожидают явного продолжения')
-            offer=next((o for o in reversed(pending) if o.url not in attempted),None)
+            offer=next((o for o in reversed(pending) if o.url not in attempted and (selected_url is None or o.url==selected_url)),None)
             if offer is None:break
-            attempted.add(offer.url);control();reference=offer.catalogue_ref['observation_id'];host=next(h['host'] for h in product['heads'] if h['current']['observation_id']==reference)
+            control();attempted.add(offer.url);on_attempt(attempted);control();reference=offer.catalogue_ref['observation_id'];host=next(h['host'] for h in product['heads'] if h['current']['observation_id']==reference)
             payload=product['identity'];canonical=ProductIdentity(**{**payload,'features':tuple(tuple(v) for v in payload['features'])})
             started=time.time();reason='';observed=None
+            operation_id=uuid.uuid4().hex
+            control();admitted=store.card_operation(canonical.key,host,offer.url,operation_id=operation_id,acquisition=acquisition)
+            if not admitted['allowed']:
+                reason='Сохранённый неопределённый исход этой страницы запрещает автоматический повтор снимка'
+                failures.append(dict(url=offer.url,reason=reason))
+                if selected_url is not None:break
+                continue
             try:
                 # Selected photographs reuse the existing model-free capture mode.
                 # The native producer still owns current-frame financial publication.
-                observed=capture_and_publish(store,canonical,position,offer.url,browser=browser,image_store=image_store,photo_only=True,acquisition=acquisition,supplier_host=host)
+                control()
+                with browser_factory() if browser_factory is not None else nullcontext(browser) as owned_browser:
+                    control()
+                    observed=capture_and_publish(store,canonical,position,offer.url,browser=owned_browser,image_store=image_store,photo_only=True,acquisition=acquisition,supplier_host=host,observation_id=operation_id)
             except SupplierDeferred:
                 reason='Получение дополнительного снимка отложено поставщиком'
             except CataloguePublicationError:
@@ -104,7 +118,12 @@ def capture_selected_proofs(store,positions,*,browser,image_store,acquisition=No
                 diagnostic=supplier_card_transport_diagnostic(failure,host)
                 if diagnostic is None:raise
                 reason=diagnostic['reason']
-            if observed is not None:attempted.add(observed.url)
+            control()
+            if observed is not None:
+                if observed.observation_id!=operation_id or store.resolve_observation(canonical.key,operation_id)is None:raise CataloguePublicationError('catalogue_operation_id_invalid')
+                store.card_operation(canonical.key,host,offer.url,operation_id=operation_id,acquisition=acquisition,resolve=True,evidence=dict(basis='observation'))
+            if observed is not None and observed.url not in attempted:
+                attempted.add(observed.url);on_attempt(attempted)
             control();current=store.lookup(identity)
             with catalogue_scope(store,snapshot=current):
                 result=project_product(store,identity,position,snapshot=current)
@@ -113,6 +132,7 @@ def capture_selected_proofs(store,positions,*,browser,image_store,acquisition=No
                 text=reason or 'Текущий снимок и допустимая цена выбранного источника не подтверждены'
                 store.record_refresh_attempt(canonical.key,host,offer.url,attempted_at=time.time(),outcome='unknown',reason=PROOF_FAILURE+text,acquisition=acquisition)
                 failures.append(dict(url=offer.url,reason=text))
+            if selected_url is not None:break
         control();product=store.lookup(identity)
         if product:
             with catalogue_scope(store,snapshot=product):

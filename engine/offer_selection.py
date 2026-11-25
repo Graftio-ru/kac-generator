@@ -76,6 +76,14 @@ def independent_offers(offers, position=None):
             continue
         if key not in sellers or price > float(_field(sellers[key], 'price_with_vat')):
             sellers[key] = offer
+        elif (position is not None and price == float(_field(sellers[key], 'price_with_vat'))
+              and _field(offer,'catalogue_ref') and _field(sellers[key],'catalogue_ref')
+              and not _field(offer,'from_letter') and not _field(sellers[key],'from_letter')):
+            # Only a true ranking tie may reuse an independently validated image.
+            # Missing proof never authorizes a cheaper quote or another seller.
+            from .search.selected_proofs import proof_ready
+            if proof_ready(offer,position) and not proof_ready(sellers[key],position):
+                sellers[key] = offer
     return sorted(sellers.values(), key=lambda offer: float(_field(offer, 'price_with_vat')))
 
 
@@ -92,6 +100,9 @@ def unit_review_pending(offer):
 def offer_is_comparable(offer, position=None, *, require_seller=True):
     """One price eligibility rule for models, API dictionaries, reports and caches."""
     from .source_quote import retired_attachment_reason
+    if _field(offer,'estimator_approval_ref'):
+        from .search.catalogue_projection import catalogue_review_reason
+        if catalogue_review_reason(offer,position):return False
     if _field(offer, 'refresh_failed') and not retired_attachment_reason(_field(offer,'refresh_failure_reason')):
         return False
     if region_status(offer) == 'incompatible':

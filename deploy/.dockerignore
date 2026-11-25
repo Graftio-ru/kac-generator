@@ -1,0 +1,18 @@
+**
+!Dockerfile
+!.dockerignore
+!public/
+!public/**
+# Defense in depth: the stager also rejects these before copying any bytes.
+**/.env
+**/.env.*
+**/.git/**
+**/.4dt/**
+**/data/**
+**/cache/**
+**/profiles/**
+**/*.sqlite*
+**/*.db
+**/*.log
+**/__pycache__/**
+**/*.pyc

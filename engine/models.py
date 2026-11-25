@@ -4,12 +4,24 @@ from __future__ import annotations
 from enum import IntEnum
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class OrgStatus(IntEnum):
     MANUFACTURER = 1  # Производитель
     SUPPLIER = 2      # Поставщик
+
+
+def normalize_alternatives(value, *, article=False):
+    import unicodedata
+    if type(value)is not list or len(value)>20:raise ValueError('At most20 alternatives required')
+    result=[];seen=set();limit=128 if article else 500
+    for item in value:
+        if type(item)is not str or any(unicodedata.category(c)in {'Cc','Cf','Cs'} for c in item):raise ValueError('Alternative must be a plain string')
+        item=item.strip()
+        if not item or len(item)>limit:raise ValueError('Alternative length invalid')
+        if item.casefold()not in seen:result.append(item);seen.add(item.casefold())
+    return result
 
 
 class SpecPosition(BaseModel):
@@ -18,6 +30,14 @@ class SpecPosition(BaseModel):
     name: str                        # наименование строительного ресурса (графа C)
     full_name: str = ""              # полное наименование (графа D); по умолчанию = name
     type_mark: str = ""              # тип, марка, обозначение
+    alternative_articles: list[str] = Field(default_factory=list)
+    alternative_names: list[str] = Field(default_factory=list)
+
+    @field_validator("alternative_articles", "alternative_names", mode="before")
+    @classmethod
+    def validate_alternatives(cls,value,info):
+        return normalize_alternatives(value,article=info.field_name=="alternative_articles")
+
     review_issue: str = ""           # unresolved source recognition details
     review_fields: dict[str, str] = Field(default_factory=dict)
     source_evidence: dict = Field(default_factory=dict)  # provenance, not verified cells
@@ -55,6 +75,9 @@ class PriceOffer(BaseModel):
     price_unit: str = ""              # единица продажи, подтверждённая на карточке
     normalized_price_unit: str = ""   # единица price_with_vat после пересчёта
     source_quote_evidence: dict = Field(default_factory=dict)
+    article_match_evidence: dict = Field(default_factory=dict)  # server-derived display only
+    estimator_approval_ref: dict = Field(default_factory=dict)
+    estimator_approval: dict = Field(default_factory=dict)
     catalogue_ref: dict = Field(default_factory=dict)
     catalogue_observed_at: float = 0.0
     catalogue_source_sha256: str = ""

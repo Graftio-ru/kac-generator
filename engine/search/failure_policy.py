@@ -18,7 +18,7 @@ _FAILURE_FRAME_FILES = frozenset({
     'engine/search/catalogue_producer.py', 'engine/search/card_attachments.py',
     'engine/search/card_link_discovery.py', 'engine/search/search_engine.py',
     'engine/search/http_card.py', 'engine/search/literal_card_quote.py',
-    'engine/search/factory_reference.py', 'engine/search/session.py',
+    'engine/search/factory_reference.py', 'engine/search/session.py', 'engine/search/search_route.py',
 })
 
 
@@ -59,6 +59,44 @@ def _unexpected_provenance(error, binding=None):
         return None  # A passive observer can never replace the original stop.
 
 
+def control_failure_observation(error, *, global_remaining=None):
+    """Passive bounded observer; never authority and never exception text/locals."""
+    import json, math, re
+    try:
+        def number(value):
+            return round(value, 6) if type(value) in (int, float) and math.isfinite(value) and abs(value) <= 1000000000 else None
+        from .session import SearchBudgetExceeded, ResearchProgressError
+        classes={ResearchControlError:'ResearchControlError',ResearchInternalFailure:'ResearchInternalFailure',
+                 SearchServiceUnavailable:'SearchServiceUnavailable',SearchQueryFailed:'SearchQueryFailed',
+                 SearchCapacityDeferred:'SearchCapacityDeferred',SearchBudgetExceeded:'SearchBudgetExceeded',
+                 ResearchProgressError:'ResearchProgressError'}
+        name=classes.get(type(error),'ResearchControlError' if isinstance(error,ResearchControlError) else 'Exception')
+        result=dict(version=1, error_class=name,
+                    global_remaining_seconds=number(global_remaining), budget_context='UNKNOWN')
+        raw=getattr(error,'_budget_observation',None)
+        if type(raw) is dict and raw.get('cause') in {'cancelled','deadline_expired','below_minimum'}:
+            result['budget_context']=dict(cause=raw['cause'],effective_remaining_seconds=number(raw.get('effective_remaining_seconds')),minimum_seconds=number(raw.get('minimum_seconds')))
+        provenance=_unexpected_provenance(error)
+        result['frames']=(provenance or {}).get('frames',[])
+        from ..browser_transport_trace import owned_browser_diagnostic
+        owned=owned_browser_diagnostic(getattr(error,'_kac_owned_browser_failure',None))
+        if owned is not None:result['owned_browser_failure']=owned
+        while len(json.dumps(result,separators=(',',':')).encode())>2048:
+            if not result['frames']:return None
+            result['frames'].pop(0)
+        return result
+    except BaseException:return None
+
+
+def record_control_failure(job, error, *, global_remaining=None):
+    """First separate diagnostic wins; existing first_stop is never touched."""
+    try:
+        if 'control_failure_diagnostic' not in job:
+            value=control_failure_observation(error,global_remaining=global_remaining)
+            if value is not None:job.setdefault('control_failure_diagnostic',value)
+    except BaseException:pass
+
+
 class ResearchInternalFailure(ResearchControlError):
     """Unclassified application failure; never permission to replay paid work."""
     def __init__(self, stage, error, *, url='', binding=None):
@@ -79,6 +117,10 @@ class ResearchInternalFailure(ResearchControlError):
         self.code = 'internal_error'
         try: self._provenance = _unexpected_provenance(error, binding)
         except BaseException: self._provenance = None
+        try:
+            from ..browser_transport_trace import owned_browser_diagnostic
+            self._owned_browser_failure=owned_browser_diagnostic(getattr(error,'_kac_owned_browser_failure',None))
+        except BaseException: self._owned_browser_failure=None
         super().__init__('Внутренняя ошибка обработки; новые проверки остановлены, сохранённые результаты доступны')
 
     def diagnostic(self):
@@ -88,6 +130,9 @@ class ResearchInternalFailure(ResearchControlError):
         if self._provenance is not None:
             import copy
             result['failure_provenance'] = copy.deepcopy(self._provenance)
+        if self._owned_browser_failure is not None:
+            import copy
+            result['owned_browser_failure']=copy.deepcopy(self._owned_browser_failure)
         return result
 
 
@@ -163,6 +208,13 @@ class SearchTransportAttempt:
     observed_at: float
     elapsed_seconds: float
     retryable: bool
+    transport_category: str = 'unknown'
+    transport_errno: int | None = None
+    transport_http_status: int | None = None
+
+    def diagnostic(self):
+        from dataclasses import asdict
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -178,8 +230,7 @@ class SearchTransportReport:
         return dict(search_operation_id=self.operation_id,
                     search_transport_attempt_count=self.attempt_count,
                     search_transport_failure_count=len(self.failures),
-                    search_transport_attempts=[dict(error_type=a.error_type,observed_at=a.observed_at,
-                        elapsed_seconds=a.elapsed_seconds,retryable=a.retryable) for a in self.failures],
+                    search_transport_attempts=[a.diagnostic() for a in self.failures],
                     search_transport_elapsed_seconds=self.elapsed_seconds,
                     response_status=self.response_status,
                     search_response_failures=[dict(xml_code=a.xml_code,http_status=a.http_status,
@@ -265,7 +316,7 @@ class SearchServiceUnavailable(ResearchControlError):
         attempts = getattr(self, 'transport_attempts', ())
         if attempts:
             result['search_transport_attempt_count'] = len(attempts)
-            result['search_transport_attempts'] = [dict(error_type=a.error_type, observed_at=a.observed_at, elapsed_seconds=a.elapsed_seconds, retryable=a.retryable) for a in attempts]
+            result['search_transport_attempts'] = [a.diagnostic() for a in attempts]
             result['search_transport_elapsed_seconds'] = self.transport_elapsed_seconds
         report = getattr(self, 'search_transport_report', None)
         if report is not None:

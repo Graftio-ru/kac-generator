@@ -44,8 +44,8 @@ def guarded_search(operation):
     from functools import wraps
     @wraps(operation)
     def guarded(*args, **kwargs):
-        from ..llm import _REQUEST_GUARD
-        guard = _REQUEST_GUARD.get()
+        from ..llm import captured_request_guard
+        guard = captured_request_guard()
         from .session import deadline_scope
         # XMLRiver's finite logical operation begins before provider admission.
         deadline = time.monotonic()+30 if operation.__name__ == 'xmlriver_search' else None
@@ -53,6 +53,9 @@ def guarded_search(operation):
         try:
             with deadline_scope(deadline):
                 if guard is None:return operation(*args, **kwargs)
+                guard.check_physical_route('search_query',
+                    provider='xmlriver-google' if operation.__name__ == 'xmlriver_search' else operation.__name__,
+                    endpoint=_effective_search_endpoint() if operation.__name__ == 'xmlriver_search' else None)
                 temporary_xmlriver = operation.__name__ == 'xmlriver_search' and _documented_xmlriver_endpoint(_effective_search_endpoint())
                 with guard.search_capacity_scope(temporary_xmlriver):
                     return guard.call('search_api', lambda: operation(*args, **kwargs))
@@ -201,15 +204,18 @@ def _search_get(url, *, operation_deadline=None, seconds=30, response_validator=
         with deadline_scope(deadline):
             for attempt in (1,2):
                 remaining=bounded_timeout(seconds)
-                from ..llm import _REQUEST_GUARD
-                wire_guard = _REQUEST_GUARD.get()
+                from ..llm import captured_request_guard
+                wire_guard = captured_request_guard()
                 if wire_guard is not None:
                     wire_guard.check_search_capacity()
+                    wire_guard.check_physical_route('search_query',provider='xmlriver-google',endpoint=url)
                 timeout=httpx.Timeout(remaining,connect=min(10,remaining))
                 token=_SEARCH_GET_ATTEMPT.set((operation,attempt))
                 stamp=time.monotonic()
                 try:
                     transport_started('search_api')
+                    if wire_guard is not None:
+                        wire_guard.admit_physical('search_query')
                     wire_count+=1
                     response=httpx.get(url,timeout=timeout,**kwargs)
                     response_status=response.status_code
@@ -249,7 +255,8 @@ def _search_get(url, *, operation_deadline=None, seconds=30, response_validator=
                     raise
                 except httpx.RequestError as error:
                     retryable=_retryable_search_transport(error)
-                    attempts.append(SearchTransportAttempt(type(error).__name__,time.time(),round(time.monotonic()-stamp,6),retryable))
+                    from ..provider_transport import safe_transport_details
+                    attempts.append(SearchTransportAttempt(type(error).__name__,time.time(),round(time.monotonic()-stamp,6),retryable,**safe_transport_details(error)))
                     bounded_timeout(1)
                     if retryable and attempt==1:
                         record_stage('search_transport_retry',0,label=type(error).__name__)
@@ -556,6 +563,10 @@ def browser_search(browser, query: str, n: int = 20) -> list[str]:
     Любая ошибка/капча → возвращаем то, что успели (вплоть до пустого списка), без падения.
     """
     from ..config import settings
+    from ..llm import captured_request_guard
+    guard = captured_request_guard()
+    if guard is not None:
+        guard.check_physical_route('search_query',provider='browser')
 
     def _grab(page):
         return page.evaluate(
