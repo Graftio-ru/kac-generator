@@ -3,7 +3,8 @@ import json,sqlite3,tempfile,time,unittest
 from io import BytesIO
 from functools import partial
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 from zipfile import ZipFile
 from .runner_control import RunnerControl
 from .runner_executor import NativeResearchRunner,DirectControl,RunnerExecutionError,RESEARCH_FINALIZATION_SECONDS,RESEARCH_MIN_WORK_SECONDS
@@ -101,6 +102,174 @@ class RunnerFinalization403Tests(unittest.TestCase):
                         for row in list(book['Предложения'].values)[1:]))
    finally:
     book.close()
+
+ def run_native_deadline_order(self, *, advance, native_cutoff=None, before_scheduler=None, after_native=None):
+  """Exercise the real missing-data path with synthetic clock steps at the scheduler and final snapshot."""
+  from . import runner_executor
+  from .search import acquisition_scheduler
+  from .search.catalogue import identity_for_position
+  from .telemetry import record_stage
+
+  open_position = self.fixture.position.model_copy(update={
+      'number': self.fixture.position.number + 1, 'name': 'Другое изделие', 'type_mark': 'XYZ456',
+  })
+  req = {'positions': [position.model_dump(mode='json') for position in (self.fixture.position, open_position)],
+         'acquisition_mode': 'missing_data'}
+  job = self.control.enqueue(req, 'native_deadline_fixture_12345678', 'server-basic:fixture')
+  claim = self.control.claim('fixture-runner', self.seal)
+  work_deadline = claim['deadline'] - RESEARCH_FINALIZATION_SECONDS
+  wall_origin, monotonic_origin = self.now[0], time.monotonic()
+
+  def wall_now():
+   """Return the fixed test clock shared by runner work and dispatch authority."""
+   return self.now[0]
+
+  def monotonic_now():
+   """Advance the native budget by the same amount as the runner clock."""
+   return monotonic_origin + (wall_now() - wall_origin)
+
+  runner = NativeResearchRunner(self.root/'runner', DirectControl(self.control), self.native,
+                                clock=wall_now, heartbeat_seconds=10000)
+  clock = SimpleNamespace(time=wall_now, monotonic=monotonic_now)
+  schedule = acquisition_scheduler.run_products
+  acquire = self.native._run_research_job
+
+  def at_scheduler(products, **kwargs):
+   """Preserve an earlier navigation metric and move time before the real scheduler's lease check."""
+   self.assertEqual(tuple(products), (identity_for_position(open_position).key,))
+   with self.native._catalogue_operation_metrics(job, 0, Mock()):
+    record_stage('navigation', 1.25)
+    record_stage('navigation', .75, ok=False)
+   if before_scheduler is not None:
+    before_scheduler(job, claim, runner)
+   self.now[0] = work_deadline + advance
+   return schedule(products, **kwargs)
+
+  def at_native_entry(job_id):
+   """Run native acquisition with an optional shorter original budget and a delayed runner read."""
+   if native_cutoff is not None:
+    self.native.RESEARCH_JOBS[job_id]['catalogue_original_deadline'] = work_deadline + native_cutoff
+   acquire(job_id)
+   if after_native is not None:
+    after_native(job_id, work_deadline)
+
+  with patch.object(self.native, 'time', clock), patch.object(runner_executor, 'time', clock), \
+       patch.object(self.native, '_catalogue_missing_required', return_value=False), \
+       patch.object(acquisition_scheduler, 'run_products', side_effect=at_scheduler) as scheduler, \
+       patch.object(self.native, '_run_research_job', side_effect=at_native_entry) as native_run:
+   result = runner.execute(claim, self.seal)
+  native_run.assert_called_once_with(job)
+  self.assertEqual(scheduler.call_count, 1)
+  return job, result
+
+ def test_native_global_deadline_before_heartbeat_exports_saved_partial_reports(self):
+  """The direct catalogue lease cutoff must use the existing reserve and publish both real books."""
+  from openpyxl import load_workbook
+
+  with patch.object(self.native, '_catalogue_export_snapshot', wraps=self.native._catalogue_export_snapshot) as export:
+   job, result = self.run_native_deadline_order(advance=.014)
+  state = self.control.public(job)
+  self.assertEqual(state['control_failure_diagnostic']['error_class'], 'SearchBudgetExceeded')
+  self.assertAlmostEqual(state['control_failure_diagnostic']['global_remaining_seconds'], -.014, places=4)
+  self.assertTrue(any(frame['function'] == 'lease_control'
+                      for frame in state['control_failure_diagnostic']['frames']))
+  self.assertEqual((result['state'], state.get('finalization_reason'), len(state['downloads'])),
+                   ('cancelled', 'research_time_reserved', 2))
+  self.assertTrue(state['partial'])
+  self.assertFalse(state['business_complete'])
+  self.assertFalse(state['cancel_requested'])
+  self.assertEqual(export.call_args.kwargs, {'local_only': True})
+  artifacts = {entry['name']: self.control.artifact(job, entry['sha256'])[0].read_bytes()
+               for entry in state['downloads']}
+  self.assertEqual(set(artifacts), {'supplier-research-summary.xlsx', 'supplier-research-package.zip'})
+  with ZipFile(BytesIO(artifacts['supplier-research-package.zip'])) as package:
+   self.assertIsNone(package.testzip())
+   packed = package.read('supplier-research-summary.xlsx')
+  for raw in (artifacts['supplier-research-summary.xlsx'], packed):
+   book = load_workbook(BytesIO(raw), read_only=True)
+   try:
+    self.assertIn('Лимит времени сбора', book['Состояние сбора']['B2'].value)
+    self.assertEqual(list(book['Время открытия карточек'].values)[1],
+                     (self.fixture.position.number, 2, 2, 1))
+    self.assertTrue(any(row[12] == 100 and row[11] == 'уп' and 'https://one.test/card' in row
+                        for row in list(book['Предложения'].values)[1:]))
+   finally:
+    book.close()
+
+ def test_earlier_native_deadline_is_not_promoted_by_late_snapshot_read(self):
+  """A genuine expiry of a shorter acquisition budget is not the runner's work deadline."""
+  def read_late(job_id, work_deadline):
+   """Reach the export reserve after native acquisition has already failed."""
+   self.assertEqual(self.native.RESEARCH_JOBS[job_id]['status'], 'error')
+   self.now[0] = work_deadline + 1
+
+  with patch.object(self.native, '_catalogue_export_snapshot') as export:
+   job, result = self.run_native_deadline_order(advance=-59, native_cutoff=-60, after_native=read_late)
+  export.assert_not_called()
+  state = self.control.public(job)
+  self.assertEqual(result['state'], 'error')
+  self.assertIsNone(state.get('finalization_reason'))
+  self.assertTrue(state['report_unavailable'])
+  self.assertEqual(state['downloads'], [])
+
+ def test_external_cancel_before_native_deadline_prevents_export(self):
+  """An unseen control cancellation still wins when the native deadline requests export."""
+  def cancel(job, claim, runner):
+   """Cancel on CONTROL while the runner is between heartbeats."""
+   self.control.cancel(job)
+
+  with patch.object(self.native, '_catalogue_export_snapshot') as export:
+   job, result = self.run_native_deadline_order(advance=.014, before_scheduler=cancel)
+  export.assert_not_called()
+  self.assertEqual(result['state'], 'cancelled')
+  self.assertTrue(self.control.public(job)['cancel_requested'])
+  self.assertEqual(self.downloads(job), [])
+
+ def test_hard_deadline_prevents_export_on_same_native_path(self):
+  """Expiry of the claim itself fails closed even through the direct catalogue deadline branch."""
+  jobs = []
+
+  def remember(job, claim, runner):
+   """Keep the job ID to inspect CONTROL after the expected runner exception."""
+   jobs.append(job)
+
+  with patch.object(self.native, '_catalogue_export_snapshot') as export, \
+       self.assertRaisesRegex(RunnerExecutionError, 'runner_lease_lost'):
+   self.run_native_deadline_order(advance=RESEARCH_FINALIZATION_SECONDS, before_scheduler=remember)
+  export.assert_not_called()
+  job, = jobs
+  self.assertEqual(self.control.public(job)['dispatch_state'], 'uncertain')
+  self.assertEqual(self.downloads(job), [])
+
+ def test_unacknowledged_deadline_checkpoint_never_builds_or_retries(self):
+  """A lost reply after saving the cutoff checkpoint must not authorize reports or replay."""
+  checkpoint_jobs = []
+
+  def lose_reply(job, claim, runner):
+   """Persist the first cutoff checkpoint, then simulate disappearance of its reply."""
+   action = runner.client.action
+
+   def lose_checkpoint(job_id, operation, *args, **kwargs):
+    """Forward real control actions, withholding only the cutoff checkpoint acknowledgment."""
+    result = action(job_id, operation, *args, **kwargs)
+    if operation == 'checkpoint':
+     checkpoint_jobs.append(job_id)
+     raise TimeoutError('fixture lost checkpoint reply')
+    return result
+
+   override = patch.object(runner.client, 'action', side_effect=lose_checkpoint)
+   override.start()
+   self.addCleanup(override.stop)
+
+  with patch.object(self.native, '_catalogue_export_snapshot') as export, self.assertRaises(TimeoutError):
+   self.run_native_deadline_order(advance=.014, before_scheduler=lose_reply)
+  export.assert_not_called()
+  job, = checkpoint_jobs
+  state = self.control.public(job)
+  self.assertEqual(state['finalization_reason'], 'research_time_reserved')
+  self.assertTrue(state['rows'][0]['candidates'])
+  self.assertEqual(state['downloads'], [])
+  self.assertIsNone(self.control.claim('fixture-runner', self.seal))
 
  def test_timer_stop_export_failure_publishes_saved_rows_and_cause(self):
   """A known local export error must not discard prices or renew the claim."""

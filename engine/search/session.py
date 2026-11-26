@@ -282,6 +282,11 @@ def research_deadline():
     return _DEADLINE.get()
 
 
+def research_cancellation_check():
+    """Capture the owning runner's optional stop check for calls outside this context."""
+    return _CANCELLED.get()
+
+
 def _budget_failure(message, cause, remaining, minimum):
     error = SearchBudgetExceeded(message)
     error._budget_observation = dict(cause=cause, effective_remaining_seconds=remaining,

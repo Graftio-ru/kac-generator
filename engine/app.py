@@ -1453,15 +1453,16 @@ def _run_catalogue_unknown_job(job_id, store, *, resumed=None):
 
 
 def _run_catalogue_unknown_job_with_documents(job_id, store, *, resumed=None):
-    """Fresh acquisition namespace: no legacy price/cache/archive candidates."""
+    """Run native catalogue acquisition under the caller's budget and stop authority."""
     global _ACTIVE_RESEARCH_ID
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from .search.catalogue import identity_for_position, CatalogueStoreError
     from .search.whitelist import whitelist_hosts
     from .llm import LLMRequestGuard,_JOB_REQUEST_LIMITS
     from .search.session import PersistentSupplierHealth
-    from .search.session import research_deadline
+    from .search.session import research_cancellation_check, research_deadline
     parent_deadline=research_deadline()
+    check_runner_stop = research_cancellation_check()
     job=RESEARCH_JOBS[job_id];positions=_RESEARCH_INPUTS[job_id]
     # Anchor the caller's original allocation before any physical operation.
     # Continuations may shorten that deadline, never renew it.
@@ -1484,9 +1485,15 @@ def _run_catalogue_unknown_job_with_documents(job_id, store, *, resumed=None):
     from .search.failure_policy import ResearchControlError
     from .search.session import SearchBudgetExceeded
     def lease_control():
+        """Stop at the parent deadline and let the owner decide whether its report reserve has begun."""
         if job.get('cancel_requested'):raise SearchBudgetExceeded('Задание отменено')
         guard.check()
-        if parent_deadline is not None and time.monotonic()>=parent_deadline:raise SearchBudgetExceeded('Общий срок получения завершён')
+        if parent_deadline is not None and time.monotonic() >= parent_deadline:
+            # The lease keeper can reach this branch outside the research context,
+            # before the runner heartbeat has observed its own work deadline.
+            if check_runner_stop is not None:
+                check_runner_stop()
+            raise SearchBudgetExceeded('Общий срок получения завершён')
     lease_keeper=AcquisitionLeaseKeeper(store,lease_control,cancelled=lambda:bool(job.get('cancel_requested')),owner=job_id)
     try:
         from .search.catalogue_xmlriver import CatalogueXmlRiver, STATE_KEY
