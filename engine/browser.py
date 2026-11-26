@@ -449,8 +449,9 @@ class Browser:
 
     @contextmanager
     def page(self, url: str) -> Iterator:
-        """Yield an opened supplier page, recording its navigation outcome before cleanup."""
+        """Yield a supplier page or attach a scoped goto failure after successful cleanup."""
         from playwright.sync_api import Error as PlaywrightError
+        from .search.failure_policy import FailureContext
 
         from . import supplier_methods as methods
         grant=methods.selected(url)
@@ -460,12 +461,15 @@ class Browser:
         trace = ArrivalTrace(url, started)
         trace.point('acquisition_start')
         try:
-            page = self._context_for_url(url).new_page()
+            context = self._context_for_url(url)
+            page = context.new_page()
         except BaseException as acquisition_error:
             trace.finalize(CACHE_DIR, acquisition_error)
             raise
         page._kac_capture_resize_allowed = not self.headed  # Owned headless page only.
         primary = None
+        failed_goto = None
+        card_failure_code = None
         try:
             trace.attach(page)
             page.set_default_timeout(page_timeout)
@@ -509,25 +513,47 @@ class Browser:
             response_status = None
             recovered_native = None
             document_url = ''
-            last_navigation_error = None
             try:
                 from .search.session import transport_started
                 bounded_timeout(10, minimum=3)
                 trace.begin_attempt()
                 transport_started('supplier_navigation',url)
                 trace.point('transport_admitted')
-                response=page.goto(url,wait_until="commit",timeout=max(1,int(bounded_timeout(10,minimum=3)*1000)))
+                goto_timeout = max(1, int(bounded_timeout(10, minimum=3) * 1000))
+                trace.native_goto_active = True
+                try:
+                    response = page.goto(url, wait_until="commit", timeout=goto_timeout)
+                except PlaywrightError as error:
+                    failed_goto = error
+                    raise
+                finally:
+                    trace.native_goto_active = False
                 response_status=response.status if response else None
                 document_url=str(response.url)if response else ''
                 trace.commit(getattr(response,'url',None),response_status)
                 methods.response(grant,response_status)
             except PlaywrightError as error:
                 trace.attempt_error(error)
-                _supplier_failure(error,url,'supplier_navigation')
+                _supplier_failure(error, url, 'supplier_navigation')
                 recovered_native=_recover_native_document(page,trace,url)
                 if getattr(page,'_kac_context_cleanup_required',False) is True:raise
                 if not recovered_native:
-                    methods.failed(grant,error,'navigation')
+                    # Only previously unclassified goto errors may use the CDP fallback.
+                    if (error is failed_goto and type(error) is PlaywrightError
+                            and getattr(error, '_kac_supplier_failure', None) is None
+                            and grant is not None and grant['method'] == 'browser'
+                            and not settings.browser_proxy_server.strip()
+                            and context is self._context and page.context is context
+                            and page.is_closed() is False and self.is_usable()
+                            and not getattr(page, '_kac_owned_browser_failure', None)):
+                        card_failure_code = trace.card_document_failure_code()
+                    method_receipt = methods.failed(grant, error, 'navigation')
+                    # The existing write checks the selected method and revision atomically.
+                    if (
+                        type(method_receipt) is not dict or method_receipt.get('recorded') is not True
+                        or method_receipt.get('stale') is not False
+                    ):
+                        card_failure_code = None
                     raise
                 response_status=recovered_native['status'];document_url=recovered_native['url']
                 trace.point('native_document_recovered')
@@ -548,6 +574,11 @@ class Browser:
             if not ready:
                 record_stage("navigation", time.monotonic() - started, ok=False)
             cleanup_error = None
+            if card_failure_code is not None and primary is failed_goto:
+                # A closed target cannot acknowledge CDP detach. Verify it while still live.
+                detach_control = trace.detach()
+                if detach_control is not None:
+                    primary.add_note('Passive trace cleanup control: ' + type(detach_control).__name__)
             trace.point('page_close_start')
             try:
                 page.close(run_before_unload=True)
@@ -560,6 +591,14 @@ class Browser:
                 primary.add_note(f"Browser page cleanup failed: {type(cleanup).__name__}")
             finally:
                 trace.finalize(CACHE_DIR, primary or cleanup_error)
+            if (card_failure_code is not None and primary is failed_goto and cleanup_error is None
+                    and context is self._context and self.is_usable()
+                    and trace.card_document_failure_code() == card_failure_code):
+                bounded_timeout(0)
+                primary._kac_supplier_failure = FailureContext(
+                    'supplier_navigation', 'local', 'network_error', time.time(),
+                    host=grant['host'], transport_error_code=card_failure_code,
+                )
 
     def screenshot(self, url: str, out_path: str | Path, *,
                    full_page: bool = False, clip_top: int | None = None) -> Path:

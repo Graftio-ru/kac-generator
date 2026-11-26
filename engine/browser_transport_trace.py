@@ -33,6 +33,17 @@ _OWNED_REASONS = frozenset({'ERR_ABORTED', 'ERR_FAILED', 'ERR_CONNECTION_CLOSED'
     'ERR_TIMED_OUT', 'ERR_NAME_NOT_RESOLVED', 'ERR_INTERNET_DISCONNECTED',
     'ERR_PROXY_CONNECTION_FAILED', 'ERR_TUNNEL_CONNECTION_FAILED', 'ERR_NETWORK_CHANGED',
     'ERR_EMPTY_RESPONSE', 'ERR_SSL_PROTOCOL_ERROR', 'ERR_CERT_AUTHORITY_INVALID'})
+_CARD_DOCUMENT_FAILURES = frozenset({
+    'net::ERR_CONNECTION_CLOSED', 'net::ERR_CONNECTION_RESET',
+    'net::ERR_CONNECTION_REFUSED', 'net::ERR_NAME_NOT_RESOLVED',
+})
+
+
+def _wire_url_digest(url):
+    """Compare exact requested URLs privately, ignoring only the client fragment."""
+    if not safe_url(url):
+        return None
+    return sha256(url.split('#', 1)[0].encode()).digest()
 
 def _owned_binding(value):
     clean = {}
@@ -141,12 +152,15 @@ class ArrivalTrace:
     MAX_FAILURES = 12
 
     def __init__(self, requested_url, started=None):
+        """Initialize bounded diagnostics and private correlation for one owned page."""
         self.started = time.monotonic() if started is None else started
         self.sink = _DIAGNOSTICS.get()
         self.page = self.channel = None
         self.main_frame = None
         self.requests = {}
         self.native_requests = {}
+        self._requested_digest = _wire_url_digest(requested_url)
+        self.native_goto_active = False
         self.attempt = 0
         self.generation = 0
         self.data = dict(version=1, role='browser_transport_trace', requested_url=safe_url(requested_url),
@@ -244,6 +258,7 @@ class ArrivalTrace:
         self.point('attempt_error')
 
     def request(self, params):
+        """Track request generations and privately mark an exact, fresh goto document."""
         rid = params.get('requestId')
         if type(rid) is not str or len(rid) > 128:
             return
@@ -253,7 +268,8 @@ class ArrivalTrace:
             return
         kind = params.get('type')
         kind = kind if kind in ('Document', 'Script', 'XHR', 'Fetch', 'Stylesheet', 'Image', 'Font', 'Media') else 'Other'
-        url = safe_url(params.get('request', {}).get('url'))
+        raw_url = params.get('request', {}).get('url')
+        url = safe_url(raw_url)
         redirect = params.get('redirectResponse')
         if previous and type(redirect) is dict:
             previous.update(response_at=self.elapsed(), status=redirect.get('status') if type(redirect.get('status')) is int else None,
@@ -271,10 +287,18 @@ class ArrivalTrace:
                 self.data['dropped'] += 1
         self.requests[rid] = record
         if main:
-            loader=params.get('loaderId')
-            if type(loader) is str and loader and len(loader)<=128:
-                self.native_requests[rid]=dict(frame_id=self.main_frame,loader_id=loader,generation=self.generation,url=None,status=None,failed=False)
-            else:self.native_requests.pop(rid,None)
+            loader = params.get('loaderId')
+            if type(loader) is str and loader and len(loader) <= 128:
+                card_request = (
+                    self.native_goto_active and bool(rid) and previous is None and 'redirectResponse' not in params
+                    and self._requested_digest is not None and _wire_url_digest(raw_url) == self._requested_digest
+                )
+                self.native_requests[rid] = dict(
+                    frame_id=self.main_frame, loader_id=loader, generation=self.generation,
+                    url=None, status=None, failed=False, card_request=card_request,
+                )
+            else:
+                self.native_requests.pop(rid, None)
         group = self.data['resources'].setdefault(kind, dict(started=0, completed=0, failed=0,
                                                             known_encoded_bytes=None, byte_observations=0))
         group['started'] += 1
@@ -318,11 +342,24 @@ class ArrivalTrace:
             group['byte_observations'] += 1
 
     def failed(self, params):
-        native=self.native_requests.get(params.get('requestId'))
-        if native is not None:native['failed']=True
+        """Retain the safe CDP code only for an unambiguous terminal Document failure."""
+        native = self.native_requests.get(params.get('requestId'))
         record = self.requests.get(params.get('requestId'))
         if record is None:
             return
+        if native is not None:
+            token = params.get('errorText')
+            eligible = (
+                self.native_goto_active and native['card_request'] and not native['failed']
+                and record['main'] and record.get('generation') == native['generation']
+                and record['completion'] == 'pending' and record['response_at'] is None
+                and params.get('type') == 'Document'
+                and (params.get('canceled') is None or params['canceled'] is False)
+                and 'blockedReason' not in params and 'corsErrorStatus' not in params
+                and type(token) is str and token in _CARD_DOCUMENT_FAILURES
+            )
+            native['card_failure_code'] = token.removeprefix('net::') if eligible else None
+            native['failed'] = True
         reason = _reason(params.get('errorText'))
         record.update(completion='failed', completed_at=self.elapsed(), during_cleanup='cleanup_started_at' in self.data, failure_reason=reason)
         self.data['resources'][record['kind']]['failed'] += 1
@@ -331,6 +368,27 @@ class ArrivalTrace:
                 generation=record.get('generation'), kind=record['kind'], host=record['host'], reason=reason))
         else:
             self.data['dropped'] += 1
+
+    def card_document_failure_code(self):
+        """Return only an exact, single main-document failure from this owned goto."""
+        binding = self.data['operation_binding']
+        if (
+            set(binding) != {'job_id', 'product_id', 'task_id', 'operation_id', 'generation', 'position_index'}
+            or binding != _OWNED_BINDING.get() or self.data['capture'] != 'cdp_network'
+            or not self.main_frame or self.data['errors'] or self.data['dropped']
+            or self.attempt != 1 or self.generation != 1 or len(self.native_requests) != 1
+        ):
+            return None
+        request_id, native = next(iter(self.native_requests.items()))
+        record = self.requests[request_id]
+        if (
+            record['main'] and record['attempt'] == self.attempt
+            and record.get('generation') == self.generation == native['generation']
+            and record['completion'] == 'failed' and record['response_at'] is None
+            and not record.get('during_cleanup')
+        ):
+            return native.get('card_failure_code')
+        return None
 
     def facts(self, phase, fields, reference):
         # Only field counts/readiness and owned evidence pointers; never content.
@@ -346,10 +404,10 @@ class ArrivalTrace:
         self.data['final_' + prefix] = record
 
     def finalize(self, cache_dir, error=None):
+        """Release the passive listener and retain only the sanitized trace."""
         if self.closed:
             return
         self.closed = True
-        control = None
         if error is not None and self.page is not None:
             cause=owned_browser_diagnostic(getattr(self.page,'_kac_owned_browser_failure',None))
             if cause is not None:
@@ -357,14 +415,7 @@ class ArrivalTrace:
                 except BaseException: pass
         self.data.update(ended_at=self.elapsed(), outcome='error' if error else 'returned',
                          primary_error_type=type(error).__name__ if error else None)
-        if self.channel is not None:
-            try:
-                self.channel.detach()
-            except ResearchControlError as cleanup:
-                control = cleanup
-                self.error('cdp_detach', cleanup)
-            except Exception as cleanup:
-                self.error('cdp_detach', cleanup)
+        control = self.detach()
         try:
             folder = cache_dir / 'browser_transport_traces'
             folder.mkdir(parents=True, exist_ok=True)
@@ -393,3 +444,16 @@ class ArrivalTrace:
             if error is None:
                 raise control
             error.add_note('Passive trace cleanup control: ' + type(control).__name__)
+
+    def detach(self):
+        """Detach once, recording failure and returning any control error to the owner."""
+        channel, self.channel = self.channel, None
+        if channel is not None:
+            try:
+                channel.detach()
+            except ResearchControlError as cleanup:
+                self.error('cdp_detach', cleanup)
+                return cleanup
+            except Exception as cleanup:
+                self.error('cdp_detach', cleanup)
+        return None

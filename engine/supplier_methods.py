@@ -129,10 +129,11 @@ def response(grant,status,text=''):
     if cause:failure(grant,cause,status);raise MethodUnavailable('supplier_method_requires_configuration')
 
 def failed(grant,error,cause='network_error'):
+    """Report through the existing revision fence and return its acknowledgement."""
     # Account/global allocation/cancellation are control flow, never host failures.
     if isinstance(error,ResearchControlError):return
     context=getattr(error,'_kac_supplier_failure',None)
     if getattr(context,'scope',None)=='global'or getattr(context,'cause',None)=='proxy_connection_failure':return
     name=type(error).__name__.lower()
     if 'timeout'in name:cause='network_timeout'
-    failure(grant,cause)
+    return failure(grant,cause)
