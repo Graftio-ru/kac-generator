@@ -4,6 +4,12 @@ from dataclasses import dataclass
 import time
 
 
+STRUCTURAL_CARD_FAILURE_CODES = frozenset({
+    'ERR_CONNECTION_CLOSED', 'ERR_CONNECTION_RESET',
+    'ERR_CONNECTION_REFUSED', 'ERR_NAME_NOT_RESOLVED',
+})
+
+
 class ResearchControlError(RuntimeError):
     """Job/service/defer/persistence control flow must never become site refusal."""
     pass

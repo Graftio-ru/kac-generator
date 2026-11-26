@@ -9,7 +9,7 @@ import time
 from urllib.parse import urlsplit, urlunsplit
 import uuid
 
-from .search.failure_policy import ResearchControlError
+from .search.failure_policy import ResearchControlError, STRUCTURAL_CARD_FAILURE_CODES
 
 _DIAGNOSTICS = ContextVar('browser_trace_diagnostics', default=None)
 
@@ -33,10 +33,7 @@ _OWNED_REASONS = frozenset({'ERR_ABORTED', 'ERR_FAILED', 'ERR_CONNECTION_CLOSED'
     'ERR_TIMED_OUT', 'ERR_NAME_NOT_RESOLVED', 'ERR_INTERNET_DISCONNECTED',
     'ERR_PROXY_CONNECTION_FAILED', 'ERR_TUNNEL_CONNECTION_FAILED', 'ERR_NETWORK_CHANGED',
     'ERR_EMPTY_RESPONSE', 'ERR_SSL_PROTOCOL_ERROR', 'ERR_CERT_AUTHORITY_INVALID'})
-_CARD_DOCUMENT_FAILURES = frozenset({
-    'net::ERR_CONNECTION_CLOSED', 'net::ERR_CONNECTION_RESET',
-    'net::ERR_CONNECTION_REFUSED', 'net::ERR_NAME_NOT_RESOLVED',
-})
+_CARD_DOCUMENT_FAILURES = frozenset('net::' + code for code in STRUCTURAL_CARD_FAILURE_CODES)
 
 
 def _wire_url_digest(url):

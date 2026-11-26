@@ -599,6 +599,8 @@ class Browser:
                     'supplier_navigation', 'local', 'network_error', time.time(),
                     host=grant['host'], transport_error_code=card_failure_code,
                 )
+                # Only the structural branch may identify itself to the native review handler.
+                primary._kac_structural_card_failure = True
 
     def screenshot(self, url: str, out_path: str | Path, *,
                    full_page: bool = False, clip_top: int | None = None) -> Path:

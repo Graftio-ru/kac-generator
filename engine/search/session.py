@@ -254,6 +254,27 @@ def transport_started(source, url=''):
         callback(source, url)
 
 
+@contextmanager
+def observe_transport_started(observer):
+    """Observe the existing transport boundary without replacing its authority callback."""
+    prior = _TRANSPORT_STARTED.get()
+
+    def notify(source, url):
+        """Preserve any existing refusal before observing entry to the transport."""
+        if prior is not None:
+            prior(source, url)
+        try:
+            observer(source, url)
+        except Exception:
+            pass  # An observational failure is not a supplier outcome.
+
+    token = _TRANSPORT_STARTED.set(notify)
+    try:
+        yield
+    finally:
+        _TRANSPORT_STARTED.reset(token)
+
+
 def exhaustive_cards():
     return _EXHAUSTIVE.get()
 

@@ -444,13 +444,14 @@ def _catalogue_legacy_check_patch(publisher,index,checks,*,replace=False):
         return {'legacy_source_checks':list(merged.values())}
 
 
-def _publish_catalogue_diagnostics(job_id, indices, coverage):
-    """Immediate current pair metadata, retaining the last derived price snapshot."""
+def _publish_catalogue_diagnostics(job_id, indices, coverage, *, evidence=None):
+    """Publish current pair metadata and optional proof on the canonical row."""
     checks=_catalogue_source_checks({'coverage':coverage})
     publisher=_research_publisher(job_id)
     with publisher.lock:
         for index in indices:
             publisher.publish(index,pairs={value['host']:value for value in checks},
+                events=[evidence] if evidence is not None and index == indices[0] else (),
                 row_patch=_catalogue_legacy_check_patch(publisher,index,checks),terminal=False,force=True)
 
 
@@ -1453,7 +1454,7 @@ def _run_catalogue_unknown_job(job_id, store, *, resumed=None):
 
 
 def _run_catalogue_unknown_job_with_documents(job_id, store, *, resumed=None):
-    """Run native catalogue acquisition under the caller's budget and stop authority."""
+    """Run native acquisition and share one optional attribution pair across its products."""
     global _ACTIVE_RESEARCH_ID
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from .search.catalogue import identity_for_position, CatalogueStoreError
@@ -1563,13 +1564,33 @@ def _run_catalogue_unknown_job_with_documents(job_id, store, *, resumed=None):
                     job['rows'][index]=row;_publish_catalogue_row(job_id,index,row)
         job.update(status='cancelled' if job.get('cancel_requested') else 'running',coverage_mode='catalogue_acquisition',budget_seconds=None)
         _save_research_job(job_id)
+        from .research_publication import SUPPLIER_CARD_ATTRIBUTION, SupplierCardAttribution
+        policy = _research_store()._input(job_id)['policy']
+        attribution = SupplierCardAttribution() if SUPPLIER_CARD_ATTRIBUTION in policy['stages'] else None
         if indexed:
             from .search.acquisition_scheduler import run_products, TimingLedger
-            products={key:_catalogue_product_steps(job_id,store,identity_for_position(positions[groups[key][0]]),groups[key],admission,guard,health,parent_deadline,lease_keeper,resumed[key][1] if resumed and key in resumed else initial_frontiers.get(key),slice_until) for key,admission in admissions.items()}
+            products = {
+                key: _catalogue_product_steps(
+                    job_id, store, identity_for_position(positions[groups[key][0]]), groups[key],
+                    admission, guard, health, parent_deadline, lease_keeper,
+                    resumed[key][1] if resumed and key in resumed else initial_frontiers.get(key),
+                    slice_until, attribution=attribution,
+                )
+                for key, admission in admissions.items()
+            }
             terminal_errors={key:value for key,value in run_products(products,control=lease_control,diagnostics=TimingLedger.for_job(RESEARCH_JOB_DIR,job_id)).items() if value}
         else:
             with ThreadPoolExecutor(max_workers=min(3,max(1,len(admissions)))) as pool:
-                pending={pool.submit(_acquire_catalogue_product,job_id,store,identity_for_position(positions[groups[key][0]]),groups[key],admission,guard,health,parent_deadline,lease_keeper,resumed[key][1] if resumed and key in resumed else initial_frontiers.get(key),slice_until):key for key,admission in admissions.items()}
+                pending = {
+                    pool.submit(
+                        _acquire_catalogue_product, job_id, store,
+                        identity_for_position(positions[groups[key][0]]), groups[key], admission,
+                        guard, health, parent_deadline, lease_keeper,
+                        resumed[key][1] if resumed and key in resumed else initial_frontiers.get(key),
+                        slice_until, attribution=attribution,
+                    ): key
+                    for key, admission in admissions.items()
+                }
                 terminal_errors={pending[future]:failure for future in as_completed(pending) if (failure:=future.result())}
         # Reproject one atomic final view, including duplicate buyer quantities.
         view=store.read_snapshot([identity_for_position(p) for p in positions if not p.is_unique])
@@ -1787,8 +1808,10 @@ def _catalogue_discovery_diagnostic_fields(saved,value):
     return dict(status='deferred' if deferred else 'error',observed_at=stamp,reason=reason,diagnostics=prior+details)
 
 
-def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,health,parent_deadline=None,lease_keeper=None,frontier=None,slice_until=None):
-    """Yield bounded product operations and checkpoint discovery, capture and review outcomes."""
+def _catalogue_product_steps(job_id, store, identity, indices, admission, guard, health,
+                             parent_deadline=None, lease_keeper=None, frontier=None,
+                             slice_until=None, *, attribution=None):
+    """Yield bounded operations and checkpoint outcomes, with optional native attribution."""
     from collections import deque
     from .search.acquisition_scheduler import Operation,SelectCard,OperationParked,advance_substage
     import httpx
@@ -1805,12 +1828,28 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
     from .search.session import research_session,bounded_timeout,research_deadline,SearchBudgetExceeded,SupplierDeferred,ResearchProgressError
     from .search.source_registry import host_for
     from .search.catalogue_projection import project_product,catalogue_scope
+    from .research_publication import SUPPLIER_CARD_TRANSPORTS
+    from .search.session import observe_transport_started
     def discovery_hosts(task,selected):
         from .search.supplier_discovery import PROVIDERS,valid_step
         step=steps.get(task.query) if task.route!='serp_only' else None
         return [h for h in selected if h in PROVIDERS] if valid_step(step,task.query) else []
     def scheduled_operation(kind,hosts,function,*,card_operation=None,diagnostic_binding=None):
+        """Run one owned operation and observe entry to an admitted card's transport."""
         def run():
+            """Flush bound transport evidence with the operation's ordinary telemetry."""
+            from contextlib import nullcontext
+
+            start_evidence = None
+            transport_seen = False
+
+            def on_transport(source, url):
+                """Consider only this card's first matched native transport callback."""
+                nonlocal start_evidence, transport_seen
+                if not transport_seen and source in SUPPLIER_CARD_TRANSPORTS and url == card_operation['url']:
+                    transport_seen = True
+                    start_evidence = attribution.transport_entered(diagnostic_binding, card_operation['host'], source)
+
             check()
             with _catalogue_operation_metrics(job_id,indices[0],check) as metrics:
                 if kind in ('discovery','own_discovery','proof'):return function(None)
@@ -1818,15 +1857,21 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
                     from .search.catalogue import RetainedCardUncertain,definitely_presend
                     admitted=store.card_operation(**card_operation,acquisition=admission,evidence=dict(job_id=job_id,generation=admission.generation))
                     if not admitted['allowed']:raise RetainedCardUncertain()
+                observer = observe_transport_started(on_transport) if attribution is not None and card_operation is not None else nullcontext()
                 try:
                     from .browser_transport_trace import owned_trace_scope
                     with owned_trace_scope(diagnostic_binding):
                         with _browser_factory() as owned_browser:
-                            result=function(owned_browser)
+                            with observer:
+                                result=function(owned_browser)
                 except BaseException:
                     if card_operation is not None and definitely_presend(metrics.events):
                         check();store.card_operation(**card_operation,acquisition=admission,resolve=True,evidence=dict(basis='proven_presend',events=[v for v in metrics.events if v.get('stage')=='provider_transport']))
                     raise
+                finally:
+                    # Attribution must not take a slot from the operation's ordinary telemetry.
+                    if start_evidence is not None and len(metrics.events) < metrics.max_events:
+                        metrics.add(start_evidence)
                 if card_operation is not None and store.resolve_observation(product_id,card_operation['operation_id']) is not None:
                     check();store.card_operation(**card_operation,acquisition=admission,resolve=True,evidence=dict(basis='observation'))
                 return result
@@ -1855,7 +1900,9 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
         lease_keeper.check(admission)
     urgent_progress=False
     diagnostic_hosts=set()
+    pending_attribution = None
     def coverage(host,**fields):
+        """Update source coverage under the current lease and expose whether it was written."""
         nonlocal urgent_progress
         check()
         written=store.publish_coverage(product_id,host,acquisition=admission,**fields)
@@ -1884,11 +1931,13 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
     from .research_publication import DerivedProgressGate
     derived_progress=DerivedProgressGate()
     def publish(*,force=False):
-        nonlocal urgent_progress
+        """Flush current diagnostics and proof before publishing derived row progress."""
+        nonlocal urgent_progress, pending_attribution
         check()
         if diagnostic_hosts:
             current={host:store.read_coverage(product_id,host,acquisition=admission,owner=job_id) for host in sorted(diagnostic_hosts)}
-            _publish_catalogue_diagnostics(job_id,indices,current)
+            _publish_catalogue_diagnostics(job_id,indices,current,evidence=pending_attribution)
+            pending_attribution = None
             diagnostic_hosts.clear()  # Only after every duplicate row acknowledges.
             urgent_progress=False
         emitted=derived_progress.publish(build_progress,force=force)
@@ -2285,6 +2334,7 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
                         continue
                     from .search.agent import capture_card_diagnostics
                     card_reason='';card_failure=None;card_error=None;card_error_code='';card_deferred=False;card_prior_unknown=False;contention_deadline=time.monotonic()+120
+                    structural_code = None
                     with capture_card_diagnostics() as diagnostics:
                         while True:
                             check();bounded_timeout(1)
@@ -2346,6 +2396,8 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
                                 from .search.failure_policy import supplier_card_transport_diagnostic
                                 diagnostic=supplier_card_transport_diagnostic(failure,host)
                                 if diagnostic is None:raise
+                                if getattr(failure, '_kac_structural_card_failure', False) is True:
+                                    structural_code = diagnostic.get('transport_error_code')
                                 diagnostic['url']=url;diagnostics.append(diagnostic);card_reason=diagnostic['reason']
                                 observation=None
                             except MethodUnavailable as failure:
@@ -2370,7 +2422,13 @@ def _catalogue_product_steps(job_id,store,identity,indices,admission,guard,healt
                     else:
                         reason=_catalogue_card_review_reason(diagnostics,card_reason)
                         cause_date=next((d['observed_at'] for d in reversed(diagnostics) if str(d.get('code','')).startswith('supplier_card_') and d.get('observed_at') is not None),None)
-                        coverage(host,status='review',observed_at=cause_date if cause_date is not None else time.time(),reason=reason[:2048],diagnostics=diagnostics)
+                        written = coverage(
+                            host, status='review', observed_at=cause_date if cause_date is not None else time.time(),
+                            reason=reason[:2048], diagnostics=diagnostics,
+                        )
+                        if written and attribution is not None and structural_code is not None:
+                            binding = dict(failure_binding, task_id=state['id'], operation_id=operation)
+                            pending_attribution = pending_attribution or attribution.accepted(binding, host, structural_code)
                     typed=None;outcome_state='observed' if observation is not None else 'review'
                     if observation is None:
                         negative=next((d for d in diagnostics if d.get('code') in {'http_primary_identity_conflict','http_primary_model_conflict','http_primary_manufacturer_conflict'} and d.get('failure_cause')=='identity_conflict'),None)

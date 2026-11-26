@@ -5,6 +5,7 @@ This module performs no dispatch, receipt writes or price-proof interpretation.
 Immutable input, trace and latest state share the research store transaction.
 """
 import copy
+import hashlib
 import json
 import math
 import re
@@ -13,6 +14,7 @@ import time
 import uuid
 
 from .research_store import ResearchStore, Invalid, StoreError, _dated
+from .search.failure_policy import STRUCTURAL_CARD_FAILURE_CODES
 
 PUBLIC_INPUT_FIELDS = {"number", "name", "type_mark", "qty", "unit", "discipline",
                        "is_unique", "review_fields", "source_is_image", "offers", "full_name", "source_evidence",
@@ -46,9 +48,11 @@ def public_source_evidence(value):
 PLAIN_LABELS = ["", "xmlriver", "source_variant", "semantic_variant", "article", "alias", "ok",
                 "http_error", "invalid_response", "configuration_missing", "budget",
                 "query_upstream_failure", "temporary_capacity", "ReadTimeout", "ConnectTimeout", "ConnectError"]
+SUPPLIER_CARD_ATTRIBUTION = "supplier_card_attribution"
+SUPPLIER_CARD_TRANSPORTS = frozenset({"supplier_http", "supplier_navigation"})
 STAGES = ["supplier_http_wire", "browser_start", "navigation", "search_api", "llm", "screenshot", "search_queue", "discovery_query", "search_cache_hit",
           "search_response", "search_deferred", "search_response_retry", "search_transport_retry",
-          "provider_transport", "model_output", "search_query_result", "search_transport_evidence"]
+          "provider_transport", "model_output", "search_query_result", "search_transport_evidence", SUPPLIER_CARD_ATTRIBUTION]
 PROVIDERS = {"cloudru", "deepseek", "anthropic", "unknown"}
 ERROR_TYPES = {"", "ReadTimeout", "ConnectTimeout", "ConnectError", "ReadError", "WriteError",
                "RemoteProtocolError", "PoolTimeout", "ResearchCancelled", "SearchBudgetExceeded"}
@@ -63,6 +67,75 @@ def finite(value):
 
 def identifier(value):
     return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{32}", value))
+
+
+def valid_supplier_card_attribution(value):
+    """Accept only the two closed evidence records and bounded native identity fields."""
+    if type(value) is not dict:
+        return False
+    sizes = dict(job_id=12, product_id=64, task_id=64, operation_id=32,
+                 supplier_sha256=64, proof_id=32)
+    common = set(sizes) | {"generation", "position_index", "sequence", "event"}
+    sequence = value.get("sequence")
+    if type(sequence) is not int or sequence not in (1, 2):
+        return False
+    if sequence == 1:
+        code = value.get("transport_error_code")
+        if (set(value) != common | {"transport_error_code"} or value["event"] != "structural_failure_accepted"
+                or type(code) is not str or code not in STRUCTURAL_CARD_FAILURE_CODES):
+            return False
+    else:
+        transport = value.get("transport")
+        if (set(value) != common | {"transport"} or value["event"] != "other_supplier_transport_entered"
+                or type(transport) is not str or transport not in SUPPLIER_CARD_TRANSPORTS):
+            return False
+    return (all(type(value[name]) is str and len(value[name]) == size
+                and re.fullmatch(r"[0-9a-f]+", value[name]) for name, size in sizes.items())
+            and type(value["generation"]) is int and 1 <= value["generation"] <= 1000000
+            and type(value["position_index"]) is int and 0 <= value["position_index"] <= 1000000)
+
+
+class SupplierCardAttribution:
+    """Capture one ordered pair per native acquisition invocation, without scheduling work."""
+
+    def __init__(self):
+        """Keep the first accepted failure until a different card enters its transport."""
+        self._lock = threading.Lock()
+        self._proof_id = uuid.uuid4().hex
+        self._failure = None
+        self._matched = False
+
+    def _event(self, binding, host, sequence, event, **closed_fields):
+        """Build one validated trace metric without URLs, diagnostics, or result payloads."""
+        supplier = hashlib.sha256(host.encode()).hexdigest()
+        label = dict(binding, supplier_sha256=supplier, proof_id=self._proof_id,
+                     sequence=sequence, event=event, **closed_fields)
+        if not valid_supplier_card_attribution(label):
+            return None
+        return dict(stage=SUPPLIER_CARD_ATTRIBUTION, seconds=0, ok=True,
+                    label=json.dumps(label, sort_keys=True, separators=(",", ":")))
+
+    def accepted(self, binding, host, code):
+        """Observe the first persisted local review attributed to the structural branch."""
+        with self._lock:
+            if self._failure is not None:
+                return None
+            event = self._event(binding, host, 1, "structural_failure_accepted", transport_error_code=code)
+            if event is not None:
+                self._failure = (binding["job_id"], binding["operation_id"], host)
+            return event
+
+    def transport_entered(self, binding, host, transport):
+        """Observe an owned distinct card's transport boundary once after the first failure."""
+        with self._lock:
+            if self._failure is None or self._matched:
+                return None
+            job_id, operation_id, failed_host = self._failure
+            if binding["job_id"] != job_id or binding["operation_id"] == operation_id or host == failed_host:
+                return None
+            event = self._event(binding, host, 2, "other_supplier_transport_entered", transport=transport)
+            self._matched = event is not None
+            return event
 
 
 def valid_label(stage, raw):
@@ -80,6 +153,8 @@ def valid_label(stage, raw):
         return False
     if not isinstance(value, dict):
         return False
+    if stage == SUPPLIER_CARD_ATTRIBUTION:
+        return valid_supplier_card_attribution(value)
     def shape(data, rules):
         return isinstance(data, dict) and set(data) == set(rules) and all(check(data[k]) for k, check in rules.items())
     enum = lambda choices: lambda v: isinstance(v, str) and v in choices
@@ -120,6 +195,7 @@ class IntegrationStore(ResearchStore):
     """Safe diagnostic telemetry and app-compatible runtime/public projections."""
     @staticmethod
     def _sanitize(event, policy):
+        """Validate structured labels before storage, refusing malformed attribution."""
         reasons = {"invalid_event", "unknown_usage_identity", "invalid_usage", "invalid_stage", "unknown_stage"}
         if (isinstance(event, dict) and set(event) == {"stage", "reason_code"}
                 and event["stage"] == "telemetry_rejected" and isinstance(event["reason_code"], str)
@@ -130,7 +206,14 @@ class IntegrationStore(ResearchStore):
             event = {k: v for k, v in event.items() if k != "omitted_fields"}
         else:
             omitted = 0
-        if isinstance(event, dict) and event.get("stage") in policy["stages"] and valid_label(event.get("stage"), event.get("label")):
+        stage = event.get("stage") if isinstance(event, dict) else None
+        structured = stage in policy["stages"] and valid_label(stage, event.get("label"))
+        if stage == SUPPLIER_CARD_ATTRIBUTION and (
+            not structured or omitted or set(event) != {"stage", "seconds", "ok", "label"}
+            or type(event["seconds"]) is not int or event["seconds"] != 0 or event["ok"] is not True
+        ):
+            return {"stage": "telemetry_rejected", "reason_code": "invalid_stage"}
+        if structured:
             # Reuse accepted scalar and usage validation; constant-size temporary
             # allowlist for this validated label, never persisted/growing in input.
             policy = {**policy, "labels": [event["label"]]}
