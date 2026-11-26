@@ -48,13 +48,18 @@ class RunnerFinalization403Tests(unittest.TestCase):
   p=self.control.public(job);self.assertEqual(p['dispatch_state'],'cancelled');self.assertTrue(p['partial']);self.assertFalse(p['business_complete']);self.assertEqual(p['finalization_reason'],'research_time_reserved');self.assertTrue({'supplier-research-summary.xlsx','supplier-research-package.zip'}<={e['name']for e in p['downloads']})
   self.assertEqual(claim['deadline'],self.now[0]+RESEARCH_FINALIZATION_SECONDS);self.assertLess(seen[0],time.monotonic()+1800)
   with sqlite3.connect(runner.path)as db:self.assertEqual(db.execute('SELECT state FROM executions WHERE job=?',(job,)).fetchone()[0],'acknowledged')
- def run_timer_limited_research(self, job, claim, runner):
-  """Run real native calculation at the simulated end of its work window."""
+ def run_timer_limited_research(self, job, claim, runner, *, with_navigation=False):
+  """Run native calculation at its simulated deadline, optionally saving earlier navigation."""
   from .search.session import bounded_timeout, SearchBudgetExceeded
   original = self.native._run_research_job
 
   def at_limit(job_id):
    """Reach the export reserve and let native cancellation save its snapshot."""
+   if with_navigation:
+    from .telemetry import record_stage
+    with self.native._catalogue_operation_metrics(job_id, 0, lambda: None):
+     record_stage('navigation', 1.25)
+     record_stage('navigation', .75, ok=False)
    self.now[0] = claim['deadline'] - RESEARCH_FINALIZATION_SECONDS
    with self.assertRaises(SearchBudgetExceeded):
     bounded_timeout(1)
@@ -66,12 +71,12 @@ class RunnerFinalization403Tests(unittest.TestCase):
   return result
 
  def test_timer_stop_uses_local_only_export_and_labels_both_reports(self):
-  """Read the saved native results without fetching images after the reserve."""
+  """Keep saved prices and navigation in both partial exports, using only local evidence."""
   from openpyxl import load_workbook
   job, claim, runner = self.setup_job()
   with patch.object(self.native, '_catalogue_export_snapshot', wraps=self.native._catalogue_export_snapshot) as export, \
        patch.object(self.native, '_catalogue_image_store', side_effect=AssertionError('unexpected_s3')) as images:
-   result = self.run_timer_limited_research(job, claim, runner)
+   result = self.run_timer_limited_research(job, claim, runner, with_navigation=True)
   self.assertEqual(result['state'], 'cancelled')
   self.assertEqual(export.call_args.kwargs, {'local_only': True})
   images.assert_not_called()
@@ -90,6 +95,8 @@ class RunnerFinalization403Tests(unittest.TestCase):
    try:
     self.assertEqual(book['Состояние сбора']['A2'].value, 'Сбор прерван')
     self.assertIn('Лимит времени сбора', book['Состояние сбора']['B2'].value)
+    self.assertEqual(list(book['Время открытия карточек'].values)[1],
+                     (self.fixture.position.number, 2, 2, 1))
     self.assertTrue(any(row[12] == 100 and row[11] == 'уп'
                         for row in list(book['Предложения'].values)[1:]))
    finally:

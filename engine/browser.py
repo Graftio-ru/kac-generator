@@ -449,13 +449,13 @@ class Browser:
 
     @contextmanager
     def page(self, url: str) -> Iterator:
+        """Yield an opened supplier page, recording its navigation outcome before cleanup."""
         from playwright.sync_api import Error as PlaywrightError
 
         from . import supplier_methods as methods
         grant=methods.selected(url)
         started = time.monotonic()
         ready = False
-        host = (urlparse(url).hostname or "").removeprefix("www.")
         page_timeout = max(1, int(bounded_timeout(20, minimum=3) * 1000))
         trace = ArrivalTrace(url, started)
         trace.point('acquisition_start')
@@ -495,10 +495,10 @@ class Browser:
                 page._kac_document_url = str(response.url)  # Actual HTTP redirect destination, not requested URL.
                 page._kac_response_status = response.status_code
                 trace.commit(str(response.url), response.status_code)
-                record_stage("navigation", time.monotonic() - started, label=host)
                 methods.response(grant,response.status_code,content)
                 methods.current(grant,url)
                 ready = True
+                record_stage("navigation", time.monotonic() - started)
                 yield page
                 methods.current(grant,url)
                 return
@@ -536,9 +536,9 @@ class Browser:
             page._kac_document_url = document_url
             page._kac_retry_after = (getattr(response,'headers',{}).get('retry-after') if response else
                                     getattr(fallback,'headers',{}).get('retry-after') if 'fallback' in locals() else None)
-            record_stage("navigation", time.monotonic() - started, label=host)
             methods.current(grant,url)
             ready = True
+            record_stage("navigation", time.monotonic() - started)
             yield page
             methods.current(grant,url)
         except BaseException as error:
@@ -546,7 +546,7 @@ class Browser:
             raise
         finally:
             if not ready:
-                record_stage("navigation", time.monotonic() - started, ok=False, label=host)
+                record_stage("navigation", time.monotonic() - started, ok=False)
             cleanup_error = None
             trace.point('page_close_start')
             try:

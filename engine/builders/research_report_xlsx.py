@@ -292,8 +292,11 @@ def _write_catalogue_journal(wb, positions):
     return sheet
 
 
-def build_research_report(request: ResearchReportRequest, screenshot_links=None, context_links=None, *, interruption_reason=None) -> bytes:
-    """Build the workbook from saved evidence and disclose any collection interruption."""
+def build_research_report(
+    request: ResearchReportRequest, screenshot_links=None, context_links=None, *,
+    interruption_reason=None, navigation_timings: list[tuple[int, int, float, int]] | None = None,
+) -> bytes:
+    """Build the workbook from saved evidence, including any interruption and runner navigation metrics."""
     # A retained browser draft cannot bypass a newer server-known refusal.
     # This is review projection, not the final minimum-three admission gate.
     from ..search.base_db import refresh_receipt_snapshot, project_refresh_offers
@@ -322,6 +325,13 @@ def build_research_report(request: ResearchReportRequest, screenshot_links=None,
             "В отчёте сохранённые результаты. Непроверенные источники и данные, требующие проверки, не подтверждают отсутствие товара.",
         ), 1):
             _put(interruption, 2, column, value)
+    if navigation_timings:
+        timings = _sheet(wb, "Время открытия карточек", [
+            "№ позиции", "Попыток открытия", "Сумма времени попыток, с", "Ошибок открытия",
+        ], [14, 20, 28, 20])
+        for row, values in enumerate(navigation_timings, 2):
+            for column, value in enumerate(values, 1):
+                _put(timings, row, column, value)
     from ..source_notes import document_notes
     notes = document_notes(request.positions)
     if notes:

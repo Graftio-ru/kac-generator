@@ -136,7 +136,8 @@ class NativeResearchRunner:
   known-card work retain source identity, ownership, cancellation and deadline
   guards. An unknown begin/completion outcome is retained as uncertain and is
   never automatically repeated. DONE for known cards excludes reports and full
-  business readiness. Existing parse/build/approval delegation is unchanged.
+  business readiness. Reports include navigation timings from the saved
+  snapshot when present. Existing parse/build/approval delegation is unchanged.
   """
   from .schemas import PositionIn,ResearchReportRequest
   from .search.session import research_session
@@ -365,11 +366,15 @@ class NativeResearchRunner:
      return terminal_owned(snapshot)
    # Report projection is still the native runner authority, never client prices.
    rows=[]
+   navigation_timings=[]
    for index,position in enumerate(positions):
     row=(snapshot.get('rows')or[])[index]if index<len(snapshot.get('rows')or[])else None
     data=position.model_dump(mode='json')
     if row:
      data.update(offers=row.get('offers',[]),candidates=row.get('candidates',[]),source_checks=row.get('source_checks',[]),research_status=row.get('status',''),research_reason=row.get('reason',''))
+     navigation=row.get('metrics',{}).get('stages',{}).get('navigation')
+     if navigation:
+      navigation_timings.append((position.number,navigation['calls'],navigation['seconds'],navigation['errors']))
     rows.append(data)
    from .search.catalogue_projection import catalogue_scope
    from .builders.research_report_xlsx import build_research_report
@@ -381,6 +386,8 @@ class NativeResearchRunner:
     report_request, store, view, _ = native._catalogue_export_snapshot(report_request, **export_options)
     finalization_phase = 'report_build'
     report_options = {'interruption_reason': interruption_reason} if interruption_reason is not None else {}
+    if navigation_timings:
+     report_options['navigation_timings'] = navigation_timings
     with catalogue_scope(store, snapshot=view):
      workbook = build_research_report(report_request, **report_options)
      reusable = workbook if can_reuse_standalone_workbook(report_request) else None

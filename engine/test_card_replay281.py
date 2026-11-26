@@ -104,7 +104,10 @@ class CardReplayTests(unittest.TestCase):
   self.assertEqual(barrier['evidence']['basis'],'retained_card_outcome_unknown');self.assertEqual(barrier['evidence']['submission_stage'],'unknown');self.assertNotIn('trace_batch_id',barrier['evidence'])
 
  def test_saturated_metric_batch_never_proves_presend(self):
+  """Keep uncertain card operations closed to replay when evidence is incomplete or navigation occurred."""
   presend=event(sent=False,presend=True)
   self.assertFalse(definitely_presend([presend]*1024))
   self.assertFalse(definitely_presend([presend,{'stage':'telemetry_rejected','reason_code':'invalid_stage'}]))
+  for success in (True,False):
+   self.assertFalse(definitely_presend([presend,dict(stage='navigation',seconds=.5,ok=success,label='')]))
   self.assertFalse(definitely_presend([dict(presend,omitted_fields=1)]))

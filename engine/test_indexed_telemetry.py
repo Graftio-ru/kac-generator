@@ -30,34 +30,41 @@ class IndexedTelemetryTests(unittest.TestCase):
   telemetry.record_stage(stage,seconds,label=label)
  def events(self,jid,row=0):return app._research_store().public(jid)['rows'][row]['metrics']
  def test_actual_indexed_nested_capture_durable_http_model_usage_duplicates_safe(self):
+  """Persist safe physical timings once while rejecting arbitrary labels and invalid events."""
   source_calls=[];real_client=httpx.Client
   def handle(request):source_calls.append(request);return httpx.Response(200,content=b'<html>synthetic supplier</html>',headers={'content-type':'text/html'})
   def capture(*a,**kw):
+   """Emit representative navigation outcomes through the production collector."""
    browser._bounded_supplier_http_get(a[3],max_bytes=65536,max_redirects=2)
    with telemetry.capture_metrics():
     self.event();telemetry.record_llm_usage('cloudru',self.model,dict(input_tokens=7,output_tokens=3,prompt_cache_hit_tokens=2))
    self.event('browser_start',.25)
-   self.event('navigation',.5,'s0.test')
+   self.event('navigation',.5)
+   telemetry.record_stage('navigation',.25,ok=False)
+   self.event('navigation',1,'s0.test')
    self.event('llm',1,'https://secret.invalid/?key=SYNTHETIC_SECRET')
    self.event('supplier_http_wire',float('nan'))
    return self.f.capture(*a,**kw)
   def search(*a,**kw):
    self.event('search_api',.5,'xmlriver');return self.f.search(*a,**kw)
   positions=[self.position(qty=1),self.position(2,qty=24)]
-  with patch.object(httpx,'Client',side_effect=lambda **kw:real_client(transport=httpx.MockTransport(handle),**kw)):
+  # Existing proof evidence keeps this fixture focused on opening a price card.
+  with patch('engine.search.selected_proofs.proof_ready', return_value=True), \
+       patch.object(httpx,'Client',side_effect=lambda **kw:real_client(transport=httpx.MockTransport(handle),**kw)):
    job,public=self.f.job(positions,search=search,capture=capture)
   jid=job['job_id'];self.assertEqual(public['status'],'done',public.get('error'));physical=len(source_calls);self.assertGreater(physical,0)
   self.assertEqual(len(self.f.captures),physical);self.assertEqual([r['qty'] for r in public['rows']],[1,24])
   self.assertTrue(all(r['candidates'][0]['price_with_vat']==150 for r in public['rows']))
   metrics=public['rows'][0]['metrics'];self.assertEqual(metrics['stages']['llm'],dict(calls=physical,seconds=.125*physical,errors=0))
   self.assertEqual(metrics['stages']['supplier_http_wire']['calls'],physical);self.assertEqual(metrics['stages']['browser_start']['calls'],physical)
+  self.assertEqual(metrics['stages']['navigation'],dict(calls=2*physical,seconds=.75*physical,errors=physical))
   self.assertEqual(metrics['llm_usage']['cloudru:'+self.model],dict(responses=physical,input_tokens=7*physical,output_tokens=3*physical,cache_hit_tokens=2*physical))
-  self.assertEqual(metrics['rejected_events'],{'invalid_stage':2*physical,'unknown_stage':physical})
+  self.assertEqual(metrics['rejected_events'],{'invalid_stage':3*physical})
   self.assertEqual(public['rows'][1]['metrics']['stages'],{});self.assertEqual(public['rows'][1]['metrics']['llm_usage'],{})
   trace=app._research_store().db.execute('SELECT payload FROM trace WHERE job=?',(jid,)).fetchall()
   self.assertEqual(len(trace),len(metrics['events']));self.assertNotIn('SYNTHETIC_SECRET',json.dumps([r[0] for r in trace]));self.assertNotIn('s0.test',json.dumps([r[0] for r in trace]))
   grouped=app._research_store().db.execute('SELECT operation,COUNT(*) n FROM trace WHERE job=? GROUP BY operation',(jid,)).fetchall()
-  self.assertIn(7,[r['n'] for r in grouped])
+  self.assertIn(9,[r['n'] for r in grouped])
   self.assertIsNone(telemetry._METRICS.get());self.assertIsNone(telemetry._METRIC_STREAM.get())
  def test_thread_and_nested_context_isolation_one_native_batch_each(self):
   jid=self.empty_job(3);barrier=Barrier(3)

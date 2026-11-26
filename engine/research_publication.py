@@ -46,7 +46,7 @@ def public_source_evidence(value):
 PLAIN_LABELS = ["", "xmlriver", "source_variant", "semantic_variant", "article", "alias", "ok",
                 "http_error", "invalid_response", "configuration_missing", "budget",
                 "query_upstream_failure", "temporary_capacity", "ReadTimeout", "ConnectTimeout", "ConnectError"]
-STAGES = ["supplier_http_wire", "browser_start", "search_api", "llm", "screenshot", "search_queue", "discovery_query", "search_cache_hit",
+STAGES = ["supplier_http_wire", "browser_start", "navigation", "search_api", "llm", "screenshot", "search_queue", "discovery_query", "search_cache_hit",
           "search_response", "search_deferred", "search_response_retry", "search_transport_retry",
           "provider_transport", "model_output", "search_query_result", "search_transport_evidence"]
 PROVIDERS = {"cloudru", "deepseek", "anthropic", "unknown"}

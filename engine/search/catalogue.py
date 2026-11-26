@@ -967,9 +967,10 @@ def provider_attempts(events):
  return output
 
 def definitely_presend(events):
+ """Require complete before-send evidence; a recorded navigation leaves the card outcome uncertain."""
  if type(events) is not list or not 0<len(events)<1024:return False
  if len(json.dumps([v for v in events if v.get('stage')=='provider_transport']).encode())>6000:return False
- if any(v.get('stage')=='telemetry_rejected' or v.get('omitted_fields') for v in events):return False
+ if any(v.get('stage') in {'telemetry_rejected','navigation'} or v.get('omitted_fields') for v in events):return False
  attempts=provider_attempts(events)
  return bool(attempts) and all(v['outcome']=='error' and v['proven_presend'] is True and v['endpoint_send_started'] is False for v in attempts)
 

@@ -39,8 +39,8 @@ def can_reuse_standalone_workbook(request):
                    for position in request.positions for offer in _evidence(position))
 
 
-def build_research_package(request, *, standalone_workbook=None, interruption_reason=None):
-    """Package the workbook and locally available evidence, including any stop reason."""
+def build_research_package(request, *, standalone_workbook=None, interruption_reason=None, navigation_timings=None):
+    """Package the workbook and local evidence, retaining the runner's timing and interruption details."""
     files = {}
     links = {}
     context_links = {}
@@ -83,7 +83,7 @@ def build_research_package(request, *, standalone_workbook=None, interruption_re
     else:
         workbook = build_research_report(
             request, screenshot_links=links, context_links=context_links,
-            interruption_reason=interruption_reason,
+            interruption_reason=interruption_reason, navigation_timings=navigation_timings,
         )
     output = BytesIO()
     with ZipFile(output, 'w', compression=ZIP_DEFLATED) as archive:

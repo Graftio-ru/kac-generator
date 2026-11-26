@@ -41,6 +41,37 @@ class BrowserLifecycleTests(unittest.TestCase):
                         self.fail('failed setup must not yield')
                 page.close.assert_called_once_with(run_before_unload=True)
 
+    def test_navigation_records_one_result_after_supplier_method_validation(self):
+        """Record a refused page only once, even when its transport returned HTTP 200."""
+        from engine.telemetry import capture_metrics
+
+        url = 'https://supplier.example/card'
+        response = MagicMock(status_code=200, url=url, text='<html>Product</html>')
+        for method, denied_gate in (('http', 'response'), ('browser', 'current')):
+            for refused in (False, True):
+                with self.subTest(method=method, refused=refused):
+                    browser, page = self.page_browser()
+                    validation_error = RuntimeError('supplier method refused') if refused else None
+                    with patch('engine.supplier_methods.selected', return_value={'method': method}), \
+                            patch('engine.supplier_methods.response',
+                                  side_effect=validation_error if denied_gate == 'response' else None), \
+                            patch('engine.supplier_methods.current',
+                                  side_effect=validation_error if denied_gate == 'current' else None), \
+                            patch('engine.browser.supplier_http_get', return_value=response), \
+                            capture_metrics() as metrics:
+                        if refused:
+                            with self.assertRaisesRegex(RuntimeError, 'supplier method refused'):
+                                with browser.page(url):
+                                    self.fail('A refused supplier page must not yield')
+                        else:
+                            with browser.page(url) as opened:
+                                self.assertIs(opened, page)
+                    events = [event for event in metrics.events if event['stage'] == 'navigation']
+                    self.assertEqual(len(events), 1)
+                    self.assertEqual(events[0]['ok'], not refused)
+                    self.assertEqual(events[0]['label'], '')
+                    page.close.assert_called_once_with(run_before_unload=True)
+
     def test_consumer_error_survives_close_failure_and_invalidates_lease(self):
         browser, page = self.page_browser()
         browser._browser = MagicMock()
