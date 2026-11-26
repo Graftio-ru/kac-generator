@@ -1,0 +1,197 @@
+{
+  "cases": [
+    {
+      "position_number": 11,
+      "expected": "unknown",
+      "url": "https://www.chipdip.ru/product/transformator-toka-ct30-300a-klass-0.5-5v-a-dkc-8026732813"
+    },
+    {
+      "position_number": 11,
+      "expected": "exact_card",
+      "url": "https://www.elektro.ru/product/transformator_toka_ct30_300a_klass_0_5_5va_ct30-300-0_5-5/"
+    },
+    {
+      "position_number": 11,
+      "expected": "identity_conflict",
+      "url": "https://www.elektro.ru/product/tte-60-300_5a_klass_tochnosti_0_5_ekf_proxima/"
+    },
+    {
+      "position_number": 11,
+      "expected": "identity_conflict",
+      "url": "https://www.elektro.ru/product/ttn_30_300_5-10va_0_5-r_tdm/"
+    },
+    {
+      "position_number": 11,
+      "expected": "identity_conflict",
+      "url": "https://www.elektro.ru/product/transformator_toka_tshp-0_66_0_5_300_5_5va_diametr_40mm/"
+    },
+    {
+      "position_number": 11,
+      "expected": "identity_conflict",
+      "url": "https://www.elektro.ru/product/transformator_toka_tshp-0_66_0_5_300_5_5va_diametr_30mm/"
+    },
+    {
+      "position_number": 11,
+      "expected": "identity_conflict",
+      "url": "https://www.elektro.ru/product/ttn_40_300_5-10va_0_5-r_tdm/"
+    },
+    {
+      "position_number": 11,
+      "expected": "identity_conflict",
+      "url": "https://www.elektro.ru/product/ttn_30_300_5-_5va_0_5-r_tdm/"
+    },
+    {
+      "position_number": 12,
+      "expected": "unknown",
+      "url": "https://www.chipdip.ru/product/transformator-toka-ct30-300-5a-klass-tochnosti-0.5s-dkc-8040906343"
+    },
+    {
+      "position_number": 12,
+      "expected": "unknown",
+      "url": "https://www.elektro.ru/product/transformator_toka_ct30_300_5a_klass_tochnosti_-_0_5s_moshchnost_-_2_5va_1/"
+    },
+    {
+      "position_number": 12,
+      "expected": "identity_conflict",
+      "url": "https://www.elektro.ru/product/transformator_toka_ct60_300_5a_klass_tochnosti_-_0_5s_moshchnost_-_2_5va_1/"
+    },
+    {
+      "position_number": 12,
+      "expected": "unknown",
+      "url": "https://favorit-el.ru/catalog/transformator-toka-ct30-300-5a-klass-tochnosti-0-5s-moshchnost-2-5va.html"
+    },
+    {
+      "position_number": 12,
+      "expected": "unknown",
+      "url": "https://rs24.ru/product/3084058"
+    },
+    {
+      "position_number": 12,
+      "expected": "unknown",
+      "url": "https://rs24.ru/product/3111096"
+    },
+    {
+      "position_number": 12,
+      "expected": "recognised_listing",
+      "url": "https://rs24.ru/series/transformatory-toka"
+    },
+    {
+      "position_number": 12,
+      "expected": "unknown",
+      "url": "https://rs24.ru/product/3084051"
+    },
+    {
+      "position_number": 29,
+      "expected": "exact_card",
+      "url": "https://www.vseinstrumenti.ru/product/perforirovannyj-lotok-400h50h3000-dkc-35266-703252/"
+    },
+    {
+      "position_number": 29,
+      "expected": "unknown",
+      "url": "https://www.elektro.ru/product/lotok_perf_400kh50_l_3000_35266/"
+    },
+    {
+      "position_number": 29,
+      "expected": "recognised_listing",
+      "url": "https://www.vseinstrumenti.ru/tag-page/kabelnye-lotki-metallicheskie-perforirovannye-50h50h3000-1149299/"
+    },
+    {
+      "position_number": 29,
+      "expected": "recognised_listing",
+      "url": "https://www.vseinstrumenti.ru/tag-page/kabelnye-lotki-lestnichnye-200h50h3000-1149185/"
+    },
+    {
+      "position_number": 29,
+      "expected": "identity_conflict",
+      "url": "https://www.vseinstrumenti.ru/product/perforirovannyj-lotok-sistema-km-50x400x1-0-l2500-mm-standart-plyus-inox304-lpeplus50-400-1-0-2500-inox304-7907852/"
+    },
+    {
+      "position_number": 29,
+      "expected": "identity_conflict",
+      "url": "https://www.vseinstrumenti.ru/product/pryamoj-zamkovyj-perforirovannyj-lotok-oao-soemi-lms-pz-400h50-1-2ts-ut2-5-l-3000-mm-n0122132336-2095262/"
+    },
+    {
+      "position_number": 29,
+      "expected": "identity_conflict",
+      "url": "https://www.vseinstrumenti.ru/product/perforirovannyj-lotok-pro-lotki-ru-lmp-400n50-1-2-hdz-l-3000-tls52171hdz-vtls52171hdz-17570291/"
+    },
+    {
+      "position_number": 29,
+      "expected": "unknown",
+      "url": "https://www.vseinstrumenti.ru/product/lotok-perforirovannyj-lotok-400x50x3000-tolsch-1-mm-ltp-400x50x3000-1-17772521/"
+    }
+  ],
+  "cards": [
+    {
+      "position_number": 29,
+      "url": "https://dinastyasnab.ru/shop/goods/lotok_listovoy_perforirovannyiy_400h50_L3000_stal_DKC_35266-142577"
+    },
+    {
+      "position_number": 11,
+      "url": "https://www.elektro.ru/product/transformator_toka_ct30_300a_klass_0_5_5va_ct30-300-0_5-5/"
+    },
+    {
+      "position_number": 11,
+      "url": "https://www.dkc.market/product/ct30-300-0-5-3-transformator-toka-ct30-300-5a-klass-tochnosti-0-5-moshhnost-3va"
+    }
+  ],
+  "positions": [
+    {
+      "number": 11,
+      "name": "Трансформатор тока, класс точности - 0.5, мощность - 5ВА",
+      "type_mark": "CT30 300/5А / CT30-300-0.5-5",
+      "unit": "шт.",
+      "qty": 6.0,
+      "source_evidence": {
+        "reader": "native_pdf",
+        "cells": {
+          "number": "11",
+          "name": "Трансформатор тока, класс точности - 0.5, мощность - 5ВА",
+          "model": "CT30 300/5А",
+          "article": "CT30-300-0.5-5",
+          "maker": "DKC",
+          "unit": "шт.",
+          "qty": "6"
+        }
+      }
+    },
+    {
+      "number": 12,
+      "name": "Трансформатор тока, класс точности - 0.5s, мощность - 2.5ВА",
+      "type_mark": "CT30 300/5А / CT30-300-0.5s-2.5",
+      "unit": "шт.",
+      "qty": 6.0,
+      "source_evidence": {
+        "reader": "native_pdf",
+        "cells": {
+          "number": "12",
+          "name": "Трансформатор тока, класс точности - 0.5s, мощность - 2.5ВА",
+          "model": "CT30 300/5А",
+          "article": "CT30-300-0.5s-2.5",
+          "maker": "DKC",
+          "unit": "шт.",
+          "qty": "6"
+        }
+      }
+    },
+    {
+      "number": 29,
+      "name": "Лоток перфорированный 400х50 L3000, толщ.1,0 мм",
+      "type_mark": "35266",
+      "unit": "м",
+      "qty": 14.0,
+      "source_evidence": {
+        "reader": "native_pdf",
+        "cells": {
+          "number": "29",
+          "name": "Лоток перфорированный 400х50 L3000, толщ.1,0 мм",
+          "model": "",
+          "article": "35266",
+          "maker": "DKC",
+          "unit": "м",
+          "qty": "14"
+        }
+      }
+    }
+  ]
+}

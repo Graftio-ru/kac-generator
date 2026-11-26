@@ -3,6 +3,7 @@ import base64
 import copy
 import hashlib
 import json
+import os
 import time
 import unittest
 from contextlib import ExitStack
@@ -88,7 +89,11 @@ class LiteralCardQuoteTests(unittest.TestCase):
         return body, p, facts['url'], facts['captured_at']
 
     def corpus(self):
-        root = Path(__file__).resolve().parents[2] / 'EPIC-0001-TASK-0071/engine/testdata/atomic-service'
+        """Read the exact historical captures only when supplied for a replay."""
+        archive = os.environ.get('KAC_ATOMIC_SERVICE_CORPUS')
+        if not archive:
+            self.skipTest('Historical replay requires KAC_ATOMIC_SERVICE_CORPUS')
+        root = Path(archive)
         payload = (root / 'manifest.json').read_bytes()
         self.assertEqual(hashlib.sha256(payload).hexdigest(), 'ce745bae8008833329ca9ec39b5515a4e4a0c34901710edab06ecad2b6f8c5bf')
         manifest = json.loads(payload)

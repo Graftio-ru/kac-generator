@@ -1,0 +1,57 @@
+{
+  "products": {
+    "1": {
+      "history": []
+    },
+    "2": {
+      "history": [
+        {
+          "raw_amount": 10767.34,
+          "title": "Трансформатор тока CT30 300/5А, класс точности - 0.5S, мощность - 2.5ВА DKC (ДКС) CT30-300-0.5S-2.5",
+          "sale_unit": "шт",
+          "state": "observed",
+          "currency": "RUB",
+          "vat": "unknown",
+          "lot_quantity": null,
+          "package_quantity": null,
+          "unit_basis": null,
+          "purchase_terms": "",
+          "source_text": "Трансформатор тока CT30 300/5А, класс точности - 0.5S, мощность - 2.5ВА DKC (ДКС) CT30-300-0.5S-2.5\nЦена 10767.34 руб.\nЕдиница измерения: шт",
+          "source_sha256": "235ba2f20e6cfc47f4be7fd08568f65fb8dd7788669612198aa08419857990b5"
+        },
+        {
+          "raw_amount": 11501.55,
+          "title": "Трансформатор CT30-300-0.5S-2.5 тока CT30 300/5А, класс точности - 0.5S, мощность -  (ДКС)",
+          "sale_unit": "шт",
+          "state": "observed",
+          "currency": "RUB",
+          "vat": "unknown",
+          "lot_quantity": null,
+          "package_quantity": null,
+          "unit_basis": null,
+          "purchase_terms": "",
+          "source_text": "Трансформатор CT30-300-0.5S-2.5 тока CT30 300/5А, класс точности - 0.5S, мощность -  (ДКС)\nЦена 11501.55 руб.\nЕдиница измерения: шт",
+          "source_sha256": "e243c607864c21da99b739a1bd304518325d184a3c39aa9e4711d9e5549eddcc"
+        }
+      ]
+    },
+    "3": {
+      "history": [
+        {
+          "raw_amount": 4618.81,
+          "title": "Лоток листовой перфорированный 400х50 L3000 сталь DKC 35266",
+          "sale_unit": "шт",
+          "state": "observed",
+          "currency": "RUB",
+          "vat": "unknown",
+          "lot_quantity": null,
+          "package_quantity": null,
+          "unit_basis": null,
+          "purchase_terms": "",
+          "source_text": "Лоток листовой перфорированный 400х50 L3000 сталь DKC 35266\nЦена 4618.81 руб.\nЕдиница измерения: шт",
+          "source_sha256": "ec7ff3bad686921ea84a58c39de44032b691aa8a52b9a90ca6d9c31629bb36dd"
+        }
+      ]
+    }
+  }
+}

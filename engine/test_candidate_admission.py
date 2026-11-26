@@ -16,6 +16,12 @@ from engine.search.supplier_health_store import SupplierHealthStore
 from engine.search.session import PersistentSupplierHealth
 
 
+def saved_candidate_routes():
+    """Load public routing inputs without the historical captures or workspace tree."""
+    fixture = Path(__file__).parent / 'testdata/candidate-admission/routes.json'
+    return json.loads(fixture.read_text(encoding='utf-8'))
+
+
 def native(model='ABC123', article='', maker='Maker', name='Cable'):
     return PositionIn(number=1, name=name, type_mark=' / '.join(v for v in (model, article) if v), unit='м', qty=1,
         source_evidence={'reader':'native_pdf','cells':{'name':name,'model':model,'article':article,'maker':maker,'unit':'м'}}).to_result().position
@@ -160,18 +166,22 @@ class CandidateProductionTests(unittest.TestCase):
         self.run_candidates([url],hints={url:hint(url,title='CT30 3 – 5 VA')},native_position=p)
         self.assertEqual(self.captured,[url])
 
-    def test_frozen_corpus_through_actual_production_loop(self):
-        root=Path(__file__).resolve().parents[2]/'EPIC-0001-TASK-0071/engine/testdata/atomic-service'
-        manifest=json.loads((root/'manifest.json').read_text())
-        positions={v['number']:PositionIn.model_validate(v) for v in json.loads((root/'parsed.json').read_text())['positions']}
-        self.f.hosts[:]=list(dict.fromkeys(c['url'].split('/')[2].removeprefix('www.') for c in manifest['candidate_cases']))
-        expected=[]
-        for number in (11,12,29):
-            cases=[c for c in manifest['candidate_cases'] if c['position_number']==number]
-            self.run_candidates([c['url'] for c in cases],native_position=positions[number])
-            expected.extend(c['url'] for c in cases if c['expected']!='recognised_listing')
-        self.assertEqual(self.captured,expected)
-        self.assertEqual((sum(d.rejected for _,d in self.decisions),len(self.captured)),(3,21))
+    def test_saved_routes_through_actual_production_loop(self):
+        """Exercise retained routes through the native scheduler with stubbed transport."""
+        routes = saved_candidate_routes()
+        positions = {v['number']: PositionIn.model_validate(v) for v in routes['positions']}
+        self.f.hosts[:] = list(dict.fromkeys(c['url'].split('/')[2].removeprefix('www.') for c in routes['cases']))
+        expected = []
+        for number in (11, 12, 29):
+            cases = [case for case in routes['cases'] if case['position_number'] == number]
+            self.run_candidates([case['url'] for case in cases], native_position=positions[number])
+            expected.extend(case['url'] for case in cases if case['expected'] != 'recognised_listing')
+        # The scheduler can prioritize suppliers independently of discovery order.
+        self.assertCountEqual(self.captured, expected)
+        self.assertEqual(len(self.captured), 21)
+        rejected = {url for url, decision in self.decisions if decision.rejected}
+        self.assertEqual(rejected, {case['url'] for case in routes['cases']
+                                    if case['expected'] == 'recognised_listing'})
 
     def test_all_rejected_never_becomes_supplier_absence(self):
         url='https://www.chipdip.ru/catalog-show/cables'
@@ -232,27 +242,24 @@ class CandidateProductionTests(unittest.TestCase):
 
 
 class FrozenCorpusAdmissionTests(unittest.TestCase):
-    def test_frozen_real_queue_retains_every_non_listing_candidate(self):
-        root=Path(__file__).resolve().parents[2]/'EPIC-0001-TASK-0071/engine/testdata/atomic-service'
-        manifest_bytes=(root/'manifest.json').read_bytes()
-        self.assertEqual(hashlib.sha256(manifest_bytes).hexdigest(),'ce745bae8008833329ca9ec39b5515a4e4a0c34901710edab06ecad2b6f8c5bf')
-        manifest=json.loads(manifest_bytes)
-        for name,entry in manifest['files'].items():
-            self.assertEqual(hashlib.sha256((root/name).read_bytes()).hexdigest(),entry['sha256'],name)
-        positions={v['number']:PositionIn.model_validate(v).to_result().position for v in json.loads((root/'parsed.json').read_text())['positions']}
-        rejected=[];retained=[]
-        for case in manifest['candidate_cases']:
-            url=case['url'];host=url.split('/')[2].removeprefix('www.')
-            decision=admit_with_hint(url,host,positions[case['position_number']])
-            self.assertEqual(decision.rejected,case['expected']=='recognised_listing',url)
+    def test_saved_routes_retain_every_non_listing_candidate(self):
+        """Discovery may reject known listings but must leave card facts for later checks."""
+        routes = saved_candidate_routes()
+        positions = {v['number']: PositionIn.model_validate(v).to_result().position
+                     for v in routes['positions']}
+        rejected = []
+        retained = []
+        for case in routes['cases']:
+            url = case['url']
+            host = url.split('/')[2].removeprefix('www.')
+            decision = admit_with_hint(url, host, positions[case['position_number']])
+            self.assertEqual(decision.rejected, case['expected'] == 'recognised_listing', url)
             (rejected if decision.rejected else retained).append(url)
-        self.assertEqual((len(rejected),len(retained)),(3,21))
-        # Main-card snapshots, including wrong-power, are not discovery hints:
-        # URLs alone must retain them for the existing actual-card checks.
-        for card in manifest['cards']:
-            facts=json.loads(json.loads((root/card['captured_input']).read_text())['payload'])
-            url=facts['requested_url'];host=url.split('/')[2].removeprefix('www.')
-            self.assertFalse(admit_with_hint(url,host,positions[card['position_number']]).rejected,card['id'])
+        self.assertEqual((len(rejected), len(retained)), (3, 21))
+        for card in routes['cards']:
+            url = card['url']
+            host = url.split('/')[2].removeprefix('www.')
+            self.assertFalse(admit_with_hint(url, host, positions[card['position_number']]).rejected, url)
 
     def test_new_admission_source_is_bound_to_resume_runtime(self):
         runtime=app._catalogue_frontier_runtime()

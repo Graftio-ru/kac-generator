@@ -9,7 +9,8 @@ engine/data/output/
 engine/data/uploads/
 engine/data/base/
 
-# Local workspace state and catalogue databases
+# Local IDE/workspace state and catalogue databases
+/.idea/
 /.dreamteam/
 /catalogue.sqlite3
 /catalogue.sqlite3-wal

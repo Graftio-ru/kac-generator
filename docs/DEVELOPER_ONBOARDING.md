@@ -683,3 +683,54 @@ UA — фиксированный Chrome 131 Windows, локаль `ru-RU`, вь
 
 Более ранние сессии по проекту (до 16 июня) не сохранились как транскрипты, но все решения
 закоммичены и описаны в `HANDOFF.md` / `STATUS.md` / память проекта.
+
+## Local runtime packaging and offline regression checks
+
+Run these commands from the repository root with the installed Python dependencies
+from `engine/requirements.txt` and Node on `PATH`. Use a source-only export
+without `engine/.env` or local runtime data when checking offline behavior.
+
+```sh
+python -m unittest deploy.test_stage_public_context \
+  engine.test_candidate_admission.CandidateAdmissionTests \
+  engine.test_candidate_admission.FrozenCorpusAdmissionTests \
+  engine.test_candidate_admission.CandidateProductionTests.test_saved_routes_through_actual_production_loop \
+  engine.test_capture_frame_contract engine.test_purchase_scope \
+  engine.test_unit_decision_policy engine.test_seller_identity_policy \
+  engine.test_visibility_paint engine.test_native_geometry
+node --test web/tests/seller-policy.test.cjs web/tests/seller-provenance.test.cjs \
+  web/tests/supplier-city.test.cjs
+```
+
+The fixture directories in `engine/testdata/` cover candidate routes,
+price-frame geometry, seller identity and unit decisions. The reduced datasets
+exercise repository behavior and preserve selected test inputs. The original
+captures and the two September supplier-audit revisions are indexed by
+TASK-0514 in the workspace sources. The historical benchmark has its own
+corpus input through `python -m engine.benchmark_atomic_service --corpus <path>`.
+To run the archive-dependent literal-card tests, point
+`KAC_ATOMIC_SERVICE_CORPUS` at the `engine/testdata/atomic-service` directory
+inside the archive. Other historical task scripts can require their original
+evidence and are outside the portable regression command above.
+
+The application inventory lives in `deploy/.dockerignore`. Each
+`!public/<path>` line allows one reviewed source or asset. Add the exact path
+when the application gains a runtime file. Remove the entry when the file
+leaves the application. Keep the inventory free of wildcard exceptions.
+
+Use `deploy.stage_public_context.is_runtime_source` to select the members of
+`runtime_source_files` before pinning their byte counts and SHA-256 hashes.
+The selector uses the same application inventory plus the explicit list of
+local deployment inputs. Build and stage from the same reviewed packaging
+revision. Include its `deploy/.dockerignore` byte-for-byte in the packet and
+pass the independently accepted manifest SHA-256 to the staging command.
+
+```sh
+python deploy/stage_public_context.py --packet "$packet" \
+  --accepted-manifest-sha256 "$accepted_sha256" --output "$context"
+```
+
+The stager checks the inventory and pins before creating the context.
+The deployment operator files remain available under `public/deploy/` for
+local release work. Docker receives the engine, web app, and the root
+resources for the supplier methods page, supplier lists, and TSN lookup.

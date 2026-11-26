@@ -1,0 +1,32 @@
+[
+  {
+    "host": "dkc.market",
+    "has_quote": false,
+    "has_observation": false
+  },
+  {
+    "host": "elektro.ru",
+    "has_quote": false,
+    "has_observation": false
+  },
+  {
+    "host": "favorit-el.ru",
+    "has_quote": true,
+    "has_observation": true
+  },
+  {
+    "host": "chipdip.ru",
+    "has_quote": false,
+    "has_observation": false
+  },
+  {
+    "host": "electro-mpo.ru",
+    "has_quote": true,
+    "has_observation": true
+  },
+  {
+    "host": "dinastyasnab.ru",
+    "has_quote": true,
+    "has_observation": true
+  }
+]

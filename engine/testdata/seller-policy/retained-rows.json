@@ -1,0 +1,49 @@
+[
+  {
+    "unit": "шт.",
+    "offers": [],
+    "comparable_sources": 0,
+    "catalogue_product_id": "1",
+    "candidates": []
+  },
+  {
+    "unit": "шт.",
+    "offers": [],
+    "comparable_sources": 1,
+    "catalogue_product_id": "2",
+    "candidates": [
+      {
+        "url": "https://www.electro-mpo.ru/catalog/elektroschetchiki_transformatory_toka_shchitovye_p/b50_transformatory_toka_abb_schneider_electric_leg/b50-transformator-ct30-300-0-5s-2-5-toka-ct30-300-/",
+        "org_name": "",
+        "inn": "",
+        "listed_price_with_vat": 11501.55,
+        "price_with_vat": 11501.55,
+        "price_unit": "шт"
+      },
+      {
+        "url": "https://favorit-el.ru/catalog/transformator-toka-ct30-300-5a-klass-tochnosti-0-5s-moshchnost-2-5va.html",
+        "org_name": "ООО «Фаворит-Электро»",
+        "inn": "7701677700",
+        "listed_price_with_vat": 10767.34,
+        "price_with_vat": 10767.34,
+        "price_unit": "шт"
+      }
+    ]
+  },
+  {
+    "unit": "м",
+    "offers": [],
+    "comparable_sources": 1,
+    "catalogue_product_id": "3",
+    "candidates": [
+      {
+        "url": "https://dinastyasnab.ru/shop/goods/lotok_listovoy_perforirovannyiy_400h50_L3000_stal_DKC_35266-142577",
+        "org_name": "ООО «Династия»",
+        "inn": "7610131367",
+        "listed_price_with_vat": 4618.81,
+        "price_with_vat": 1539.6033333333335,
+        "price_unit": "шт"
+      }
+    ]
+  }
+]

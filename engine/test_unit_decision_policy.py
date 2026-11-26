@@ -48,17 +48,29 @@ class UnitDecisionPolicyTests(unittest.TestCase):
   self.assertTrue(_saved_price_unit_is_verified('шт','',None,100))
   self.assertFalse(_saved_price_unit_is_verified('м','шт',300,100,'Лоток L3000','https://xcom-shop.ru/p',''))
   self.assertTrue(_saved_price_unit_is_verified('м','шт',300,100,'Лоток L3000','https://xcom-shop.ru/p','Единица измерения: шт'))
- def test_retained_actual88_snapshot_invariants(self):
-  rows=json.loads((DATA/'rows.json').read_text());cat=json.loads((DATA/'catalogue.json').read_text());before=copy.deepcopy(cat);values=[]
+ def test_reduced_quote_fixtures_preserve_unit_decisions(self):
+  """Check pricing and selection invariants using only selected public facts."""
+  rows = json.loads((DATA.parent / 'seller-policy/retained-rows.json').read_text())
+  catalogue = json.loads((DATA / 'catalogue.json').read_text())
+  before = copy.deepcopy(catalogue)
+  values = []
   for row in rows:
-   for obs in cat['products'][row['catalogue_product_id']]['history']:
-    facts,reason=_facts(obs,row);self.assertEqual(reason,'');values.append((obs['raw_amount'],facts['price'],facts['quantity']))
-  self.assertEqual(sorted(values),sorted([(10767.34,10767.34,1),(11501.55,11501.55,1),(4618.81,1539.6033333333335,3)]))
-  self.assertEqual(cat,before);self.assertEqual([len(r['offers']) for r in rows],[0,0,0]);self.assertEqual([r['comparable_sources'] for r in rows],[0,1,1])
-  outcomes=json.loads((DATA/'outcomes.json').read_text());self.assertEqual(len(outcomes),6)
+   for observation in catalogue['products'][row['catalogue_product_id']]['history']:
+    facts, reason = _facts(observation, row)
+    self.assertEqual(reason, '')
+    values.append((observation['raw_amount'], facts['price'], facts['quantity']))
+  self.assertCountEqual(values, [(10767.34, 10767.34, 1), (11501.55, 11501.55, 1),
+                                 (4618.81, 1539.6033333333335, 3)])
+  self.assertEqual(catalogue, before)
+  self.assertEqual([len(row['offers']) for row in rows], [0, 0, 0])
+  self.assertEqual([row['comparable_sources'] for row in rows], [0, 1, 1])
+  outcomes = json.loads((DATA / 'outcomes.json').read_text())
+  self.assertEqual(len(outcomes), 6)
   for item in outcomes:
-   if item['host'] in {'dkc.market','chipdip.ru','elektro.ru'}:self.assertIsNone(item['quote']);self.assertIsNone(item['observation'])
-  self.assertEqual(sum(item['quote'] is not None for item in outcomes),3) # frozen actual outcomes, not a reprobe.
+   if item['host'] in {'dkc.market', 'chipdip.ru', 'elektro.ru'}:
+    self.assertFalse(item['has_quote'])
+    self.assertFalse(item['has_observation'])
+  self.assertEqual(sum(item['has_quote'] for item in outcomes), 3)
 
  def test_catalogue_missing_lot_quantity_and_recommendation_only(self):
   self.assertIsNone(_product_length_metres('Рекомендуем L3000'))
