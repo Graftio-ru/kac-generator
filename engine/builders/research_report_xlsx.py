@@ -150,7 +150,11 @@ def _checked_date(value):
 def _quote_details(offer, position):
     """Export local denomination separately from immutable supplier evidence."""
     if offer.catalogue_ref:
-        from ..search.catalogue_projection import catalogue_raw_facts
+        from ..search.catalogue_projection import catalogue_raw_facts, saved_catalogue_report
+        if saved_catalogue_report():
+            return dict(quantity=None, unit_text='Основание не перепроверено',
+                        calculation='Сохранённая цена; пересчёт не подтверждён',
+                        observed_at=offer.catalogue_observed_at or None)
         raw_facts = catalogue_raw_facts(offer, position)
         from ..source_quote import quote_review_reason
         if quote_review_reason(offer, position):

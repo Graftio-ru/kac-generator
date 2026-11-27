@@ -266,7 +266,7 @@ def record_page_article(url: str, article: str) -> int:
 
 
 def _result_from_entry(entry: dict, pos: SpecPosition, year: str, quarter: str) -> PositionResult:
-    """Восстанавливает PositionResult из записи базы (год/квартал — текущие, переданные)."""
+    """Восстанавливает позицию и использует каталог, только когда это разрешено текущим контекстом."""
     from .agent import (_conflicting_explicit_article, _conflicting_full_model_code,
                         _conflicting_model_code_in_title, _conflicting_numeric_article,
                         _conflicting_network_cable_spec, _conflicting_page_article,
@@ -295,7 +295,7 @@ def _result_from_entry(entry: dict, pos: SpecPosition, year: str, quarter: str) 
     cands = [PriceOffer(**o) for o in
              (entry.get("candidates") or entry.get("offers") or [])]
     from . import catalogue_projection as projection
-    store=projection._SCOPED_STORE.get()or projection._STORE
+    store=projection.current_catalogue_store()
     if store is not None and any(o.catalogue_ref for o in cands):
         from .catalogue import identity_for_position
         projected=projection.project_product(store,identity_for_position(pos),pos)

@@ -1454,10 +1454,10 @@ def _run_catalogue_unknown_job(job_id, store, *, resumed=None):
 
 
 def _run_catalogue_unknown_job_with_documents(job_id, store, *, resumed=None):
-    """Run native acquisition and share one optional attribution pair across its products."""
+    """Run acquisition and retain the first no-write refusal separately from cleanup authority."""
     global _ACTIVE_RESEARCH_ID
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    from .search.catalogue import identity_for_position, CatalogueStoreError
+    from .search.catalogue import Acquisition, CatalogueStoreError, identity_for_position
     from .search.whitelist import whitelist_hosts
     from .llm import LLMRequestGuard,_JOB_REQUEST_LIMITS
     from .search.session import PersistentSupplierHealth
@@ -1496,6 +1496,9 @@ def _run_catalogue_unknown_job_with_documents(job_id, store, *, resumed=None):
                 check_runner_stop()
             raise SearchBudgetExceeded('Общий срок получения завершён')
     lease_keeper=AcquisitionLeaseKeeper(store,lease_control,cancelled=lambda:bool(job.get('cancel_requested')),owner=job_id)
+    admission_stop = None
+    # Only a fresh, acknowledged cleanup may publish report eligibility.
+    job.pop('catalogue_admission_stop', None)
     try:
         from .search.catalogue_xmlriver import CatalogueXmlRiver, STATE_KEY
         if resumed is None:
@@ -1540,7 +1543,15 @@ def _run_catalogue_unknown_job_with_documents(job_id, store, *, resumed=None):
                 if product is not None and _catalogue_missing_required(positions[indices[0]],store,product):
                     admission=store.acquire_missing(identity,hosts,owner=job_id,expected_revision=fresh['revision'],mode='missing_data')
                     if not admission.allowed:
-                        raise CatalogueStoreError('Missing-data admission refused: '+admission.reason)
+                        if admission == Acquisition('', '', 0, False, 'snapshot_changed'):
+                            # This exact CAS result precedes every write. No target lease was issued.
+                            admission_stop = {
+                                'code': 'snapshot_changed', 'job_id': job_id,
+                                'position_index': indices[0], 'position_number': positions[indices[0]].number,
+                                'expected_revision': fresh['revision'],
+                                'prior_generation': (product.get('acquisition') or {}).get('generation'),
+                            }
+                        raise CatalogueStoreError('Missing-data admission refused')
                 else:
                     admission=store.acquire_unknown(identity,hosts,owner=job_id)
             else:
@@ -1634,12 +1645,18 @@ def _run_catalogue_unknown_job_with_documents(job_id, store, *, resumed=None):
         job.update(status='cancelled' if job.get('cancel_requested') else 'error',error=stop['reason'],error_code=stop['code'],first_stop=stop)
         _save_research_job(job_id,force=True)
     finally:
+        if admission_stop is not None:
+            job['catalogue_admission_stop'] = dict(admission_stop, cleanup_confirmed=False)
         if job.get('status') in {'error','cancelled'}:job.update(awaiting_provider=False,awaiting_supplier=False,awaiting_slice=False)
         try:
             lease_keeper.stop(revoke=bool(job.get('cancel_requested') or guard.diagnostic() or job.get('status')=='error'),reason=job.get('error') or 'Получение каталога остановлено',cancelled=bool(job.get('cancel_requested')))
             for admission in admissions.values():
                 if job.get('cancel_requested'):store.cancel_acquisition(admission)
                 elif job.get('status')=='error' or admission.product_id not in job.get('catalogue_awaiting_products',[]):store.finish_acquisition(admission,error=job.get('error',''))
+            if (admission_stop is not None and job.get('status') == 'error'
+                    and job.get('error_code') == 'catalogue_store_error' and not job.get('cancel_requested')
+                    and not guard.diagnostic() and lease_keeper.revocations_confirmed(admissions.values())):
+                job['catalogue_admission_stop']['cleanup_confirmed'] = True
         except CatalogueStoreError:
             job.update(status='error',error='Каталог недоступен; получение остановлено',error_code='catalogue_store_error')
         job.pop('_catalogue_xmlriver',None)

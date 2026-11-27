@@ -615,7 +615,7 @@ def current_offer_article_evidence(offer,position):
     from .catalogue import identity_for_position
     field=lambda k,d=None:offer.get(k,d)if isinstance(offer,dict)else getattr(offer,k,d)
     reference=field('catalogue_ref',{})or {}
-    store=projection._SCOPED_STORE.get()or projection._STORE
+    store=projection.current_catalogue_store()
     if store is None or set(reference)!={'product_id','observation_id'}:return {}
     try:
         if identity_for_position(position).key!=reference['product_id']:return {}

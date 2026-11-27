@@ -9,6 +9,7 @@ import hashlib,json,re
 from pathlib import PurePosixPath
 from typing import TypedDict, cast
 from urllib.parse import urlsplit
+CATALOGUE_ADMISSION_REPORT='catalogue_admission_snapshot_changed'
 MAX_JSON=16*1024*1024
 MAX_ARTIFACT=64*1024*1024
 MAX_TOTAL=256*1024*1024

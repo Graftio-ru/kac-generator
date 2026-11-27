@@ -9,6 +9,7 @@ _STORE = None
 _SCOPED_STORE = ContextVar('catalogue_projection_store', default=None)
 _SCOPED_SNAPSHOT = ContextVar('catalogue_projection_snapshot', default=None)
 _SCOPED_READ_CACHE = ContextVar('catalogue_projection_read_cache', default=None)
+_SAVED_REPORT = ContextVar('saved_catalogue_report', default=False)
 
 def configure_store(store):
     """Server composition only. Request data must never supply a store."""
@@ -26,6 +27,29 @@ def catalogue_scope(store, *, snapshot=None):
         _SCOPED_SNAPSHOT.reset(snapshot_token)
         _SCOPED_READ_CACHE.reset(cache_token)
         _SCOPED_STORE.reset(token)
+
+@contextmanager
+def saved_catalogue_report_scope():
+    """Show persisted raw facts without falling back to any live catalogue authority."""
+    token = _SAVED_REPORT.set(True)
+    try:
+        with catalogue_scope(None):
+            yield
+    finally:
+        _SAVED_REPORT.reset(token)
+
+
+def saved_catalogue_report():
+    """Tell the report builder that dates refer to saved, unvalidated facts."""
+    return _SAVED_REPORT.get()
+
+
+def current_catalogue_store(store=None):
+    """Resolve the usual store, unless a saved-only report has disabled catalogue reads."""
+    if _SAVED_REPORT.get():
+        return None
+    return store or _SCOPED_STORE.get() or _STORE
+
 
 def _scoped_read(store, kind, key, read):
     """Reuse native immutable reads only inside one trusted frozen scope.
@@ -86,9 +110,10 @@ def _image(observation):
         return '', {}, 'Сохранённый снимок каталога недоступен'
 
 def _estimator_approval(observation,position,store=None):
+    """Resolve active approvals only for a verified observation under a live catalogue scope."""
     from .estimator_approval import active_approval,_exists,_material,_hash
     from .catalogue import CatalogueStoreError
-    target=store or _SCOPED_STORE.get() or _STORE
+    target=current_catalogue_store(store)
     # No authority exists without its durable table. Recheck schema every use;
     # do not parse/qualify a price just to discover there is no approval source.
     valid_source=False
@@ -345,7 +370,7 @@ def _facts(observation, position):
 
 def catalogue_raw_facts(offer, position, *, store=None):
     """Bound raw source display only; this is never financial admission."""
-    store=store or _SCOPED_STORE.get() or _STORE
+    store=current_catalogue_store(store)
     reference=_field(offer,'catalogue_ref',{})
     if not store or position is None or type(reference) is not dict or set(reference)!={'product_id','observation_id'}:return None
     try:
@@ -385,7 +410,7 @@ def catalogue_raw_facts(offer, position, *, store=None):
 
 
 def catalogue_review_reason(offer, position=None, *, store=None):
-    store = store or _SCOPED_STORE.get() or _STORE
+    store = current_catalogue_store(store)
     reference = _field(offer, 'catalogue_ref', {})
     if not store or type(reference) is not dict or set(reference) != {'product_id', 'observation_id'}:
         return 'Ссылка на источник каталога не подтверждена'

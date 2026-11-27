@@ -139,6 +139,12 @@ class AcquisitionLeaseKeeper:
    self._thread.join(20)
    if self._thread.is_alive():raise CatalogueStoreError('Продление прав каталога не завершено')
   if revoke:self.revoke_all(reason=reason,cancelled=cancelled)
+ def revocations_confirmed(self,admissions):
+  """Confirm every earlier lease was closed by this keeper without an unknown outcome."""
+  with self._lock:
+   return (self._stop.is_set() and (self._thread is None or not self._thread.is_alive())
+           and self._failure is None and all(self._key(admission) in self._revoked for admission in admissions))
+
  @property
  def stopped(self):return self._stop.is_set()
  def _run(self):

@@ -6,7 +6,7 @@ proof that paid work stopped. Queue and publication use separate control data.
 import hashlib,json,os,re,secrets,sqlite3,time,uuid
 from contextlib import contextmanager
 from pathlib import Path
-from .runner_protocol import bounded,canonical,digest,identifier,manifest,public_snapshot,MAX_ARTIFACT,command
+from .runner_protocol import bounded,canonical,digest,identifier,manifest,public_snapshot,MAX_ARTIFACT,command,CATALOGUE_ADMISSION_REPORT
 class DispatchError(ValueError):pass
 class RunnerControl:
  def __init__(self,root,source_seal,*,clock=time.time,lease_seconds=30):
@@ -174,16 +174,31 @@ class RunnerControl:
     os.replace(temp,path);fd=os.open(folder,os.O_RDONLY);os.fsync(fd);os.close(fd)
    db.execute('INSERT OR IGNORE INTO artifacts VALUES(?,?,?)',(job,entry['name'],canonical(entry).decode()))
  def complete(self,job,token,fence,entries,snapshot,outcome):
+  """Publish registered results under the live fence, atomically rejecting late catalogue-report cancellation."""
   entries=manifest(entries);snap=public_snapshot(snapshot,job,entries)
   if outcome not in {'done','error','cancelled','uncertain'}:raise DispatchError('runner_outcome_invalid')
   with self.tx()as db:
    row=self._owned(db,job,token,fence)
    if row['state']!='started':raise DispatchError('runner_not_started')
+   catalogue_report=bool(entries) and snap.get('finalization_reason')==CATALOGUE_ADMISSION_REPORT
+   if catalogue_report:
+    if row['cancel']:raise DispatchError('runner_cancelled')
+    checkpoint=json.loads(row['snapshot']) if row['snapshot'] else {}
+    stop=snap.get('catalogue_admission_stop')
+    if (outcome!='error' or snap.get('partial') is not True or snap.get('business_complete') is not False
+        or type(stop)is not dict or stop.get('code')!='snapshot_changed' or stop.get('job_id')!=job
+        or stop.get('cleanup_confirmed') is not True
+        or checkpoint.get('finalization_reason')!=CATALOGUE_ADMISSION_REPORT
+        or checkpoint.get('partial') is not True or checkpoint.get('business_complete') is not False
+        or checkpoint.get('catalogue_admission_stop')!=snap['catalogue_admission_stop']):
+     raise DispatchError('runner_catalogue_report_checkpoint_invalid')
    for entry in entries:
     registered=db.execute('SELECT payload FROM artifacts WHERE job=? AND name=?',(job,entry['name'])).fetchone()
     if not registered or json.loads(registered[0])!=entry:raise DispatchError('runner_artifact_unregistered')
     path=self.root/'artifacts'/job/entry['sha256']
     if path.is_symlink()or not path.is_file()or path.stat().st_size!=entry['bytes']or hashlib.sha256(path.read_bytes()).hexdigest()!=entry['sha256']:raise DispatchError('runner_artifact_missing')
+   if catalogue_report and self.clock()>=min(row['lease'],row['deadline']):
+    raise DispatchError('runner_fence_lost')
    if row['cancel']and outcome=='done':outcome='cancelled'
    if outcome in {'done','error','cancelled'}:
     snap['native_snapshot_status']=snap.get('status');snap['status']=outcome

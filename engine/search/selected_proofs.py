@@ -13,7 +13,7 @@ def proof_ready(offer,position):
     reference=_field(offer,'catalogue_ref')
     if not reference:return True # Existing manual/letter/noncatalogue rules.
     from . import catalogue_projection as projection
-    store=projection._SCOPED_STORE.get() or projection._STORE
+    store=projection.current_catalogue_store()
     if store is None:return False
     try:
         record=store.resolve_observation(reference['product_id'],reference['observation_id'])
@@ -25,9 +25,10 @@ def proof_ready(offer,position):
     except (KeyError,TypeError,ValueError):return False
 
 def _server_attempts(position):
+    """Read server attempts only when the current report scope permits catalogue access."""
     from . import catalogue_projection as projection
     from .catalogue import identity_for_position
-    store=projection._SCOPED_STORE.get() or projection._STORE
+    store=projection.current_catalogue_store()
     if store is None:return []
     identity=identity_for_position(position);frozen=projection._SCOPED_SNAPSHOT.get()
     product=(frozen.get('products',{}).get(identity.key) if 'products' in frozen else frozen) if frozen is not None else store.lookup(identity)
@@ -38,9 +39,10 @@ def price_candidates(result):
     return select_top_offers(result.all_offers or result.offers,3,result.position)
 
 def final_offers(result):
+    """Choose comparable offers and attach available proof from the authorized catalogue scope."""
     selected=price_candidates(result);output=[]
     from . import catalogue_projection as projection
-    store=projection._SCOPED_STORE.get() or projection._STORE
+    store=projection.current_catalogue_store()
     for offer in selected:
         reference=_field(offer,'catalogue_ref')
         if not reference:

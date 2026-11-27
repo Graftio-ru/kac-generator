@@ -5,11 +5,11 @@ No automatic resume: a local started/uncertain dispatch ID is never invoked
 again, even after control transport or process restart. Native catalogue/cache
 and manual-approval authority never migrate to the website control.
 """
-import base64,hashlib,json,math,os,sqlite3,threading,time
+import base64,hashlib,json,math,os,re,sqlite3,threading,time
 from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import Request,urlopen
-from .runner_protocol import canonical,digest,manifest,command,ProtocolError,MAX_JSON,MAX_ARTIFACT,MAX_TOTAL
+from .runner_protocol import canonical,digest,manifest,command,ProtocolError,MAX_JSON,MAX_ARTIFACT,MAX_TOTAL,CATALOGUE_ADMISSION_REPORT
 class RunnerExecutionError(ValueError):pass
 
 # Global research policy: 27 minutes acquisition + 3 minutes finalization
@@ -30,6 +30,46 @@ def _model_interruption(snapshot):
   reason = stop.get('reason')
   return reason if isinstance(reason, str) and reason.strip() else 'API модели недоступен'
  return None
+
+def _catalogue_admission_report(snapshot, positions, job):
+ """Require the native no-write receipt, same input row, and an uncancelled terminal snapshot."""
+ stop=snapshot.get('catalogue_admission_stop')
+ if (snapshot['status']!='error' or snapshot.get('error_code')!='catalogue_store_error'
+     or snapshot.get('cancel_requested') or snapshot.get('first_stop')
+     or snapshot.get('acquisition_mode')!='missing_data' or type(stop)is not dict
+     or set(stop)!={'code','job_id','position_index','position_number','expected_revision',
+                   'prior_generation','cleanup_confirmed'}
+     or stop['code']!='snapshot_changed' or stop['job_id']!=job
+     or stop['cleanup_confirmed'] is not True):
+  return False
+ index=stop['position_index'];generation=stop['prior_generation'];revision=stop['expected_revision']
+ return (type(index)is int and 0<=index<len(positions)
+         and type(stop['position_number'])is int and positions[index].number==stop['position_number']
+         and type(revision)is int and revision>=0
+         and (generation is None or type(generation)is int and generation>0))
+
+
+def _saved_catalogue_candidates(row):
+ """Retain one raw quote per bound observation, without qualifying it for an estimate."""
+ candidates=[];seen=set()
+ for offer in row.get('candidates',[])+row.get('offers',[]):
+  ref=offer.get('catalogue_ref');amount=offer.get('listed_price_with_vat')
+  if (type(ref)is not dict or set(ref)!={'product_id','observation_id'}
+      or ref['product_id']!=row.get('catalogue_product_id')
+      or type(ref['product_id'])is not str or not re.fullmatch('[0-9a-f]{64}',ref['product_id'])
+      or type(ref['observation_id'])is not str or not re.fullmatch('[0-9a-f]{32}',ref['observation_id'])
+      or type(amount)not in (int,float) or not math.isfinite(amount) or amount<=0):
+   continue
+  observation = (ref['product_id'], ref['observation_id'])
+  if observation in seen:
+   continue
+  seen.add(observation)
+  candidates.append(dict(offer,price_with_vat=amount,normalized_price_unit='',
+                         unit_review_required=True,estimator_approval_ref={},estimator_approval={},
+                         screenshot_product='',screenshot_context='',screenshot_requisites='',
+                         context_capture_evidence={}))
+ return candidates
+
 
 def _safe_error(error):
  """No exception messages, response bodies, headers, URLs or arbitrary names."""
@@ -134,8 +174,9 @@ class NativeResearchRunner:
 
   Persists begin_pending before the first state-changing RPC. Research and
   known-card work retain source identity, ownership, cancellation and deadline
-  guards. An unknown begin/completion outcome is retained as uncertain and is
-  never automatically repeated. DONE for known cards excludes reports and full
+  guards. A confirmed no-write catalogue stop may publish previously persisted
+  raw rows after an acknowledged checkpoint. An unknown begin/completion outcome
+  is retained as uncertain and is never automatically repeated. DONE for known cards excludes reports and full
   business readiness. Reports include navigation timings from the saved
   snapshot when present. Existing parse/build/approval delegation is unchanged.
   """
@@ -325,13 +366,17 @@ class NativeResearchRunner:
      raise RunnerExecutionError('runner_result_unacknowledged')
     self._state(job, 'acknowledged', dict(ack, terminal_without_reports=True))
     return ack
+   native_terminal = snapshot
+   catalogue_report = not known_cards and _catalogue_admission_report(snapshot,positions,job)
    model_stop_reason = None if known_cards else _model_interruption(snapshot)
    time_reserved = reserve_stop.is_set()
    deadline_report = time_reserved and not known_cards
    interruption_reason = model_stop_reason
-   if deadline_report and interruption_reason is None:
+   if catalogue_report:
+    interruption_reason = 'Каталог изменился перед сбором; показаны сохранённые результаты'
+   elif deadline_report and interruption_reason is None:
     interruption_reason = 'Лимит времени сбора исчерпан'
-   partial_report_allowed = time_reserved or model_stop_reason is not None
+   partial_report_allowed = catalogue_report or time_reserved or model_stop_reason is not None
    if snapshot['status'] in {'error','cancelled'} and (
        not partial_report_allowed or lost.is_set() or external_cancel.is_set()
    ):
@@ -342,10 +387,12 @@ class NativeResearchRunner:
    outcome=snapshot['status']
    if model_stop_reason is not None:
     snapshot = dict(snapshot, partial=True, finalization_reason='llm_unavailable', business_complete=False)
+   elif catalogue_report:
+    snapshot=dict(snapshot,partial=True,finalization_reason=CATALOGUE_ADMISSION_REPORT,business_complete=False)
    elif time_reserved:
     snapshot=dict(snapshot,partial=True,finalization_reason='research_time_reserved',business_complete=False)
-   if deadline_report:
-    # Persist the final prices and timer reason before optional export work.
+   if deadline_report or catalogue_report:
+    # Persist the final prices and interruption reason before optional export work.
     # Later heartbeats keep publishing this same snapshot within the lease.
     with checkpoint_lock:
      if ownership_lost():
@@ -363,32 +410,44 @@ class NativeResearchRunner:
      frozen_partial_snapshot = snapshot
     if saved['cancel_requested']:
      external_cancel.set()
-     return terminal_owned(snapshot)
+     return terminal_owned(native_terminal if catalogue_report else snapshot)
    # Report projection is still the native runner authority, never client prices.
    rows=[]
    navigation_timings=[]
    for index,position in enumerate(positions):
     row=(snapshot.get('rows')or[])[index]if index<len(snapshot.get('rows')or[])else None
     data=position.model_dump(mode='json')
+    if catalogue_report:
+     data.update(offers=[],candidates=[])
     if row:
-     data.update(offers=row.get('offers',[]),candidates=row.get('candidates',[]),source_checks=row.get('source_checks',[]),research_status=row.get('status',''),research_reason=row.get('reason',''))
+     if catalogue_report and (row.get('index')!=index or row.get('number')!=position.number):
+      raise RunnerExecutionError('runner_native_unsettled')
+     data.update(offers=[] if catalogue_report else row.get('offers',[]),
+                 candidates=_saved_catalogue_candidates(row) if catalogue_report else row.get('candidates',[]),
+                 source_checks=row.get('source_checks',[]),research_status=row.get('status',''),research_reason=row.get('reason',''))
      navigation=row.get('metrics',{}).get('stages',{}).get('navigation')
      if navigation:
       navigation_timings.append((position.number,navigation['calls'],navigation['seconds'],navigation['errors']))
     rows.append(data)
-   from .search.catalogue_projection import catalogue_scope
+   from .search.catalogue_projection import catalogue_scope,saved_catalogue_report_scope
    from .builders.research_report_xlsx import build_research_report
    from .builders.research_package import build_research_package,can_reuse_standalone_workbook
+   if catalogue_report and not any(row['candidates'] for row in rows):
+    return terminal_owned(native_terminal)
    try:
     finalization_phase = 'current_projection'
     report_request = ResearchReportRequest.model_validate({'positions': rows})
-    export_options = {'local_only': True} if interruption_reason is not None else {}
-    report_request, store, view, _ = native._catalogue_export_snapshot(report_request, **export_options)
+    if catalogue_report:
+     report_scope = saved_catalogue_report_scope()
+    else:
+     export_options = {'local_only': True} if interruption_reason is not None else {}
+     report_request, store, view, _ = native._catalogue_export_snapshot(report_request, **export_options)
+     report_scope = catalogue_scope(store,snapshot=view)
     finalization_phase = 'report_build'
     report_options = {'interruption_reason': interruption_reason} if interruption_reason is not None else {}
     if navigation_timings:
      report_options['navigation_timings'] = navigation_timings
-    with catalogue_scope(store, snapshot=view):
+    with report_scope:
      workbook = build_research_report(report_request, **report_options)
      reusable = workbook if can_reuse_standalone_workbook(report_request) else None
      package = build_research_package(report_request, standalone_workbook=reusable, **report_options)
@@ -411,15 +470,15 @@ class NativeResearchRunner:
       for child in value:images(child)
     # Under the timer, local evidence may travel inside the ZIP; publish
     # only the two reports as standalone artifacts to bound the manifest.
-    if not deadline_report:
+    if not (deadline_report or catalogue_report):
      images(snapshot)
     entries=[{'name':name,'content_type':kind,'bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest()}for name,kind,raw in artifacts];manifest(entries)
    except Exception as error:
     if interruption_reason is None or ownership_lost():
      raise
     # A local export failure must not prevent delivery of the saved terminal rows.
-    snapshot['partial_report_failure'] = dict(phase=finalization_phase, **_safe_error(error))
-    return terminal_owned(snapshot)
+    failure = dict(phase=finalization_phase, **_safe_error(error))
+    return terminal_owned(dict(snapshot, partial_report_failure=failure))
    finalization_phase='publish_artifacts'
    for entry,(_,_,raw)in zip(entries,artifacts):
     if ownership_lost():raise RunnerExecutionError('runner_lease_lost')
@@ -434,7 +493,7 @@ class NativeResearchRunner:
    if control['cancel_requested']:
     if snapshot['status']in {'error','cancelled'}:
      finalization_phase='terminal_ack'
-     return terminal_owned(snapshot,proof=control)
+     return terminal_owned(native_terminal if catalogue_report else snapshot,proof=control)
     raise RunnerExecutionError('runner_cancelled')
    if ownership_lost():raise RunnerExecutionError('runner_lease_lost')
    finalization_phase='terminal_ack'
