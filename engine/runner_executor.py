@@ -169,10 +169,11 @@ class NativeResearchRunner:
 
   Persists begin_pending before the first state-changing RPC. Research and
   known-card work retain source identity, ownership, cancellation and deadline
-  guards. A confirmed no-write catalogue stop may publish previously persisted
-  raw rows after an acknowledged checkpoint. An unknown begin/completion outcome
-  is retained as uncertain and is never automatically repeated. DONE for known cards excludes reports and full
-  business readiness. Reports include navigation timings from the saved
+  guards. A timer cutoff or confirmed no-write catalogue stop may publish
+  previously persisted raw rows after an acknowledged checkpoint. An unknown
+  begin/completion outcome stays uncertain and is never automatically repeated.
+  DONE for known cards excludes reports and full business readiness.
+  Reports include navigation timings from the saved
   snapshot when present. Existing parse/build/approval delegation is unchanged.
   """
   from .schemas import PositionIn,ResearchReportRequest
@@ -366,6 +367,9 @@ class NativeResearchRunner:
    model_stop_reason = None if known_cards else _model_interruption(snapshot)
    time_reserved = reserve_stop.is_set()
    deadline_report = time_reserved and not known_cards
+   # A timer export uses the acknowledged snapshot without requalifying
+   # prices or reading images from the mutable catalogue during the reserve.
+   saved_report = catalogue_report or (deadline_report and model_stop_reason is None)
    interruption_reason = model_stop_reason
    if catalogue_report:
     interruption_reason = 'Каталог изменился перед сбором; показаны сохранённые результаты'
@@ -412,13 +416,13 @@ class NativeResearchRunner:
    for index,position in enumerate(positions):
     row=(snapshot.get('rows')or[])[index]if index<len(snapshot.get('rows')or[])else None
     data=position.model_dump(mode='json')
-    if catalogue_report:
+    if saved_report:
      data.update(offers=[],candidates=[])
     if row:
-     if catalogue_report and (row.get('index')!=index or row.get('number')!=position.number):
+     if saved_report and (row.get('index')!=index or row.get('number')!=position.number):
       raise RunnerExecutionError('runner_native_unsettled')
-     data.update(offers=[] if catalogue_report else row.get('offers',[]),
-                 candidates=_saved_catalogue_candidates(row) if catalogue_report else row.get('candidates',[]),
+     data.update(offers=[] if saved_report else row.get('offers',[]),
+                 candidates=_saved_catalogue_candidates(row) if saved_report else row.get('candidates',[]),
                  source_checks=row.get('source_checks',[]),research_status=row.get('status',''),research_reason=row.get('reason',''))
      navigation=row.get('metrics',{}).get('stages',{}).get('navigation')
      if navigation:
@@ -432,7 +436,7 @@ class NativeResearchRunner:
    try:
     finalization_phase = 'current_projection'
     report_request = ResearchReportRequest.model_validate({'positions': rows})
-    if catalogue_report:
+    if saved_report:
      report_scope = saved_catalogue_report_scope()
     else:
      export_options = {'local_only': True} if interruption_reason is not None else {}
@@ -463,8 +467,7 @@ class NativeResearchRunner:
        else:images(child)
      elif isinstance(value,list):
       for child in value:images(child)
-    # Under the timer, local evidence may travel inside the ZIP; publish
-    # only the two reports as standalone artifacts to bound the manifest.
+    # Publish only the two reports under the timer or admission fallback.
     if not (deadline_report or catalogue_report):
      images(snapshot)
     entries=[{'name':name,'content_type':kind,'bytes':len(raw),'sha256':hashlib.sha256(raw).hexdigest()}for name,kind,raw in artifacts];manifest(entries)

@@ -71,15 +71,15 @@ class RunnerFinalization403Tests(unittest.TestCase):
   native_call.assert_called_once_with(job)
   return result
 
- def test_timer_stop_uses_local_only_export_and_labels_both_reports(self):
-  """Keep saved prices and navigation in both partial exports, using only local evidence."""
+ def test_timer_stop_uses_saved_raw_export_and_labels_both_reports(self):
+  """Keep source price, review status and navigation without reopening current catalogue authority."""
   from openpyxl import load_workbook
   job, claim, runner = self.setup_job()
   with patch.object(self.native, '_catalogue_export_snapshot', wraps=self.native._catalogue_export_snapshot) as export, \
        patch.object(self.native, '_catalogue_image_store', side_effect=AssertionError('unexpected_s3')) as images:
    result = self.run_timer_limited_research(job, claim, runner, with_navigation=True)
   self.assertEqual(result['state'], 'cancelled')
-  self.assertEqual(export.call_args.kwargs, {'local_only': True})
+  export.assert_not_called()
   images.assert_not_called()
   state = self.control.public(job)
   self.assertEqual(state['finalization_reason'], 'research_time_reserved')
@@ -98,8 +98,10 @@ class RunnerFinalization403Tests(unittest.TestCase):
     self.assertIn('Лимит времени сбора', book['Состояние сбора']['B2'].value)
     self.assertEqual(list(book['Время открытия карточек'].values)[1],
                      (self.fixture.position.number, 2, 2, 1))
-    self.assertTrue(any(row[12] == 100 and row[11] == 'уп'
-                        for row in list(book['Предложения'].values)[1:]))
+    quote, = [row for row in list(book['Предложения'].values)[1:]
+              if row[12] == 100 and row[11] == 'уп']
+    self.assertEqual((quote[6], quote[16], quote[19]),
+                     (None, 'Нет', 'Основание не перепроверено'))
    finally:
     book.close()
 
@@ -178,7 +180,7 @@ class RunnerFinalization403Tests(unittest.TestCase):
   self.assertTrue(state['partial'])
   self.assertFalse(state['business_complete'])
   self.assertFalse(state['cancel_requested'])
-  self.assertEqual(export.call_args.kwargs, {'local_only': True})
+  export.assert_not_called()
   artifacts = {entry['name']: self.control.artifact(job, entry['sha256'])[0].read_bytes()
                for entry in state['downloads']}
   self.assertEqual(set(artifacts), {'supplier-research-summary.xlsx', 'supplier-research-package.zip'})
