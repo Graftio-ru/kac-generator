@@ -4,7 +4,7 @@ from hashlib import sha256
 from io import BytesIO
 import sqlite3
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from zipfile import ZipFile
 
 from fastapi.testclient import TestClient
@@ -16,6 +16,7 @@ from .runner_executor import DirectControl, NativeResearchRunner, RunnerExecutio
 from .runner_protocol import CATALOGUE_ADMISSION_REPORT
 from .search import acquisition_scheduler, base_db, catalogue_projection
 from .search.catalogue import CatalogueStoreError, identity_for_position
+from .search.session import SearchBudgetExceeded
 from .telemetry import record_stage
 from .test_runner_finalization403 import RunnerFinalization403Tests as FinalizationFixture
 
@@ -167,12 +168,14 @@ class CatalogueAdmissionReportsTests(unittest.TestCase):
             self.assertEqual(response.status_code,200)
             state=response.json()
             downloads=state['downloads']
+            self.assertEqual(len(revisions),0 if fault=='generic' else 2)
             if fault in {None,'lost-complete-ack'}:
                 self.assertEqual((state['status'],state['partial'],state['business_complete']),('error',True,False))
                 self.assertEqual(state['finalization_reason'],CATALOGUE_ADMISSION_REPORT)
                 self.assertEqual(state['catalogue_admission_stop'],{
                     'code':'snapshot_changed','job_id':job,'position_index':2,'position_number':9,
-                    'expected_revision':revisions[0],'prior_generation':1,'cleanup_confirmed':True,
+                    'expected_revision':revisions[0],'retry_expected_revision':revisions[1],
+                    'prior_generation':1,'cleanup_confirmed':True,
                 })
                 self.assertLess(actions.index('checkpoint'),actions.index('complete'))
                 self.check_books(web,downloads,len(positions))
@@ -185,7 +188,8 @@ class CatalogueAdmissionReportsTests(unittest.TestCase):
                     else:
                         self.assertEqual(state['catalogue_admission_stop'], {
                             'code':'snapshot_changed','job_id':job,'position_index':2,'position_number':9,
-                            'expected_revision':revisions[0],'prior_generation':1,'cleanup_confirmed':False,
+                            'expected_revision':revisions[0],'retry_expected_revision':revisions[1],
+                            'prior_generation':1,'cleanup_confirmed':False,
                         })
                     self.assertNotIn('checkpoint',actions)
                     self.assertTrue(state['report_unavailable'])
@@ -237,8 +241,121 @@ class CatalogueAdmissionReportsTests(unittest.TestCase):
                 book.close()
 
     def test_full96_saved_reports_are_visible_without_catalogue_reads(self):
-        """Publish both guarded reports for the 96-row fixture."""
+        """Publish both guarded 96-row reports after two real no-write CAS conflicts."""
         self.exercise(full=True)
+
+    def test_recheck_projects_sufficient_snapshot_without_reallocation(self):
+        """Use the real sufficiency policy and return its exact detached adequate view."""
+        fixture = FinalizationFixture()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        catalogue, position = fixture.fixture.store, fixture.fixture.position
+        identity = identity_for_position(position)
+        fresh = catalogue.read_snapshot([identity])
+        product = fresh['products'][identity.key]
+        incomplete = dict(product, heads=product['heads'][:1])
+        self.assertTrue(app._catalogue_missing_required(position,catalogue,incomplete))
+        self.assertFalse(app._catalogue_missing_required(position,catalogue,product))
+        keeper, runner_stop = Mock(), Mock(return_value=False)
+        with patch.object(catalogue,'acquire_missing',side_effect=AssertionError('unexpected CAS')):
+            admission, snapshot, revision = app._recheck_catalogue_missing(
+                position,catalogue,identity,incomplete,fresh['revision']-1,tuple(product['coverage']),
+                job_id='abc123abc123',lease_keeper=keeper,check_runner_stop=runner_stop,
+            )
+        self.assertIsNone(admission)
+        self.assertEqual(snapshot,product)
+        self.assertEqual(revision,fresh['revision'])
+        self.assertEqual(keeper.check_control.call_count,2)
+        self.assertEqual(runner_stop.call_count,2)
+
+    def test_recheck_admits_incomplete_target_at_fresh_revision(self):
+        """After a real unrelated catalogue write, the same incomplete product receives one new grant."""
+        fixture = FinalizationFixture()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        catalogue = fixture.fixture.store
+        position = fixture.fixture.position.model_copy(update={'number':8,'type_mark':'PQR789'})
+        identity = identity_for_position(position)
+        hosts = ('one.test',)
+        previous = catalogue.acquire_unknown(identity,hosts,owner='previous-owner')
+        self.assertTrue(catalogue.finish_acquisition(previous))
+        before = catalogue.read_snapshot([identity])
+        other = fixture.fixture.position.model_copy(update={'number':9,'type_mark':'XYZ987'})
+        self.assertTrue(catalogue.acquire_unknown(identity_for_position(other),hosts,owner='other-owner').allowed)
+        owner = 'abc123abc123'
+        with patch.object(catalogue,'acquire_missing',wraps=catalogue.acquire_missing) as acquire:
+            refusal = catalogue.acquire_missing(identity,hosts,owner=owner,
+                                                expected_revision=before['revision'],mode='missing_data')
+            self.assertEqual((refusal.allowed,refusal.reason),(False,'snapshot_changed'))
+            admission, _, revision = app._recheck_catalogue_missing(
+                position,catalogue,identity,before['products'][identity.key],before['revision'],hosts,
+                job_id=owner,lease_keeper=Mock(),check_runner_stop=None,
+            )
+        self.assertTrue(admission.allowed)
+        self.assertEqual((admission.product_id,admission.generation),(previous.product_id,2))
+        self.assertEqual([call.kwargs['expected_revision'] for call in acquire.call_args_list],
+                         [before['revision'],revision])
+        self.assertEqual(catalogue.read_snapshot([])['revision'],revision+1)
+
+    def test_recheck_rejects_identity_and_authority_changes(self):
+        """Disappearance, ambiguity and a changed target binding cannot authorize any CAS."""
+        fixture = FinalizationFixture()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        catalogue, position = fixture.fixture.store, fixture.fixture.position
+        identity = identity_for_position(position)
+        view = catalogue.read_snapshot([identity])
+        original = view['products'][identity.key]
+        changes = {
+            'missing':None,'ambiguous':dict(original,identity_ambiguous=True),
+            'identity':dict(original,identity=dict(original['identity'],code='changed')),
+            'product':dict(original,product_id='a'*64),
+            'owner':dict(original,acquisition_owner='other'),
+            'generation':dict(original,acquisition=dict(original['acquisition'],generation=2)),
+            'scope':dict(original,coverage={}),
+        }
+        for case, change in changes.items():
+            with self.subTest(case=case):
+                fresh = dict(view,products={identity.key:change})
+                with patch.object(catalogue,'read_snapshot',return_value=fresh), \
+                        patch.object(catalogue,'acquire_missing') as acquire:
+                    with self.assertRaises(CatalogueStoreError):
+                        app._recheck_catalogue_missing(
+                            position,catalogue,identity,original,view['revision']-1,tuple(original['coverage']),
+                            job_id='abc123abc123',lease_keeper=Mock(),check_runner_stop=None,
+                        )
+                acquire.assert_not_called()
+
+    def test_recheck_fences_both_reads_and_writes(self):
+        """Reject live stop and keeper failure on either side of the fresh read."""
+        fixture = FinalizationFixture()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        catalogue, position = fixture.fixture.store, fixture.fixture.position
+        identity = identity_for_position(position)
+        fresh = catalogue.read_snapshot([identity])
+        product = fresh['products'][identity.key]
+        for gate in ('runner','keeper'):
+            for after_read in (False,True):
+                with self.subTest(gate=gate,after_read=after_read):
+                    keeper, runner_stop = Mock(), Mock(return_value=False)
+                    if gate=='runner':
+                        runner_stop.side_effect = [False,True] if after_read else [True]
+                        failure = SearchBudgetExceeded
+                    else:
+                        stop = CatalogueStoreError('fixture latched keeper failure')
+                        keeper.check_control.side_effect = [None,stop] if after_read else [stop]
+                        failure = CatalogueStoreError
+                    with patch.object(catalogue,'read_snapshot',return_value=fresh) as read, \
+                            patch.object(app,'_catalogue_missing_required',return_value=True), \
+                            patch.object(catalogue,'acquire_missing') as acquire:
+                        with self.assertRaises(failure):
+                            app._recheck_catalogue_missing(
+                                position,catalogue,identity,product,fresh['revision']-1,tuple(product['coverage']),
+                                job_id='abc123abc123',lease_keeper=keeper,check_runner_stop=runner_stop,
+                            )
+                    self.assertEqual(read.call_count,int(after_read))
+                    acquire.assert_not_called()
 
     def test_saved_quote_identity_is_independent_of_url(self):
         """Collapse one observation across lists while retaining different observations at the same URL."""
@@ -265,8 +382,8 @@ class CatalogueAdmissionReportsTests(unittest.TestCase):
                 self.exercise(fault)
                 self.doCleanups()
 
-    def test_control_refuses_manifest_without_cleanup_confirmation(self):
-        """Even a matching persisted checkpoint cannot authorize unconfirmed cleanup."""
+    def test_control_requires_two_refusals_and_confirmed_cleanup(self):
+        """A matching persisted checkpoint alone cannot authorize absent or invalid retry evidence."""
         fixture = FinalizationFixture()
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
@@ -275,16 +392,20 @@ class CatalogueAdmissionReportsTests(unittest.TestCase):
         token, fence = claim['lease_token'], claim['fence']
         control.begin(job,token,fence)
         stop = {'code':'snapshot_changed','job_id':job,'position_index':0,'position_number':7,
-                'expected_revision':8,'prior_generation':1,'cleanup_confirmed':False}
-        snapshot = dict(job_id=job,status='error',partial=True,business_complete=False,
-                        finalization_reason=CATALOGUE_ADMISSION_REPORT,catalogue_admission_stop=stop)
-        self.assertTrue(control.checkpoint(job,token,fence,1,snapshot)['persisted'])
+                'expected_revision':8,'retry_expected_revision':9,'prior_generation':1,'cleanup_confirmed':False}
         raw = b'fixture bytes'
         entry = dict(name=BOOK,sha256=sha256(raw).hexdigest(),bytes=len(raw),
                      content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
         control.put_artifact(job,token,fence,entry,raw)
-        with self.assertRaisesRegex(DispatchError,'runner_catalogue_report_checkpoint_invalid'):
-            control.complete(job,token,fence,[entry],snapshot,'error')
+        missing_retry = dict(stop,cleanup_confirmed=True)
+        del missing_retry['retry_expected_revision']
+        for sequence, receipt in enumerate((stop,missing_retry,
+                                            dict(stop,cleanup_confirmed=True,retry_expected_revision=8)),1):
+            snapshot = dict(job_id=job,status='error',partial=True,business_complete=False,
+                            finalization_reason=CATALOGUE_ADMISSION_REPORT,catalogue_admission_stop=receipt)
+            self.assertTrue(control.checkpoint(job,token,fence,sequence,snapshot)['persisted'])
+            with self.assertRaisesRegex(DispatchError,'runner_catalogue_report_checkpoint_invalid'):
+                control.complete(job,token,fence,[entry],snapshot,'error')
         self.assertEqual(control.public(job)['downloads'],[])
 
     def test_cancel_before_build_and_inside_final_manifest_commit(self):

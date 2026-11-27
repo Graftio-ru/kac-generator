@@ -1453,8 +1453,48 @@ def _run_catalogue_unknown_job(job_id, store, *, resumed=None):
         document_cache.close()  # Scheduler/executor cleanup has already joined workers.
 
 
+def _recheck_catalogue_missing(position, store, identity, product, revision, hosts, *,
+                               job_id, lease_keeper, check_runner_stop):
+    """Re-evaluate a confirmed no-write conflict under the unchanged target allocation.
+
+    Return one CAS result, or None with the detached sufficient snapshot for
+    ordinary projection. Changed identity, authority or scope stops admission.
+    """
+    from .search.catalogue import Acquisition, CatalogueStoreError
+    from .search.session import SearchBudgetExceeded
+
+    def check_control():
+        """Honor the keeper's latched failure and the owning runner's live stop check."""
+        lease_keeper.check_control()
+        if check_runner_stop is not None and check_runner_stop():
+            raise SearchBudgetExceeded('Следующий допуск каталога остановлен')
+
+    check_control()
+    fresh = store.read_snapshot([identity])
+    current = fresh['products'][identity.key]
+    requested_hosts = set(hosts)
+    if (current is None or current.get('identity_ambiguous')
+            or current['product_id'] != product['product_id']
+            or current['identity'] != product['identity']
+            or current['acquisition_owner'] != product['acquisition_owner']
+            or current['acquisition'] != product['acquisition']
+            or set(current['coverage']) != requested_hosts
+            or set(product['coverage']) != requested_hosts
+            or fresh['revision'] <= revision):
+        raise CatalogueStoreError('Catalogue authority changed after admission conflict')
+    needs_work = _catalogue_missing_required(position, store, current)
+    check_control()
+    admission = None
+    if needs_work:
+        admission = store.acquire_missing(identity, hosts, owner=job_id,
+                                          expected_revision=fresh['revision'], mode='missing_data')
+        if type(admission) is not Acquisition:
+            raise CatalogueStoreError('Unknown catalogue admission result')
+    return admission, current, fresh['revision']
+
+
 def _run_catalogue_unknown_job_with_documents(job_id, store, *, resumed=None):
-    """Run acquisition and retain the first no-write refusal separately from cleanup authority."""
+    """Run acquisition and preserve both confirmed refusals independently of cleanup authority."""
     global _ACTIVE_RESEARCH_ID
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from .search.catalogue import Acquisition, CatalogueStoreError, identity_for_position
@@ -1537,18 +1577,28 @@ def _run_catalogue_unknown_job_with_documents(job_id, store, *, resumed=None):
             identity=identity_for_position(p);groups.setdefault(identity.key,[]).append(index)
         for key,indices in groups.items():
             identity=identity_for_position(positions[indices[0]])
+            rechecked_product = None
             lease_control()  # No allocation after cancellation/global stop/deadline.
             if resumed is None and _research_acquisition_mode(job_id)=='missing_data':
                 fresh=store.read_snapshot([identity]);product=fresh['products'][identity.key]
                 if product is not None and _catalogue_missing_required(positions[indices[0]],store,product):
                     admission=store.acquire_missing(identity,hosts,owner=job_id,expected_revision=fresh['revision'],mode='missing_data')
-                    if not admission.allowed:
-                        if admission == Acquisition('', '', 0, False, 'snapshot_changed'):
-                            # This exact CAS result precedes every write. No target lease was issued.
+                    if type(admission) is not Acquisition:
+                        raise CatalogueStoreError('Unknown catalogue admission result')
+                    no_write_conflict = Acquisition('', '', 0, False, 'snapshot_changed')
+                    if admission == no_write_conflict:
+                        admission, rechecked_product, retry_revision = _recheck_catalogue_missing(
+                            positions[indices[0]], store, identity, product, fresh['revision'], hosts,
+                            job_id=job_id, lease_keeper=lease_keeper, check_runner_stop=check_runner_stop,
+                        )
+                    if admission is not None and not admission.allowed:
+                        if admission == no_write_conflict:
+                            # Both CAS refusals precede every write. No target lease was issued.
                             admission_stop = {
                                 'code': 'snapshot_changed', 'job_id': job_id,
                                 'position_index': indices[0], 'position_number': positions[indices[0]].number,
                                 'expected_revision': fresh['revision'],
+                                'retry_expected_revision': retry_revision,
                                 'prior_generation': (product.get('acquisition') or {}).get('generation'),
                             }
                         raise CatalogueStoreError('Missing-data admission refused')
@@ -1569,7 +1619,7 @@ def _run_catalogue_unknown_job_with_documents(job_id, store, *, resumed=None):
                     controller,_,_=_catalogue_checkpoint_controller(job_id,indices[0],admission,store,planner,initial)
                     initial_frontiers[key]=controller.value
             else:
-                product=store.lookup(identity)
+                product=rechecked_product if rechecked_product is not None else store.lookup(identity)
                 for index in indices:
                     row=_catalogue_known_row(positions[index],store=store,product=product,hosts=hosts)
                     job['rows'][index]=row;_publish_catalogue_row(job_id,index,row)

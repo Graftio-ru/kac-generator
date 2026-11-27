@@ -7,6 +7,7 @@ import hashlib,json,os,re,secrets,sqlite3,time,uuid
 from contextlib import contextmanager
 from pathlib import Path
 from .runner_protocol import bounded,canonical,digest,identifier,manifest,public_snapshot,MAX_ARTIFACT,command,CATALOGUE_ADMISSION_REPORT
+from .runner_protocol import catalogue_admission_stop_valid
 class DispatchError(ValueError):pass
 class RunnerControl:
  def __init__(self,root,source_seal,*,clock=time.time,lease_seconds=30):
@@ -174,7 +175,7 @@ class RunnerControl:
     os.replace(temp,path);fd=os.open(folder,os.O_RDONLY);os.fsync(fd);os.close(fd)
    db.execute('INSERT OR IGNORE INTO artifacts VALUES(?,?,?)',(job,entry['name'],canonical(entry).decode()))
  def complete(self,job,token,fence,entries,snapshot,outcome):
-  """Publish registered results under the live fence, atomically rejecting late catalogue-report cancellation."""
+  """Publish under the live fence, binding catalogue reports to the checkpoint of both refusals."""
   entries=manifest(entries);snap=public_snapshot(snapshot,job,entries)
   if outcome not in {'done','error','cancelled','uncertain'}:raise DispatchError('runner_outcome_invalid')
   with self.tx()as db:
@@ -186,8 +187,7 @@ class RunnerControl:
     checkpoint=json.loads(row['snapshot']) if row['snapshot'] else {}
     stop=snap.get('catalogue_admission_stop')
     if (outcome!='error' or snap.get('partial') is not True or snap.get('business_complete') is not False
-        or type(stop)is not dict or stop.get('code')!='snapshot_changed' or stop.get('job_id')!=job
-        or stop.get('cleanup_confirmed') is not True
+        or not catalogue_admission_stop_valid(stop,job)
         or checkpoint.get('finalization_reason')!=CATALOGUE_ADMISSION_REPORT
         or checkpoint.get('partial') is not True or checkpoint.get('business_complete') is not False
         or checkpoint.get('catalogue_admission_stop')!=snap['catalogue_admission_stop']):

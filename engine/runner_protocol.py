@@ -16,6 +16,22 @@ MAX_TOTAL=256*1024*1024
 MAX_MEMBERS=128
 class ProtocolError(ValueError):pass
 
+def catalogue_admission_stop_valid(stop: object, job: str) -> bool:
+ """Recognize a cleaned, same-job refusal for both revision-guarded attempts."""
+ if type(stop) is not dict or set(stop) != {
+     'code','job_id','position_index','position_number','expected_revision',
+     'retry_expected_revision','prior_generation','cleanup_confirmed',
+ }:
+  return False
+ first, retry = stop['expected_revision'], stop['retry_expected_revision']
+ generation = stop['prior_generation']
+ return (stop['code']=='snapshot_changed' and stop['job_id']==job
+         and stop['cleanup_confirmed'] is True
+         and type(stop['position_index']) is int and stop['position_index']>=0
+         and type(stop['position_number']) is int
+         and type(first) is int and type(retry) is int and 0<=first<retry
+         and (generation is None or type(generation) is int and generation>0))
+
 def canonical(value):
  try:return json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(',',':'),allow_nan=False).encode()
  except (ValueError,TypeError):raise ProtocolError('runner_json_invalid')from None

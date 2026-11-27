@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import Request,urlopen
 from .runner_protocol import canonical,digest,manifest,command,ProtocolError,MAX_JSON,MAX_ARTIFACT,MAX_TOTAL,CATALOGUE_ADMISSION_REPORT
+from .runner_protocol import catalogue_admission_stop_valid
 class RunnerExecutionError(ValueError):pass
 
 # Global research policy: 27 minutes acquisition + 3 minutes finalization
@@ -32,21 +33,15 @@ def _model_interruption(snapshot):
  return None
 
 def _catalogue_admission_report(snapshot, positions, job):
- """Require the native no-write receipt, same input row, and an uncancelled terminal snapshot."""
+ """Require both no-write refusals, confirmed cleanup, and the original uncancelled input row."""
  stop=snapshot.get('catalogue_admission_stop')
  if (snapshot['status']!='error' or snapshot.get('error_code')!='catalogue_store_error'
      or snapshot.get('cancel_requested') or snapshot.get('first_stop')
-     or snapshot.get('acquisition_mode')!='missing_data' or type(stop)is not dict
-     or set(stop)!={'code','job_id','position_index','position_number','expected_revision',
-                   'prior_generation','cleanup_confirmed'}
-     or stop['code']!='snapshot_changed' or stop['job_id']!=job
-     or stop['cleanup_confirmed'] is not True):
+     or snapshot.get('acquisition_mode')!='missing_data'
+     or not catalogue_admission_stop_valid(stop,job)):
   return False
- index=stop['position_index'];generation=stop['prior_generation'];revision=stop['expected_revision']
- return (type(index)is int and 0<=index<len(positions)
-         and type(stop['position_number'])is int and positions[index].number==stop['position_number']
-         and type(revision)is int and revision>=0
-         and (generation is None or type(generation)is int and generation>0))
+ index=stop['position_index']
+ return index<len(positions) and positions[index].number==stop['position_number']
 
 
 def _saved_catalogue_candidates(row):
