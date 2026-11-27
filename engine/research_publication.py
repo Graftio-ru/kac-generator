@@ -276,16 +276,20 @@ class DeltaPublisher:
 
     The caller passes changed candidates and pairs at their producer hooks. Small
     ordinary updates can wait one second or bounded saturation; semantic evidence
-    and lifecycle boundaries force synchronous commit. No worker/dispatch queue.
-    After any failed flush, exact retry must finish before accepting another delta.
+    and lifecycle boundaries force synchronous commit. A single update larger
+    than the staging cap drains earlier deltas and commits on its own. Only its
+    unacknowledged transaction can remain outside the coalescing budget, to allow
+    exact retry before accepting any other delta.
     """
     def __init__(self, store, job, *, clock=time.monotonic, seconds=1., max_events=1024, max_bytes=262144):
+        """Configure the compact byte and event limits of the coalescing buffer."""
         if not finite(seconds) or type(max_events) is not int or not 1 <= max_events <= 1024 or type(max_bytes) is not int or max_bytes < 1024:
             raise Invalid("Invalid staging buffer bounds")
         self.store, self.job, self.clock = store, job, clock
         self.seconds, self.max_events, self.max_bytes = seconds, max_events, max_bytes
         self.lock = threading.RLock()
         self.pending, self.last, self.revisions = {}, {}, {}
+        self._direct = None  # (row index, exact oversized delta); empty whenever coalescing.
         self.peak_events = self.peak_bytes = 0
         self.pending_events = self.pending_bytes = 0
 
@@ -298,7 +302,7 @@ class DeltaPublisher:
     def migrate_acquisition_source_intent(self, source_intent, *, catalogue_store, entries, expected_frontiers,expected_job_revision,verify_records,previous_source_intent=None,compatibility=None):
         """Explicit operator-only CAS; caller supplies fixed receipt/revisions for retry."""
         with self.lock:
-            for index in list(self.pending):self.flush(index)
+            self.drain()
             result=self.store.migrate_acquisition_source_intent(self.job,source_intent,catalogue_store=catalogue_store,
                 entries=entries,expected_frontiers=expected_frontiers,expected_job_revision=expected_job_revision,
                 operation='source-adoption-'+source_intent['sha256'],verify_records=verify_records,previous_source_intent=previous_source_intent,compatibility=compatibility)
@@ -322,8 +326,13 @@ class DeltaPublisher:
 
     def publish(self, index, *, row_patch=None, pairs=None, candidates=None, removals=None,
                 selected_keys=None, events=(), terminal=None, force=False):
+        """Stage a compact delta or submit one oversized delta in its own transaction.
+
+        A drain failure leaves the new delta unaccepted. A failure submitting an
+        accepted delta retains it with the same operation ID for an exact flush.
+        """
         with self.lock:
-            if any(p.get("retry") for p in self.pending.values()):
+            if self._direct is not None or any(p.get("retry") for p in self.pending.values()):
                 raise StoreError("Retry the unacknowledged transaction before new deltas")
             snapshot = self.store._input(self.job)
             if type(index) is not int or not 0 <= index < len(snapshot["positions"]):
@@ -340,9 +349,14 @@ class DeltaPublisher:
                    "candidates": copy.deepcopy(candidates or {}), "removals": list(removals or []), "events": safe, "terminal": terminal}
             if selected_keys is not None:
                 new["row_patch"]["selected_keys"] = list(selected_keys)
-            raw_size = len(json.dumps(new, ensure_ascii=False, allow_nan=False).encode()) + 64
+            raw_size = len(json.dumps(new, ensure_ascii=False, allow_nan=False,
+                                      separators=(",", ":")).encode("utf-8")) + 64
             if raw_size > self.max_bytes:
-                raise Invalid("Single delta exceeds publication byte bound; never truncate proof")
+                # Older same-row updates must establish the revision before this
+                # transaction. Never merge an over-cap update into staged work.
+                self.drain()
+                self._direct = (index, new)
+                return self._flush_for_delivery(index)
             count, size = self._size()
             if count + len(safe) > self.max_events or size + raw_size > self.max_bytes:
                 self.drain()
@@ -365,15 +379,21 @@ class DeltaPublisher:
             if not semantic:
                 self.peak_events, self.peak_bytes = max(self.peak_events, count), max(self.peak_bytes, size)
             if semantic or index not in self.last or self.clock() - self.last[index] >= self.seconds:
-                try:
-                    return self.flush(index)
-                except Exception as error:
-                    raise BufferedPublicationError("Delta buffered; retry exact flush before further delivery") from error
+                return self._flush_for_delivery(index)
             return None
 
+    def _flush_for_delivery(self, index):
+        """Report a store failure after acceptance so callers never resend the source delta."""
+        try:
+            return self.flush(index)
+        except Exception as error:
+            raise BufferedPublicationError("Delta retained; retry exact flush before further delivery") from error
+
     def flush(self, index):
+        """Commit or reconcile the same operation, clearing its slot only after acknowledgment."""
         with self.lock:
-            pending = self.pending.get(index)
+            direct = self._direct is not None and self._direct[0] == index
+            pending = self._direct[1] if direct else self.pending.get(index)
             if pending is None:
                 return None
             args = {"index": index, "expected_revision": self.revisions[index], "row_patch": pending["row_patch"],
@@ -385,14 +405,20 @@ class DeltaPublisher:
                 pending["retry"] = True
                 raise
             self.revisions[index] = result["row_revision"]
-            self.pending_events -= len(pending["events"])
-            self.pending_bytes -= pending["charged_bytes"]
-            self.pending.pop(index)
+            if direct:
+                self._direct = None
+            else:
+                self.pending_events -= len(pending["events"])
+                self.pending_bytes -= pending["charged_bytes"]
+                self.pending.pop(index)
             self.last[index] = self.clock()
             return result
 
     def drain(self):
+        """Flush accepted coalesced work or reconcile the sole direct update."""
         with self.lock:
+            if self._direct is not None:
+                self.flush(self._direct[0])
             for index in list(self.pending):
                 self.flush(index)
 
