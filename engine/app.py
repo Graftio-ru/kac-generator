@@ -1896,15 +1896,15 @@ def _catalogue_product_steps(job_id, store, identity, indices, admission, guard,
     from .search.source_registry import host_for
     from .search.catalogue_projection import project_product,catalogue_scope
     from .research_publication import SUPPLIER_CARD_TRANSPORTS
-    from .search.session import observe_transport_started
+    from .search.session import observe_transport_started, supplier_transport
     def discovery_hosts(task,selected):
         from .search.supplier_discovery import PROVIDERS,valid_step
         step=steps.get(task.query) if task.route!='serp_only' else None
         return [h for h in selected if h in PROVIDERS] if valid_step(step,task.query) else []
     def scheduled_operation(kind,hosts,function,*,card_operation=None,diagnostic_binding=None):
-        """Run one owned operation and observe entry to an admitted card's transport."""
+        """Admit supplier health before journaling a card that can reach transport."""
         def run():
-            """Flush bound transport evidence with the operation's ordinary telemetry."""
+            """Keep deferrals before card reservation and flush bound transport evidence."""
             from contextlib import nullcontext
 
             start_evidence = None
@@ -1920,19 +1920,26 @@ def _catalogue_product_steps(job_id, store, identity, indices, admission, guard,
             check()
             with _catalogue_operation_metrics(job_id,indices[0],check) as metrics:
                 if kind in ('discovery','own_discovery','proof'):return function(None)
-                if card_operation is not None:
-                    from .search.catalogue import RetainedCardUncertain,definitely_presend
-                    admitted=store.card_operation(**card_operation,acquisition=admission,evidence=dict(job_id=job_id,generation=admission.generation))
-                    if not admitted['allowed']:raise RetainedCardUncertain()
+                from .search.catalogue import definitely_presend
+                reserved = False
+                supplier_scope = supplier_transport(card_operation['url']) if card_operation is not None else nullcontext()
                 observer = observe_transport_started(on_transport) if attribution is not None and card_operation is not None else nullcontext()
                 try:
                     from .browser_transport_trace import owned_trace_scope
-                    with owned_trace_scope(diagnostic_binding):
-                        with _browser_factory() as owned_browser:
-                            with observer:
-                                result=function(owned_browser)
+                    with supplier_scope:
+                        if card_operation is not None:
+                            # A refused supplier lease has not entered the card callback.
+                            # Capture reuses the same active supplier lease for this host.
+                            check()
+                            admitted = store.card_operation(**card_operation, acquisition=admission,
+                                evidence=dict(job_id=job_id, generation=admission.generation))
+                            if not admitted['allowed']:
+                                raise RetainedCardUncertain()
+                            reserved = True
+                        with owned_trace_scope(diagnostic_binding), _browser_factory() as owned_browser, observer:
+                            result = function(owned_browser)
                 except BaseException:
-                    if card_operation is not None and definitely_presend(metrics.events):
+                    if reserved and definitely_presend(metrics.events):
                         check();store.card_operation(**card_operation,acquisition=admission,resolve=True,evidence=dict(basis='proven_presend',events=[v for v in metrics.events if v.get('stage')=='provider_transport']))
                     raise
                 finally:

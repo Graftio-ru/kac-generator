@@ -44,6 +44,65 @@ class CardReplayTests(unittest.TestCase):
   self.presend=True;self.job();self.calls=[];self.job();self.assertIn('https://s0.test/card',self.calls)
  def test_mixed_postsend_and_presend_does_not_resolve(self):
   self.assertFalse(definitely_presend([event(),event(sent=False,presend=True)]));self.assertTrue(definitely_presend([event(sent=False,presend=True)]));self.assertFalse(definitely_presend([]))
+ def test_supplier_admission_refusal_does_not_reserve_owned_card(self):
+  """A cooldown and a held probe defer their cards while a healthy supplier still runs."""
+  from engine.search.session import supplier_transport
+  from engine.search.supplier_health_store import Outcome, SupplierHealthStore
+
+  wall = time.time()
+  health = SupplierHealthStore(self.f.root/'preflight-health.sqlite3', cooldown_seconds=3600,
+                               clock=lambda: wall)
+  self.assertTrue(health.finish(health.acquire('s0.test'),Outcome.HTTP_RATE_LIMITED))
+  held = health.acquire('s1.test')
+  self.assertTrue(held.allowed)
+  self.allowed = {0,1,2}
+  capture_entries = []
+
+  def capture_available(*args, **kwargs):
+   """Place the fixture capture behind the same reentrant health gate as the native adapter."""
+   capture_entries.append(kwargs['supplier_host'])
+   with supplier_transport(args[3]):
+    return self.f.capture(*args, **kwargs)
+
+  self.capture = capture_available
+  positions = (self.p,self.p.model_copy(update={'number':2,'name':'Other cable','type_mark':'DEF456'}))
+  with patch('engine.search.supplier_health_store.SupplierHealthStore',return_value=health), \
+       patch.object(health,'acquire',wraps=health.acquire) as acquire:
+   for position in positions:
+    _, public = self.job(position)
+    product = self.f.store.lookup(identity_for_position(position))
+    self.assertEqual({head['host'] for head in product['heads']},{'s2.test'})
+    for host in ('s0.test','s1.test'):
+     self.assertFalse(any(row.get('card_operation') and row['host']==host
+                          for row in product['refresh_attempts']))
+     sources = [check for check in public['rows'][0]['source_checks'] if check['host']==host]
+     self.assertEqual(sources[0]['product_presence'],'unknown')
+     self.assertNotEqual(sources[0]['status'],'no_match')
+  self.assertEqual(capture_entries,['s2.test','s2.test'])
+  self.assertEqual(sum(call.args==('s2.test',) for call in acquire.call_args_list),2)
+  self.assertTrue(health.finish(held,Outcome.UNKNOWN))
+ def test_lost_card_reservation_ack_preserves_pending(self):
+  """A committed reservation with a lost reply cannot be resolved or captured automatically."""
+  reserve = self.f.store.card_operation
+  calls_before = []
+
+  def lose_ack(*args, **kwargs):
+   """Commit the real journal record, then interrupt its acknowledgement."""
+   result = reserve(*args, **kwargs)
+   if kwargs.get('host') == 's0.test' and result['allowed'] and not kwargs.get('resolve'):
+    calls_before.append(kwargs['operation_id'])
+    raise RuntimeError('Fixture lost journal acknowledgement')
+   return result
+
+  self.allowed={0}
+  with patch.object(self.f.store,'card_operation',side_effect=lose_ack):
+   self.job()
+  self.assertEqual(self.calls,[])
+  self.assertEqual(len(calls_before),1)
+  product = self.f.store.lookup(identity_for_position(self.p))
+  operations = [row['card_operation'] for row in product['refresh_attempts']
+                if row.get('card_operation',{}).get('operation_id') in calls_before]
+  self.assertEqual([operation['state'] for operation in operations],['pending'])
  def test_different_product_is_not_blanket_blocked(self):
   self.job();self.calls=[];self.job(self.p.model_copy(update={'type_mark':'DEF456'}));self.assertIn('https://s0.test/card',self.calls)
  def test_legacy_import_uses_native_bound_outcome_without_transport_attribution(self):
