@@ -1885,6 +1885,7 @@ def _catalogue_product_steps(job_id, store, identity, indices, admission, guard,
     from playwright.sync_api import Error as SupplierNavigationError
     from .search.catalogue import CatalogueStoreError,CatalogueConflict,ProductIdentity
     from .search.catalogue_producer import capture_and_publish,CataloguePublicationError
+    from .search.acquisition_card_input import link_input, recover_input
     from .search.catalogue import RetainedCardUncertain
     from .search.article_query_plan import build_article_query_plan
     from .search.discovery_plan import StagedDiscoveryPlan,DiscoveryObservationCache,expand_discovery_tasks,own_prefix
@@ -1940,7 +1941,12 @@ def _catalogue_product_steps(job_id, store, identity, indices, admission, guard,
                             result = function(owned_browser)
                 except BaseException:
                     if reserved and definitely_presend(metrics.events):
-                        check();store.card_operation(**card_operation,acquisition=admission,resolve=True,evidence=dict(basis='proven_presend',events=[v for v in metrics.events if v.get('stage')=='provider_transport']))
+                        check()
+                        # A pre-send model failure may follow a completed supplier capture.
+                        retained = store.pending_acquisition_input(
+                            admission, owner=job_id, host=card_operation['host'], url=card_operation['url'])
+                        if retained is None:
+                            store.card_operation(**card_operation,acquisition=admission,resolve=True,evidence=dict(basis='proven_presend',events=[v for v in metrics.events if v.get('stage')=='provider_transport']))
                     raise
                 finally:
                     # Attribution must not take a slot from the operation's ordinary telemetry.
@@ -2082,7 +2088,9 @@ def _catalogue_product_steps(job_id, store, identity, indices, admission, guard,
                 job.update(awaiting_slice=True,acquisition_resume_only=True,awaiting_slice_reason='Временной отрезок получения завершён; сохранённые результаты доступны, оставшиеся операции ожидают явного продолжения')
             _save_research_job(job_id,force=True)
             return True
+        recovered_urls = set()
         def selected_proofs(*,early=False):
+            """Refresh optional evidence for other selected offers without reopening recovered cards."""
             nonlocal paused,supplier_pending,supplier_hold
             from .search.selected_proofs import capture_selected_proofs,price_candidates,proof_ready
             with advance_substage('selected_proofs_prepare'):
@@ -2091,7 +2099,7 @@ def _catalogue_product_steps(job_id, store, identity, indices, admission, guard,
                 with catalogue_scope(store,snapshot=product):
                     selected=price_candidates(project_product(store,identity,position,snapshot=product))
                     attempted=set(job.get('catalogue_proof_attempts',{}).get(product_id,[]))
-                    pending=[o for o in selected if not proof_ready(o,position) and o.url not in attempted]
+                    pending=[o for o in selected if not proof_ready(o,position) and o.url not in attempted and o.url not in recovered_urls]
             if early and len(selected)<3:return False
             if not pending or len(attempted)>=6:return False
             def save_attempts(urls):
@@ -2376,6 +2384,28 @@ def _catalogue_product_steps(job_id, store, identity, indices, admission, guard,
                     committed=store.resolve_observation(product_id,operation)
                     if outcome is not None:
                         checkpoint(controller.settle_card(state['id'],outcome));seen.add(url);continue
+                    if park_slice():break
+                    from .search.agent import capture_card_diagnostics
+                    with capture_card_diagnostics() as recovery_diagnostics:
+                        retained = recover_input(store, admission, job_id, producer_identity, position,
+                            host=host, url=url, root=CACHE_DIR)
+                    if retained is not None:
+                        recovered_urls.add(url)
+                        seen.add(url)
+                        retained_id = retained['observation']['observation_id']
+                        source = reusable_source(url, host)
+                        if retained_id == operation:
+                            settle_card('observed', retained_id)
+                        elif (_research_acquisition_mode(job_id) == 'missing_data'
+                              and source is not None and source['observation_id'] == retained_id):
+                            settle_card('observed', retained_id, typed=dict(
+                                version=1, disposition='catalogue_reuse', evidence=source))
+                        else:
+                            typed = _catalogue_uncertain_card_completion(recovery_diagnostics)
+                            settle_card('review', reason=typed['evidence']['code'], typed=typed)
+                        settled = current_hosts()
+                        publish()
+                        continue
                     if committed is not None:
                         actual=committed['observation']
                         if actual['requested_url']!=url or actual['supplier_host']!=host:raise ValueError('Committed card operation binding differs')
@@ -2387,7 +2417,6 @@ def _catalogue_product_steps(job_id, store, identity, indices, admission, guard,
                         bounded_timeout(0);guard.check();check()
                         settle_card('review',reason='card_link_parent_unsettled')
                         seen.add(url);continue
-                    if park_slice():break
                     if _research_acquisition_mode(job_id)=='missing_data':
                         reused=reusable_source(url,host)
                         if reused is not None:
@@ -2406,7 +2435,6 @@ def _catalogue_product_steps(job_id, store, identity, indices, admission, guard,
                         settle_card('review' if decision.reason=='candidate_known_listing' else 'identity_conflict',reason=decision.reason,typed=dict(version=1,disposition='deterministic_rejection',evidence=dict(role='candidate_admission',code=decision.reason,response_sha256=state['response']['sha256'])))
                         publish()
                         continue
-                    from .search.agent import capture_card_diagnostics
                     card_reason='';card_failure=None;card_error=None;card_error_code='';card_deferred=False;card_prior_unknown=False;contention_deadline=time.monotonic()+120
                     structural_code = None
                     with capture_card_diagnostics() as diagnostics:
@@ -2415,9 +2443,12 @@ def _catalogue_product_steps(job_id, store, identity, indices, admission, guard,
                             try:
                                 from functools import partial
                                 from .search.card_attachments import collect_current
+                                capture_binding = dict(product_id=product_id, host=host, url=url, operation_id=operation)
                                 def capture_independent(browser):
+                                    """Link same-operation input before price work and preserve owned card links."""
                                     from .search.card_link_discovery import receive_sources
                                     def received(record,source):
+                                        """Bind discovered links to the current card before exposing them to its frontier."""
                                         bounded_timeout(0);guard.check();check()
                                         # The source is read back from immutable native bytes;
                                         # callback dictionaries/diagnostics are not authority.
@@ -2429,7 +2460,8 @@ def _catalogue_product_steps(job_id, store, identity, indices, admission, guard,
                                             bounded_timeout(0);guard.check();check()
                                             checkpoint(controller.accept_card_links(state['id'],reference))
                                     with receive_sources(received):
-                                        return capture_and_publish(store,producer_identity,position,url,browser=browser,image_store=image_store,capture=partial(collect_current,http_preflight=True),acquisition=admission,supplier_host=host,observation_id=operation)
+                                        retain = partial(link_input, store, admission, capture_binding, job_id, CACHE_DIR, position)
+                                        return capture_and_publish(store,producer_identity,position,url,browser=browser,image_store=image_store,capture=partial(collect_current,http_preflight=True,on_retained=retain),acquisition=admission,supplier_host=host,observation_id=operation)
                                 with failure_operation(state['id'],operation):
                                     observation=yield scheduled_operation('card',[host],capture_independent,card_operation=dict(product_id=product_id,host=host,url=url,operation_id=operation),diagnostic_binding=dict(failure_binding,task_id=state['id'],operation_id=operation))
                             except SupplierDeferred as failure:

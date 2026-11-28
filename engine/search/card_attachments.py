@@ -63,12 +63,13 @@ def reusable_photo(offer):
     except (OSError,ValueError,TypeError):return False
 
 
-def capture_current(browser, position, url, *, extract=True, neutral_sink=None, http_preflight=False, photos=True, financial_outcome=None):
+def capture_current(browser, position, url, *, extract=True, neutral_sink=None, http_preflight=False, photos=True, financial_outcome=None, on_retained=None):
     """Capture with existing transport/authority, then separately apply native quote rules.
 
     An active fact scope observes retained HTTP input before expected-product
     admission. Those raw observations cannot qualify or replace an offer.
     Native cancellation, seller, ownership and financial failures are unchanged.
+    The internal on_retained hook links the exact snapshot before price work.
     """
     from . import agent
     from .card_batch import extract_batch
@@ -148,6 +149,8 @@ def capture_current(browser, position, url, *, extract=True, neutral_sink=None, 
         retained_input=snapshot.retain(agent.CACHE_DIR)
         from .document_context import _capture_input_retained
         _capture_input_retained(snapshot,retained_input)
+        if on_retained is not None:
+            on_retained(snapshot, retained_input)
         from .owned_purchase_row import from_facts,retain_decision
         import uuid
         operation_id=uuid.uuid4().hex
@@ -183,13 +186,14 @@ def capture_current(browser, position, url, *, extract=True, neutral_sink=None, 
         return snapshot,bind_photo(offer) if offer else None
 
 
-def collect_current(browser, position, url, *, extract=True, neutral_sink=None, http_preflight=False):
+def collect_current(browser, position, url, *, extract=True, neutral_sink=None, http_preflight=False, on_retained=None):
     """Collect source facts without photographs, preserving them independently of quote admission.
 
     The ordinary capture/extraction/catalogue path remains the quote authority.
     Additive fact-journal references are emitted even if matching later refuses
     the item. Facts are neither a normalized price nor a catalogue-head update.
     Context and diagnostics are settled on cancellation/error without retry.
+    Forward the internal hook so acquisition can link the pre-extraction input.
     """
     from . import agent
     from .observed_fact_capture import fact_capture_scope, observe_rendered
@@ -205,7 +209,7 @@ def collect_current(browser, position, url, *, extract=True, neutral_sink=None, 
         try:
             snapshot, offer = capture_current(
                 browser, position, url, extract=extract, neutral_sink=sink,
-                http_preflight=http_preflight, photos=False,
+                http_preflight=http_preflight, photos=False, on_retained=on_retained,
             )
         finally:
             diagnostics = agent._CARD_DIAGNOSTICS.get()

@@ -777,27 +777,58 @@ class CatalogueStore:
    payload=dict(outcome='unknown',reason='Native card operation '+value['state'],observation_id=None,source_url=None,card_operation=value)
    db.execute('INSERT INTO attempts(product_id,host,url,attempted_at,payload,revision) VALUES(?,?,?,?,?,?)',(product_id,host,url,stamp,_json(payload),revision))
    return dict(allowed=True,pending=[])
- def record_card_capture(self,product_id,host,url,*,operation_id,reference,capability):
-  """Append a durable same-operation input reference, never resolve old uncertainty.
+ def record_card_capture(self,product_id,host,url,*,operation_id,reference,capability=None,acquisition=None,owner=None,request_sha256=None):
+  """Append an input link under either explicit or ordinary acquisition authority.
 
   Exact private issuer/reference and ownership are rechecked under the write
   transaction; forged, duplicate or stale links raise before publication.
   """
   from .document_context import _validate_capture_link
-  _validate_capture_link(capability,self,product_id,host,url,operation_id,reference)
+  if acquisition is None:
+   _validate_capture_link(capability,self,product_id,host,url,operation_id,reference)
+  elif capability is not None or not isinstance(owner,str) or not owner:
+   raise CatalogueConflict('Invalid acquisition capture authority')
   with self._connection(True)as db:
-   _validate_capture_link(capability,self,product_id,host,url,operation_id,reference,connection=db)
+   if acquisition is None:
+    _validate_capture_link(capability,self,product_id,host,url,operation_id,reference,connection=db)
+   elif acquisition.product_id!=product_id or not self._current_acquisition(db,acquisition,owner=owner):
+    raise CatalogueConflict('Acquisition ownership lost before capture link')
    states={}
    for row in db.execute('SELECT payload FROM attempts WHERE product_id=? AND host=? AND url=? ORDER BY id',(product_id,host,url)):
     item=self._decode(row['payload']).get('card_operation')
     if item:states[item['operation_id']]=item
    current=states.get(operation_id)
    if current is None or current['state']!='pending' or current['evidence'].get('captured_input'):raise CatalogueConflict('Capture input transition unavailable')
+   if acquisition is not None and current['evidence']!=dict(job_id=owner,generation=acquisition.generation):
+    raise CatalogueConflict('Capture input reservation differs')
    evidence=dict(current['evidence'],captured_input=reference)
+   if acquisition is not None:
+    _digest(request_sha256)
+    evidence['request_sha256']=request_sha256
    value=dict(version=1,operation_id=operation_id,state='pending',evidence=evidence)
    payload=dict(outcome='unknown',reason='Native capture input retained; financial outcome pending',observation_id=None,source_url=None,card_operation=value)
+   from .catalogue_observation_storage import validate_stored_attempt
+   stamp=time.time()
+   validate_stored_attempt(payload,dict(host=host,url=url,attempted_at=stamp))
    revision=self._revision(db)
-   db.execute('INSERT INTO attempts(product_id,host,url,attempted_at,payload,revision) VALUES(?,?,?,?,?,?)',(product_id,host,url,time.time(),_json(payload),revision))
+   db.execute('INSERT INTO attempts(product_id,host,url,attempted_at,payload,revision) VALUES(?,?,?,?,?,?)',(product_id,host,url,stamp,_json(payload),revision))
+ def pending_acquisition_input(self,acquisition,*,owner,host,url):
+  """Read one unambiguous ordinary capture link without granting transport authority."""
+  product_id=acquisition.product_id
+  with self._connection() as db:
+   if not self._current_acquisition(db,acquisition,owner=owner):
+    raise CatalogueConflict('Acquisition ownership lost before capture read')
+   states={}
+   for row in db.execute("SELECT * FROM attempts WHERE product_id=? AND host=? AND url=? AND json_type(payload,'$.card_operation') IS NOT NULL ORDER BY id",(product_id,host,url)):
+    item=self._stored_attempt(row).get('card_operation')
+    if item is not None:states[item['operation_id']]=item
+   pending=[item for item in states.values() if item['state']=='pending']
+   if len(pending)!=1:return None
+   item=pending[0];evidence=item['evidence']
+   if (set(evidence)!={'job_id','generation','captured_input','request_sha256'}
+       or type(evidence['generation']) is not int
+       or not 0<evidence['generation']<=acquisition.generation):return None
+   return item
  def publish_coverage(self,product_id,host,*,status,observed_at=None,reason='',product_presence='unknown',observation_id=None,diagnostics=None,acquisition=None,deferred_check=None):
   if deferred_check is not None:deferred_check=safe_deferred_check(deferred_check,host)
   _host(host);_text(reason,2048,empty=True)
